@@ -139,6 +139,16 @@ impl Value {
         self.0.borrow_mut().grad = 0.0;
     }
 
+    /// Directly set the scalar value (used by the optimizer to apply weight updates).
+    pub fn set_val(&self, val: f32) {
+        self.0.borrow_mut().val = val;
+    }
+
+    /// Directly set the gradient (used for gradient clipping).
+    pub fn set_grad(&self, grad: f32) {
+        self.0.borrow_mut().grad = grad;
+    }
+
     /// Attach a label for debugging.
     pub fn label(&self, s: &str) -> Self {
         self.0.borrow_mut().label = s.to_string();
