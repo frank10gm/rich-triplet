@@ -17,5 +17,6 @@ blas-src = { version = "0.10", optional = true, features = ["accelerate"] }
 weight-loading = ["safetensors"]
 mmap-loading = ["memmap2"]
 blas = ["cblas", "blas-src"]
+parallel = []
 
 [dev-dependencies]

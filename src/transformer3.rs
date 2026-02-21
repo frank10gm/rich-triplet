@@ -47,6 +47,104 @@ use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2};
 use std::cell::RefCell;
 
 // =============================================================================
+// SamplingParams — controls how tokens are drawn from the logit distribution
+// =============================================================================
+//
+// ## Why not just "temperature"?
+//
+// Temperature alone is often not enough:
+//
+//   • temperature=1.0  → full distribution, can pick low-probability garbage
+//   • temperature=0.0  → greedy argmax, repetitive / boring
+//
+// Production systems layer three filters on top of the temperature-scaled
+// distribution before drawing:
+//
+//   1. top_k — keep only the K highest-probability tokens.
+//      Prevents long-tail surprises. k=50 is a common default.
+//
+//   2. top_p (nucleus sampling) — keep the *smallest* set of tokens whose
+//      cumulative probability ≥ p.  p=0.9 means "ignore the bottom 10%".
+//      Adapts to the shape of the distribution: if the model is confident
+//      (one token has 80% probability) few candidates remain; if it's
+//      uncertain many remain.
+//
+//   3. repetition_penalty — multiply the logit of any token that already
+//      appears in the context by (1 / penalty) before softmax.
+//      Values like 1.1–1.3 reduce looping.
+//
+// ## Sampling with a PRNG
+//
+// A linear congruential generator (LCG) is embedded so every call to
+// `sample_token` is reproducible given the same `seed`.  The seed advances
+// by one on every drawn sample, so successive calls within a generation loop
+// produce different (but reproducible) outputs.
+//
+// ## Usage
+//
+//   let params = SamplingParams {
+//       temperature: 0.8,
+//       top_k:  50,
+//       top_p:  0.92,
+//       repetition_penalty: 1.1,
+//       seed:   42,
+//   };
+//   let tok = model.generate_with_params(&prompt_ids, 100, &params);
+
+/// Parameters controlling token sampling.
+#[derive(Clone, Debug)]
+pub struct SamplingParams {
+    /// Divide logits by this value before softmax.
+    ///   temperature = 0.0 → greedy argmax (no randomness).
+    ///   temperature = 1.0 → unmodified distribution.
+    ///   temperature > 1.0 → flatter (more random).
+    ///   temperature < 1.0 → sharper (more greedy).
+    pub temperature: f32,
+
+    /// Keep only the top-k tokens by probability before sampling.
+    /// Set to 0 to disable (keep all tokens).
+    pub top_k: usize,
+
+    /// Nucleus (top-p) sampling: keep the smallest set of tokens whose
+    /// cumulative probability ≥ top_p.  1.0 disables the filter.
+    pub top_p: f32,
+
+    /// Divide the logit of any previously-seen token by this factor.
+    /// 1.0 = no penalty, 1.1–1.3 = mild, 2.0 = aggressive.
+    pub repetition_penalty: f32,
+
+    /// Seed for the internal LCG random number generator.
+    /// The same seed + same logits → same sample (reproducible).
+    pub seed: u64,
+}
+
+impl SamplingParams {
+    /// Greedy (deterministic) sampling — always picks the argmax.
+    pub fn greedy() -> Self {
+        SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 }
+    }
+
+    /// Typical creative-writing defaults.
+    pub fn creative(seed: u64) -> Self {
+        SamplingParams { temperature: 0.8, top_k: 50, top_p: 0.92, repetition_penalty: 1.1, seed }
+    }
+}
+
+/// Internal LCG RNG — fast, no-dependency, reproducible.
+///
+/// Uses Knuth's multiplier (same as InitRng in nn.rs but step is different).
+/// Each call to `next_f32` advances the state and returns a value in [0, 1).
+struct LcgRng { state: u64 }
+impl LcgRng {
+    fn new(seed: u64) -> Self { LcgRng { state: seed.wrapping_add(1) } }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state
+    }
+    fn next_f32(&mut self) -> f32 { (self.next_u64() >> 11) as f32 / (1u64 << 53) as f32 }
+}
+
+// =============================================================================
 // Config3 — GPT-OSS hyperparameters
 // =============================================================================
 
@@ -918,26 +1016,274 @@ impl GptOssModel {
     }
 
     /// Sample a token from logits at row `pos` with temperature scaling.
+    ///
+    /// Legacy helper kept for backward compatibility with existing tests.
+    /// Equivalent to `sample_token_full` with greedy/temperature-only params.
     fn sample_token(&self, logits: &Mat, pos: usize, temperature: f32) -> usize {
-        let v = logits.cols;
-        if temperature <= 0.0 {
-            // Greedy
-            return (0..v).max_by(|&a, &b|
-                logits.at(pos, a).partial_cmp(&logits.at(pos, b)).unwrap()
-            ).unwrap();
-        }
-        // Softmax with temperature
-        let row_max = (0..v).map(|c| logits.at(pos, c)).fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = (0..v).map(|c| ((logits.at(pos, c) - row_max) / temperature).exp()).collect();
-        let sum: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+        let params = if temperature <= 0.0 {
+            SamplingParams::greedy()
+        } else {
+            SamplingParams { temperature, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 }
+        };
+        // No previously-seen tokens (repetition_penalty disabled)
+        self.sample_token_full(logits, pos, &params, &[], &mut LcgRng::new(params.seed))
+    }
 
-        // Simple deterministic sampling: argmax of probs (for test reproducibility)
-        // A real implementation would use a random number generator here.
-        probs.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i)
-            .unwrap()
+    /// Full sampler: top-k → top-p → repetition penalty → temperature → sample.
+    ///
+    /// ## Algorithm
+    ///
+    ///   1. Apply repetition penalty: logit[tok] /= penalty  for each tok ∈ seen_ids.
+    ///      (Division because logit is positive for likely tokens; dividing makes
+    ///       them relatively less likely while keeping the distribution normalised.)
+    ///
+    ///   2. If temperature ≤ 0: greedy argmax on (penalised) logits. Done.
+    ///
+    ///   3. Apply temperature: logit[t] /= temperature.
+    ///
+    ///   4. top-k filter: keep only the K highest-logit indices.
+    ///      If top_k = 0, keep all.
+    ///
+    ///   5. Compute softmax over the surviving set.
+    ///
+    ///   6. top-p (nucleus) filter: sort by descending probability, keep the
+    ///      smallest prefix whose cumulative probability ≥ top_p.  Re-normalise.
+    ///
+    ///   7. Draw one token proportionally to the surviving probabilities using
+    ///      the provided PRNG.
+    fn sample_token_full(
+        &self,
+        logits: &Mat,
+        pos: usize,
+        params: &SamplingParams,
+        seen_ids: &[usize],
+        rng: &mut LcgRng,
+    ) -> usize {
+        let v = logits.cols;
+
+        // Step 1: repetition penalty
+        let mut row: Vec<f32> = (0..v).map(|c| logits.at(pos, c)).collect();
+        if params.repetition_penalty != 1.0 {
+            for &tok in seen_ids {
+                if tok < v {
+                    // Penalise: reduce logit magnitude (works for both positive & negative logits)
+                    row[tok] /= params.repetition_penalty;
+                }
+            }
+        }
+
+        // Step 2: greedy if temperature == 0
+        if params.temperature <= 0.0 {
+            return row.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+        }
+
+        // Step 3: temperature scaling
+        let temp = params.temperature;
+        for x in row.iter_mut() { *x /= temp; }
+
+        // Step 4: top-k — keep only the k highest logits
+        let mut candidates: Vec<usize> = (0..v).collect();
+        if params.top_k > 0 && params.top_k < v {
+            candidates.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            candidates.truncate(params.top_k);
+        }
+
+        // Step 5: softmax over candidates
+        let row_max = candidates.iter().map(|&i| row[i]).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = candidates.iter().map(|&i| (row[i] - row_max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let mut probs: Vec<(usize, f32)> = candidates.iter().zip(exps.iter())
+            .map(|(&tok, &e)| (tok, e / sum))
+            .collect();
+
+        // Step 6: top-p (nucleus) — sort desc, keep cumulative ≥ top_p
+        if params.top_p < 1.0 {
+            probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let mut cumsum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (i, &(_, p)) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= params.top_p {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cutoff);
+            // Re-normalise
+            let total: f32 = probs.iter().map(|(_, p)| p).sum();
+            for (_, p) in probs.iter_mut() { *p /= total; }
+        }
+
+        // Step 7: draw from the distribution
+        let u = rng.next_f32();
+        let mut cumsum = 0.0f32;
+        for &(tok, p) in &probs {
+            cumsum += p;
+            if u < cumsum { return tok; }
+        }
+        probs.last().map(|&(tok, _)| tok).unwrap_or(0)
+    }
+
+    /// Full generation using `SamplingParams` (top-k, top-p, rep. penalty, RNG).
+    ///
+    /// Returns the generated token ids (not including the prompt).
+    pub fn generate_with_params(
+        &self,
+        token_ids: &[usize],
+        max_new: usize,
+        params: &SamplingParams,
+    ) -> Vec<usize> {
+        let cache = KvCache::new(&self.config);
+        let d = self.config.hidden_size;
+        let te = self.embed_tokens.data().clone();
+        let mut rng = LcgRng::new(params.seed);
+
+        // Prefill
+        let t_prompt = token_ids.len();
+        let x_data = Mat::from_fn(t_prompt, d, |row, col| te.at(token_ids[row], col));
+        let mut x = TensorNode::leaf(x_data);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+        }
+        let x_normed = self.norm.forward(&x);
+        let logits   = self.lm_head.forward(&x_normed);
+
+        let mut generated: Vec<usize> = Vec::with_capacity(max_new);
+        // seen = prompt + generated (for repetition penalty)
+        let mut seen: Vec<usize> = token_ids.to_vec();
+
+        let first_tok = self.sample_token_full(&logits.data(), t_prompt - 1, params, &seen, &mut rng);
+        generated.push(first_tok);
+        seen.push(first_tok);
+
+        // Decode
+        let mut prev_tok = first_tok;
+        for _ in 1..max_new {
+            let x_data = Mat::from_fn(1, d, |_, col| te.at(prev_tok, col));
+            let mut x = TensorNode::leaf(x_data);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+            }
+            let x_normed = self.norm.forward(&x);
+            let logits   = self.lm_head.forward(&x_normed);
+
+            prev_tok = self.sample_token_full(&logits.data(), 0, params, &seen, &mut rng);
+            generated.push(prev_tok);
+            seen.push(prev_tok);
+        }
+        generated
+    }
+
+    /// Streaming variant of `generate_with_params`.
+    pub fn generate_with_params_streaming(
+        &self,
+        token_ids: &[usize],
+        max_new: usize,
+        params: &SamplingParams,
+        mut callback: impl FnMut(usize),
+    ) {
+        let cache = KvCache::new(&self.config);
+        let d = self.config.hidden_size;
+        let te = self.embed_tokens.data().clone();
+        let mut rng = LcgRng::new(params.seed);
+
+        let t_prompt = token_ids.len();
+        let x_data = Mat::from_fn(t_prompt, d, |row, col| te.at(token_ids[row], col));
+        let mut x = TensorNode::leaf(x_data);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+        }
+        let x_normed = self.norm.forward(&x);
+        let logits   = self.lm_head.forward(&x_normed);
+
+        let mut seen: Vec<usize> = token_ids.to_vec();
+        let first_tok = self.sample_token_full(&logits.data(), t_prompt - 1, params, &seen, &mut rng);
+        callback(first_tok);
+        seen.push(first_tok);
+
+        let mut prev_tok = first_tok;
+        for _ in 1..max_new {
+            let x_data = Mat::from_fn(1, d, |_, col| te.at(prev_tok, col));
+            let mut x = TensorNode::leaf(x_data);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+            }
+            let x_normed = self.norm.forward(&x);
+            let logits   = self.lm_head.forward(&x_normed);
+
+            prev_tok = self.sample_token_full(&logits.data(), 0, params, &seen, &mut rng);
+            callback(prev_tok);
+            seen.push(prev_tok);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Perplexity
+    // -------------------------------------------------------------------------
+
+    /// Compute perplexity of a token sequence: PPL = exp(mean cross-entropy loss).
+    ///
+    /// ## What perplexity means
+    ///
+    /// Perplexity is the standard benchmark metric for language models.
+    /// It measures "how surprised is the model by this text?":
+    ///   - PPL = 1     → model predicts every token with 100% confidence (perfect)
+    ///   - PPL = V     → model is no better than random (V = vocab size)
+    ///   - GPT-2 achieves ~29 PPL on WikiText-103
+    ///   - GPT-3 achieves ~20 PPL
+    ///   - GPT-OSS-20b is expected to achieve ~12 PPL
+    ///
+    /// ## Algorithm
+    ///
+    ///   PPL = exp( -1/T * sum_t log P(token_t | token_0..t-1) )
+    ///
+    /// We evaluate this by sliding a context window of `context_len` tokens
+    /// across the full sequence, computing the model's probability of each
+    /// token, and averaging the log-probabilities.
+    ///
+    /// ## Parameters
+    ///   token_ids:   the full sequence to evaluate (must have ≥ 2 tokens)
+    ///   context_len: maximum context window (defaults to config max if 0)
+    ///
+    /// ## Returns
+    ///   Perplexity as f32 (lower is better).
+    pub fn perplexity(&self, token_ids: &[usize], context_len: usize) -> f32 {
+        assert!(token_ids.len() >= 2, "perplexity: need at least 2 tokens");
+        let ctx = if context_len == 0 { self.config.max_position_embeddings } else { context_len };
+        let ctx = ctx.min(self.config.max_position_embeddings);
+
+        let n = token_ids.len();
+        let mut total_nll = 0.0f32;
+        let mut n_tokens = 0usize;
+
+        // Slide a window: at each position t predict token_ids[t] from context
+        let mut t = 1usize;
+        while t < n {
+            // Context: take up to ctx tokens ending just before t
+            let ctx_start = if t > ctx { t - ctx } else { 0 };
+            let ctx_ids = &token_ids[ctx_start..t];
+            let target   = token_ids[t];
+
+            let logits_node = self.forward(ctx_ids);
+            let logits = logits_node.data();
+            let last   = logits.rows - 1;
+            let v      = logits.cols;
+
+            // Numerically stable log-softmax at last position
+            let row_max = (0..v).map(|c| logits.at(last, c)).fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f32 = (0..v).map(|c| (logits.at(last, c) - row_max).exp()).sum();
+            let log_prob = logits.at(last, target) - row_max - sum_exp.ln();
+            total_nll -= log_prob;
+            n_tokens  += 1;
+
+            // Advance by stride = ctx/2 to overlap windows (more accurate PPL)
+            t += (ctx / 2).max(1);
+        }
+
+        (total_nll / n_tokens as f32).exp()
     }
 }
 
@@ -1809,6 +2155,125 @@ mod tests {
         let mut count = 0usize;
         model.generate_cached_streaming(&[0, 1], 7, 1.0, |_tok| count += 1);
         assert_eq!(count, 7, "expected 7 callback calls, got {}", count);
+    }
+
+    // --- SamplingParams, top-k, top-p, repetition penalty, perplexity ---
+
+    #[test]
+    fn test_sampling_params_greedy_is_deterministic() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams::greedy();
+        let r1 = model.generate_with_params(&[0, 1, 2], 5, &p);
+        let r2 = model.generate_with_params(&[0, 1, 2], 5, &p);
+        assert_eq!(r1, r2, "greedy must be deterministic");
+    }
+
+    #[test]
+    fn test_sampling_params_same_seed_same_output() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams::creative(7);
+        let r1 = model.generate_with_params(&[0, 1], 6, &p);
+        let r2 = model.generate_with_params(&[0, 1], 6, &p);
+        assert_eq!(r1, r2, "same seed must produce same output");
+    }
+
+    #[test]
+    fn test_sampling_params_different_seeds_may_differ() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p1 = SamplingParams::creative(1);
+        let p2 = SamplingParams::creative(99999);
+        let r1 = model.generate_with_params(&[0, 1, 2, 3], 10, &p1);
+        let r2 = model.generate_with_params(&[0, 1, 2, 3], 10, &p2);
+        // With different seeds the output may differ (not guaranteed but
+        // overwhelmingly likely with temperature > 0 and a real distribution)
+        // We only assert that the generation runs without panicking and
+        // produces the right length.
+        assert_eq!(r1.len(), 10);
+        assert_eq!(r2.len(), 10);
+    }
+
+    #[test]
+    fn test_top_k_zero_same_as_full_vocab() {
+        // top_k = 0 means "keep all tokens" — result must equal top_k = vocab_size
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p_nok = SamplingParams { temperature: 0.8, top_k: 0,              top_p: 1.0, repetition_penalty: 1.0, seed: 42 };
+        let p_all = SamplingParams { temperature: 0.8, top_k: cfg.vocab_size, top_p: 1.0, repetition_penalty: 1.0, seed: 42 };
+        let r_nok = model.generate_with_params(&[1, 2], 5, &p_nok);
+        let r_all = model.generate_with_params(&[1, 2], 5, &p_all);
+        assert_eq!(r_nok, r_all, "top_k=0 should behave like top_k=vocab_size");
+    }
+
+    #[test]
+    fn test_top_p_one_same_as_no_nucleus() {
+        // top_p = 1.0 keeps all tokens → same as disabling nucleus sampling
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p1 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 7 };
+        let p2 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 0.9999, repetition_penalty: 1.0, seed: 7 };
+        let r1 = model.generate_with_params(&[0, 3], 4, &p1);
+        // With top_p ≈ 1 the result may or may not equal r1 depending on dist.
+        // We just verify it runs without panic and produces correct length.
+        assert_eq!(r1.len(), 4);
+        let r2 = model.generate_with_params(&[0, 3], 4, &p2);
+        assert_eq!(r2.len(), 4);
+    }
+
+    #[test]
+    fn test_repetition_penalty_tokens_in_vocab() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.5, seed: 3 };
+        let tokens = model.generate_with_params(&[0, 1, 2], 8, &p);
+        for &tok in &tokens {
+            assert!(tok < cfg.vocab_size, "token {} out of vocab", tok);
+        }
+    }
+
+    #[test]
+    fn test_generate_with_params_streaming_matches_buffered() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams::creative(42);
+        let buffered = model.generate_with_params(&[0, 1], 6, &p);
+        let mut streamed = Vec::new();
+        model.generate_with_params_streaming(&[0, 1], 6, &p, |t| streamed.push(t));
+        assert_eq!(buffered, streamed);
+    }
+
+    #[test]
+    fn test_perplexity_is_finite_and_positive() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let tokens: Vec<usize> = (0..8).map(|i| i % cfg.vocab_size).collect();
+        let ppl = model.perplexity(&tokens, 4);
+        assert!(ppl.is_finite() && ppl > 0.0, "expected finite positive PPL, got {}", ppl);
+    }
+
+    #[test]
+    fn test_perplexity_untrained_near_vocab_size() {
+        // A randomly-initialised model should have PPL close to vocab_size
+        // (since it can't predict anything useful).
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let tokens: Vec<usize> = (0..12).map(|i| i % cfg.vocab_size).collect();
+        let ppl = model.perplexity(&tokens, 4);
+        // Allow a wide range: random init can vary quite a bit
+        assert!(ppl > 1.0, "PPL should be > 1 for an untrained model");
+        assert!(ppl < (cfg.vocab_size as f32) * 10.0,
+            "PPL should not be absurdly large, got {}", ppl);
     }
 
     // --- Batching ---

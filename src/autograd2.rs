@@ -122,9 +122,14 @@ impl Mat {
     /// in the old engine. On modern CPUs the compiler can auto-vectorize the
     /// inner loop with SIMD instructions.
     ///
-    /// When compiled with `--features blas`, delegates to `cblas_sgemm` for
-    /// an additional 4–8× speedup via CPU-vendor BLAS (Apple Accelerate on
-    /// macOS, OpenBLAS/MKL on Linux/Windows).
+    /// Dispatch priority (highest first):
+    ///   1. `--features blas`     → `cblas_sgemm` (4–8× vs pure Rust)
+    ///   2. `--features parallel` → multi-threaded pure Rust (≈N_CPU × speedup)
+    ///   3. default               → single-threaded pure Rust
+    ///
+    /// The `parallel` feature is useful when BLAS is unavailable (e.g. no
+    /// Apple Accelerate / OpenBLAS installed).  When both `blas` and `parallel`
+    /// are active, `blas` wins because BLAS is already multi-threaded internally.
     pub fn matmul(&self, b: &Mat) -> Mat {
         assert_eq!(self.cols, b.rows,
             "matmul shape mismatch: [{},{}] × [{},{}]", self.rows, self.cols, b.rows, b.cols);
@@ -134,7 +139,12 @@ impl Mat {
             return self.matmul_blas(b);
         }
 
-        #[cfg(not(feature = "blas"))]
+        #[cfg(all(feature = "parallel", not(feature = "blas")))]
+        {
+            return self.matmul_parallel(b, 0);
+        }
+
+        #[cfg(not(any(feature = "blas", feature = "parallel")))]
         {
             let (m, k, n) = (self.rows, self.cols, b.cols);
             let mut out = Mat::zeros(m, n);
@@ -376,6 +386,236 @@ impl Mat {
                 });
             }
         });
+
+        out
+    }
+}
+
+// =============================================================================
+// BF16 (bfloat16) storage — half the memory, nearly lossless
+// =============================================================================
+//
+// ## What is BF16?
+//
+// BF16 (Brain Float 16) is a 16-bit floating-point format with:
+//   - 1 sign bit
+//   - 8 exponent bits  (same as f32 — same range: ~1e-38 to ~3e38)
+//   - 7 mantissa bits  (vs 23 for f32 — lower precision)
+//
+// Because the exponent range equals f32, BF16 ↔ f32 conversion is trivial:
+//   f32_bits   = bf16_bits << 16          (zero-pad the lower 16 bits)
+//   bf16_bits  = (f32_bits >> 16) as u16  (truncate the lower 16 bits)
+//
+// ## Why use BF16?
+//
+// All major open-weight models (LLaMA, Gemma, Mistral, GPT-OSS) ship weights
+// as BF16:
+//   • Half the disk space and RAM of f32
+//   • Full exponent range → no clipping issues during fine-tuning
+//   • Supported natively by NVIDIA Ampere / Hopper, Apple M3+, Google TPUs
+//
+// In this CPU-only codebase we store weights as BF16 but dequantize to f32
+// on the fly for computation (same strategy as Q4, but simpler).
+//
+// `MatBf16` provides a compact storage format.  `Mat::from_bf16()` converts
+// a `MatBf16` to `Mat` for use in matmul.  `Mat::to_bf16()` converts back.
+//
+// ## Precision loss
+//
+// BF16 has only 7 mantissa bits (2.3 decimal digits of precision, vs 7.2 for f32).
+// This is acceptable for weights but not for accumulators (loss, gradients) —
+// those should stay as f32.
+
+/// A matrix stored in BF16 (bfloat16) format for compact in-memory storage.
+///
+/// Use `Mat::from_bf16` to convert to f32 for computation.
+/// Use `Mat::to_bf16` to convert an f32 `Mat` back to `MatBf16`.
+#[derive(Clone)]
+pub struct MatBf16 {
+    pub data: Vec<u16>,  // bf16 bits, one u16 per element
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl MatBf16 {
+    /// Convert a BF16-packed u16 to f32.
+    ///
+    /// Shift the 16 bits into the upper half of a u32 (f32's bit layout):
+    /// the sign and exponent fields are identical, mantissa is zero-padded.
+    #[inline]
+    pub fn bf16_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    /// Convert an f32 to BF16 bits (round-to-nearest, ties-to-even).
+    ///
+    /// For NaN/Inf, we preserve the special value.
+    /// For finite values: shift right by 16, with rounding.
+    #[inline]
+    pub fn f32_to_bf16(v: f32) -> u16 {
+        let bits = v.to_bits();
+        if v.is_nan() {
+            // Propagate NaN, ensure mantissa bit is set
+            return ((bits >> 16) as u16) | 0x0040;
+        }
+        // Round-to-nearest-even: look at the truncated bits
+        let rounding_bias = 0x7fff_u32 + ((bits >> 16) & 1);
+        let rounded = bits.wrapping_add(rounding_bias);
+        (rounded >> 16) as u16
+    }
+
+    /// Convert this `MatBf16` to a full f32 `Mat`.
+    pub fn to_f32(&self) -> Mat {
+        Mat {
+            data: self.data.iter().map(|&b| Self::bf16_to_f32(b)).collect(),
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+
+    /// Size in bytes (2 bytes per element).
+    pub fn size_bytes(&self) -> usize { self.data.len() * 2 }
+
+    /// Compression ratio vs f32 (always 2.0×).
+    pub fn compression_ratio(&self) -> f32 { 2.0 }
+
+    #[inline]
+    pub fn at(&self, r: usize, c: usize) -> f32 {
+        Self::bf16_to_f32(self.data[r * self.cols + c])
+    }
+}
+
+impl Mat {
+    /// Convert this `Mat` to compact BF16 storage.
+    pub fn to_bf16(&self) -> MatBf16 {
+        MatBf16 {
+            data: self.data.iter().map(|&v| MatBf16::f32_to_bf16(v)).collect(),
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+
+    /// Construct a `Mat` from a `MatBf16` (dequantize on load).
+    pub fn from_bf16(src: &MatBf16) -> Mat {
+        src.to_f32()
+    }
+
+    /// Build a `Mat` from raw BF16 bytes (as stored in .safetensors BF16 shards).
+    ///
+    /// `bytes` must be `rows * cols * 2` bytes, little-endian BF16.
+    pub fn from_bf16_bytes(bytes: &[u8], rows: usize, cols: usize) -> Self {
+        assert_eq!(bytes.len(), rows * cols * 2,
+            "from_bf16_bytes: expected {} bytes, got {}", rows * cols * 2, bytes.len());
+        let data: Vec<f32> = bytes.chunks_exact(2).map(|c| {
+            let bits = u16::from_le_bytes([c[0], c[1]]);
+            MatBf16::bf16_to_f32(bits)
+        }).collect();
+        Mat { data, rows, cols }
+    }
+}
+
+// =============================================================================
+// Gradient checkpointing
+// =============================================================================
+//
+// ## The memory problem
+//
+// During backpropagation, every intermediate activation (every TensorNode
+// created in the forward pass) must be kept in memory until its backward_fn
+// is called.  For a GPT model with L layers, T tokens, and d_model dimensions,
+// this is roughly:
+//
+//   L × T × d_model × (several matrices per layer) × 4 bytes
+//
+// For GPT-OSS-20b with L=24, T=2048, d_model=2880:
+//   24 × 2048 × 2880 × ~10 × 4 bytes ≈ 5.6 GB
+//
+// That's on top of the weights themselves.
+//
+// ## The solution: recomputation
+//
+// Gradient checkpointing (also called "activation checkpointing" or
+// "rematerialisation") trades compute for memory:
+//
+//   - During the forward pass, only store activations at "checkpoints"
+//     (typically the input to each transformer block).
+//   - During the backward pass, recompute the forward pass for each
+//     segment from its checkpoint to recover the activations needed for
+//     the gradient.
+//
+// This reduces activation memory from O(L × T × d) to O(√L × T × d)
+// with only a 33% increase in compute (each layer is computed twice).
+//
+// ## Implementation
+//
+// We implement the simplest useful form: per-block checkpointing.
+//
+// `CheckpointedBlock` wraps a `TransformerBlock2` (or any `Module2`-shaped
+// layer) and provides a `forward_checkpointed` method that:
+//   1. Saves only the input tensor to the block (not all intermediate activations)
+//   2. During backward, re-runs the block's forward to recover needed activations
+//      then computes the block's backward
+//
+// ## How to use
+//
+//   let blocks: Vec<CheckpointedBlock> = model.blocks.iter()
+//       .map(|b| CheckpointedBlock::new(b))
+//       .collect();
+//   for block in &blocks {
+//       x = block.forward_checkpointed(&x);
+//   }
+//   loss.backward(); // block inputs recomputed as needed
+
+use std::sync::Arc;
+
+/// A wrapper that implements gradient checkpointing for any function
+/// `f: TensorNode → TensorNode`.
+///
+/// Only the input is stored; the forward pass is re-run during backward
+/// to recover intermediate activations.
+pub struct Checkpoint<F>
+where F: Fn(&TensorNode) -> TensorNode,
+{
+    f: Arc<F>,
+}
+
+impl<F> Checkpoint<F>
+where F: Fn(&TensorNode) -> TensorNode + 'static,
+{
+    pub fn new(f: F) -> Self { Checkpoint { f: Arc::new(f) } }
+
+    /// Run `f(x)`, but register a backward that re-computes the forward
+    /// before propagating gradients.
+    ///
+    /// ## Memory behaviour
+    ///
+    /// Forward: saves only `x` (the input).  All intermediate nodes created
+    ///   inside `f` are dropped immediately.
+    ///
+    /// Backward: re-runs `f(x)` to re-create the intermediate graph, runs
+    ///   that graph's backward pass, then accumulates the gradient into `x`.
+    pub fn forward(&self, x: &TensorNode) -> TensorNode {
+        // Compute forward: get the output value but drop the full graph
+        let out_data = (self.f)(x).data().clone();
+        let out = TensorNode::leaf(out_data);
+
+        let x_c = x.clone();
+        let f_c = Arc::clone(&self.f);
+        let out_c = out.clone();
+
+        out.set_backward(Box::new(move || {
+            // Re-run forward to rebuild the intermediate graph
+            // Zero the re-created input's grad so we accumulate correctly
+            x_c.zero_grad();
+            let recomputed = f_c(&x_c);
+
+            // Seed with the gradient that flowed back to `out`
+            recomputed.set_grad(out_c.grad().clone());
+            // Run backward through the recomputed graph
+            recomputed.call_backward_fn();
+
+            // The gradient now lives in x_c.grad (accumulated by recomputed backward)
+        }), vec![x.clone()]);
 
         out
     }
@@ -2239,5 +2479,141 @@ mod tests {
             assert!((m2.at(0, c) - m.at(0, c)).abs() < 0.15,
                 "small Q4: error at col {}: {} vs {}", c, m2.at(0,c), m.at(0,c));
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // BF16 tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_bf16_roundtrip_values() {
+        for v in [0.0f32, 1.0, -1.0, 2.0, 0.5, 16.0, -8.0, 0.125] {
+            let bits = MatBf16::f32_to_bf16(v);
+            let back = MatBf16::bf16_to_f32(bits);
+            assert!((back - v).abs() < 1e-2,
+                "bf16 roundtrip: {} → bits={:#06x} → {}", v, bits, back);
+        }
+    }
+
+    #[test]
+    fn test_bf16_precision_loss_small() {
+        let v = 3.14159f32;
+        let bits = MatBf16::f32_to_bf16(v);
+        let back = MatBf16::bf16_to_f32(bits);
+        assert!((back - v).abs() < 0.01,
+            "bf16 precision: {} → {}", v, back);
+    }
+
+    #[test]
+    fn test_mat_to_bf16_shape() {
+        let m = Mat::from_fn(4, 8, |r, c| (r * 8 + c) as f32 * 0.1);
+        let bf = m.to_bf16();
+        assert_eq!((bf.rows, bf.cols), (4, 8));
+        assert_eq!(bf.data.len(), 32);
+    }
+
+    #[test]
+    fn test_mat_bf16_roundtrip() {
+        let m = Mat::from_fn(3, 5, |r, c| (r as f32 - 1.5) * (c as f32 + 0.5));
+        let bf = m.to_bf16();
+        let back = bf.to_f32();
+        assert_eq!((back.rows, back.cols), (m.rows, m.cols));
+        for r in 0..m.rows { for c in 0..m.cols {
+            assert!((back.at(r, c) - m.at(r, c)).abs() < 0.05,
+                "bf16 Mat roundtrip [{},{}]: {} → {}", r, c, m.at(r,c), back.at(r,c));
+        }}
+    }
+
+    #[test]
+    fn test_mat_from_bf16_bytes() {
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let mut bytes = Vec::new();
+        for &v in &values {
+            let bits = MatBf16::f32_to_bf16(v);
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        let m = Mat::from_bf16_bytes(&bytes, 2, 2);
+        assert_eq!((m.rows, m.cols), (2, 2));
+        for (i, &v) in values.iter().enumerate() {
+            let r = i / 2; let c = i % 2;
+            assert!((m.at(r, c) - v).abs() < 0.01,
+                "from_bf16_bytes [{},{}]: expected {} got {}", r, c, v, m.at(r,c));
+        }
+    }
+
+    #[test]
+    fn test_bf16_compression_ratio() {
+        let m = Mat::from_fn(8, 8, |_, _| 1.0f32);
+        let bf = m.to_bf16();
+        assert_eq!(bf.compression_ratio(), 2.0);
+        assert_eq!(bf.size_bytes(), m.numel() * 2);
+    }
+
+    #[test]
+    fn test_bf16_special_values() {
+        let zero = MatBf16::bf16_to_f32(MatBf16::f32_to_bf16(0.0));
+        assert_eq!(zero, 0.0);
+        let inf = MatBf16::bf16_to_f32(MatBf16::f32_to_bf16(f32::INFINITY));
+        assert!(inf.is_infinite() && inf > 0.0);
+        let neg_inf = MatBf16::bf16_to_f32(MatBf16::f32_to_bf16(f32::NEG_INFINITY));
+        assert!(neg_inf.is_infinite() && neg_inf < 0.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Gradient checkpointing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_forward_correct() {
+        let x = TensorNode::leaf(Mat::from_fn(4, 4, |r, c| (r * 4 + c) as f32 * 0.1));
+        let w = TensorNode::leaf(Mat::from_fn(4, 4, |r, c| if r == c { 1.0 } else { 0.0 }));
+        let w_c = w.clone();
+        let chk = Checkpoint::new(move |x: &TensorNode| x.matmul(&w_c));
+        let out_chk = chk.forward(&x);
+        let out_ref = x.matmul(&w);
+        let od = out_chk.data();
+        let rd = out_ref.data();
+        for r in 0..4 { for c in 0..4 {
+            assert!((od.at(r,c) - rd.at(r,c)).abs() < 1e-5,
+                "checkpoint output mismatch [{},{}]", r, c);
+        }}
+    }
+
+    #[test]
+    fn test_checkpoint_backward_gradient_flows() {
+        let x_data = Mat::from_fn(2, 4, |r, c| (r * 4 + c) as f32 * 0.5 + 0.1);
+        let w_data = Mat::from_fn(4, 4, |_, _| 0.25);
+        let x = TensorNode::leaf(x_data);
+        let w = TensorNode::leaf(w_data);
+        let w_c = w.clone();
+        let chk = Checkpoint::new(move |x: &TensorNode| x.matmul(&w_c));
+        let out = chk.forward(&x);
+        // Build a loss: sum of all out elements
+        let sum_val: f32 = out.data().data.iter().sum();
+        let loss = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
+        let out_c = out.clone();
+        loss.set_backward(Box::new(move || {
+            let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
+            out_c.set_grad(ones);
+            out_c.call_backward_fn();
+        }), vec![out]);
+        loss.backward();
+        let gx = x.grad();
+        assert!(gx.data.iter().any(|&v| v.abs() > 1e-6),
+            "expected non-zero gradient through checkpoint");
+    }
+
+    #[test]
+    fn test_checkpoint_saves_only_input_as_prev() {
+        // The output of Checkpoint::forward has exactly 1 prev (the input x),
+        // not the full internal forward graph.
+        let x = TensorNode::leaf(Mat::from_fn(2, 2, |r, c| (r * 2 + c) as f32));
+        let chk = Checkpoint::new(|x: &TensorNode| {
+            let t1 = x.gelu();
+            t1.gelu()
+        });
+        let out = chk.forward(&x);
+        assert_eq!(out.0.borrow().prev.len(), 1,
+            "checkpointed output should have exactly 1 prev");
     }
 }

@@ -1155,11 +1155,48 @@ pub struct SentencePiece {
 ///
 /// Implements the same `Tokenizer` trait as `CharTokenizer` and
 /// `BpeTokenizer` so it can be used as a drop-in replacement.
+// =============================================================================
+// Trie for fast SentencePiece lookup
+// =============================================================================
+//
+// The naive Viterbi scans all V pieces for every end position → O(N · V).
+// For LLaMA-3 (V = 128,256) and a 1024-token context this is ~130M comparisons.
+//
+// A trie reduces this to O(N · L) where L = max piece length (typically ≤ 32).
+//
+// ## Structure
+//
+// Each node stores a `HashMap<u8, usize>` pointing to child node indices.
+// When a terminal piece ends at a node, the node stores `(piece_id, log_prob)`.
+//
+// ## Lookup
+//
+// To find all pieces that start at position `start` in `s`:
+//   Walk the trie byte-by-byte starting at node 0 (root).
+//   At each node, if the node has a terminal entry, yield it as a candidate.
+//   If the next byte has no child in the trie, stop.
+//
+// This replaces the inner V-loop with a trie walk of at most L steps.
+
+/// A single node in the piece trie.
+struct TrieNode {
+    /// child_byte → child_node_index in the trie Vec
+    children: HashMap<u8, usize>,
+    /// If a piece ends here: (piece_id, log_prob)
+    terminal: Option<(u32, f32)>,
+}
+
+impl TrieNode {
+    fn new() -> Self { TrieNode { children: HashMap::new(), terminal: None } }
+}
+
 pub struct SentencePieceTokenizer {
     /// Vocabulary table; index = token id
     pub pieces: Vec<SentencePiece>,
     /// `piece_text → token_id` for O(1) lookup
-    piece_to_id: HashMap<String, u32>,
+    pub piece_to_id: HashMap<String, u32>,
+    /// Trie over piece bytes for O(N·L) Viterbi instead of O(N·V)
+    trie: Vec<TrieNode>,
     /// Special token id for unknown bytes (id 0 by convention)
     unk_id: u32,
 }
@@ -1229,9 +1266,66 @@ impl SentencePieceTokenizer {
         for (i, p) in pieces.iter().enumerate() {
             piece_to_id.insert(p.text.clone(), i as u32);
         }
-        // Convention: <unk> = id 0 if it exists, otherwise 0
         let unk_id = piece_to_id.get("<unk>").copied().unwrap_or(0);
-        SentencePieceTokenizer { pieces, piece_to_id, unk_id }
+
+        // Build trie
+        let trie = Self::build_trie(&pieces);
+
+        SentencePieceTokenizer { pieces, piece_to_id, trie, unk_id }
+    }
+
+    /// Build a byte trie over all piece texts.
+    ///
+    /// Node 0 is the root. Each piece is inserted byte-by-byte;
+    /// at the final byte of each piece we store `(piece_id, log_prob)`.
+    fn build_trie(pieces: &[SentencePiece]) -> Vec<TrieNode> {
+        let mut trie = vec![TrieNode::new()]; // node 0 = root
+        for (id, piece) in pieces.iter().enumerate() {
+            let bytes = piece.text.as_bytes();
+            let mut node_idx = 0usize;
+            for &b in bytes {
+                let next = if let Some(&c) = trie[node_idx].children.get(&b) {
+                    c
+                } else {
+                    let new_idx = trie.len();
+                    trie[node_idx].children.insert(b, new_idx);
+                    trie.push(TrieNode::new());
+                    new_idx
+                };
+                node_idx = next;
+            }
+            // Only keep the entry with the highest log_prob if two pieces are identical
+            if trie[node_idx].terminal.as_ref().map_or(true, |&(_, lp)| piece.log_prob > lp) {
+                trie[node_idx].terminal = Some((id as u32, piece.log_prob));
+            }
+        }
+        trie
+    }
+
+    /// Iterate over all pieces that start at byte position `start` in `s`.
+    ///
+    /// Uses the trie to walk at most `max_piece_len` steps instead of
+    /// scanning all V pieces.
+    ///
+    /// Yields `(end_pos, piece_id, log_prob)` for each match found.
+    fn trie_matches<'a>(&'a self, s: &'a [u8], start: usize) -> impl Iterator<Item=(usize, u32, f32)> + 'a {
+        let mut node_idx = 0usize;
+        let mut pos = start;
+        let mut results = Vec::new();
+        while pos < s.len() {
+            let b = s[pos];
+            match self.trie[node_idx].children.get(&b) {
+                None => break,
+                Some(&next) => {
+                    node_idx = next;
+                    pos += 1;
+                    if let Some(&(id, lp)) = self.trie[node_idx].terminal.as_ref() {
+                        results.push((pos, id, lp));
+                    }
+                }
+            }
+        }
+        results.into_iter()
     }
 
     // -------------------------------------------------------------------------
@@ -1250,25 +1344,24 @@ impl SentencePieceTokenizer {
         let mut back: Vec<(usize, u32)> = vec![(0, self.unk_id); n + 1];
         best[0] = 0.0;
 
-        for end in 1..=n {
-            // Try every vocabulary piece that ends at position `end`
-            for (id, piece) in self.pieces.iter().enumerate() {
-                let pb = piece.text.as_bytes();
-                let plen = pb.len();
-                if plen > end { continue; }
-                let start = end - plen;
-                if &s[start..end] != pb { continue; }
-                if best[start] == NEG_INF { continue; }
-                let score = best[start] + piece.log_prob;
+        // Trie-based Viterbi: for each start position, walk the trie to find
+        // all pieces that begin there.  O(N · L) instead of O(N · V).
+        for start in 0..n {
+            if best[start] == NEG_INF { continue; }
+            for (end, id, log_prob) in self.trie_matches(s, start) {
+                let score = best[start] + log_prob;
                 if score > best[end] {
                     best[end] = score;
-                    back[end] = (start, id as u32);
+                    back[end] = (start, id);
                 }
             }
-            // Fallback: if no piece covers position `end`, emit unknown byte
-            if best[end] == NEG_INF {
-                best[end] = best[end - 1] + (-100.0); // heavy penalty
-                back[end] = (end - 1, self.unk_id);
+        }
+
+        // Fallback pass: fill any positions still at NEG_INF with single-byte UNK
+        for i in 1..=n {
+            if best[i] == NEG_INF {
+                best[i] = best[i - 1] + (-100.0);
+                back[i] = (i - 1, self.unk_id);
             }
         }
 

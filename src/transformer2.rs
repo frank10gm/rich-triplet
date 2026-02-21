@@ -28,6 +28,7 @@
 use crate::autograd2::{TensorNode, Mat};
 use crate::nn::InitRng;
 use crate::nn2::{Linear2, LayerNorm2, Mlp2, Module2};
+use std::cell::RefCell;
 
 // =============================================================================
 // Config (shared with scalar version — we re-use the same struct)
@@ -428,6 +429,242 @@ impl Module2 for Gpt2 {
 }
 
 // =============================================================================
+// KV Cache for Gpt2
+// =============================================================================
+//
+// Autoregressive generation without a KV cache is O(T²): every new token
+// requires re-computing attention over all T previous tokens from scratch.
+//
+// With a KV cache:
+//   • Prefill stage: run the full prompt [T_p tokens] through all layers once,
+//     storing K and V for each layer.
+//   • Decode stage: each new token only runs through attention once (1×d),
+//     reading the cached K/V from all previous positions.  → O(T) per step.
+//
+// ## Structure
+//
+// `Gpt2KvCache` holds one `HeadKvCache` per attention head per block.
+// Each `HeadKvCache` stores a growing matrix:
+//   k_cache: [seq_len, d_head]
+//   v_cache: [seq_len, d_head]
+//
+// ## Implementation note
+//
+// The standard multi-head attention in `transformer2.rs` separates each head
+// into its own `AttentionHead2` that independently projects and attends.
+// The cached version simply lets each head's K/V matrix grow incrementally.
+
+/// KV cache for a single attention head.
+pub struct HeadKvCache {
+    pub k: Mat,    // [seq_len, d_head]  — grows as tokens are decoded
+    pub v: Mat,    // [seq_len, d_head]
+    d_head: usize,
+}
+
+impl HeadKvCache {
+    fn new(d_head: usize) -> Self {
+        HeadKvCache {
+            k:      Mat::zeros(0, d_head),
+            v:      Mat::zeros(0, d_head),
+            d_head,
+        }
+    }
+
+    /// Append one new row (one new token's K or V) to the cache.
+    fn append_k(&mut self, row: &[f32]) {
+        assert_eq!(row.len(), self.d_head);
+        let old_rows = self.k.rows;
+        let mut new_data = Vec::with_capacity((old_rows + 1) * self.d_head);
+        new_data.extend_from_slice(&self.k.data);
+        new_data.extend_from_slice(row);
+        self.k = Mat::new(new_data, old_rows + 1, self.d_head);
+    }
+
+    fn append_v(&mut self, row: &[f32]) {
+        assert_eq!(row.len(), self.d_head);
+        let old_rows = self.v.rows;
+        let mut new_data = Vec::with_capacity((old_rows + 1) * self.d_head);
+        new_data.extend_from_slice(&self.v.data);
+        new_data.extend_from_slice(row);
+        self.v = Mat::new(new_data, old_rows + 1, self.d_head);
+    }
+}
+
+/// Per-block KV cache: one `HeadKvCache` per attention head.
+pub struct BlockKvCache {
+    pub heads: Vec<HeadKvCache>,
+}
+
+impl BlockKvCache {
+    fn new(n_heads: usize, d_head: usize) -> Self {
+        BlockKvCache { heads: (0..n_heads).map(|_| HeadKvCache::new(d_head)).collect() }
+    }
+}
+
+/// Full model KV cache: one `BlockKvCache` per transformer block.
+pub struct Gpt2KvCache {
+    pub blocks: Vec<RefCell<BlockKvCache>>,
+}
+
+impl Gpt2KvCache {
+    pub fn new(config: &Config) -> Self {
+        let d_head = config.d_head();
+        let blocks = (0..config.n_layers)
+            .map(|_| RefCell::new(BlockKvCache::new(config.n_heads, d_head)))
+            .collect();
+        Gpt2KvCache { blocks }
+    }
+}
+
+// =============================================================================
+// Cached attention forward
+// =============================================================================
+
+/// Compute attention for a single new token using the KV cache.
+///
+/// x_new: [1, d_model] — the new token's representation
+/// cache:  per-head K/V cache for this block
+///
+/// Returns: [1, d_model] attended output
+fn mha_forward_cached(
+    attn: &MultiHeadAttention2,
+    x_new: &TensorNode,
+    cache: &mut BlockKvCache,
+) -> TensorNode {
+    let d = attn.d_model;
+    let n_heads = attn.heads.len();
+    let dh = d / n_heads;
+    let t_new = x_new.data().rows; // always 1 during decode, T during prefill
+
+    // Compute Q, K, V projections for the new token(s)
+    let mut head_outs: Vec<TensorNode> = Vec::with_capacity(n_heads);
+
+    for (h, head) in attn.heads.iter().enumerate() {
+        let q_new = head.w_q.forward(x_new); // [t_new, d_head]
+        let k_new = head.w_k.forward(x_new); // [t_new, d_head]
+        let v_new = head.w_v.forward(x_new); // [t_new, d_head]
+
+        // Append each new token's K, V to the cache
+        let kd = k_new.data();
+        let vd = v_new.data();
+        for r in 0..t_new {
+            let k_row: Vec<f32> = (0..dh).map(|c| kd.at(r, c)).collect();
+            let v_row: Vec<f32> = (0..dh).map(|c| vd.at(r, c)).collect();
+            cache.heads[h].append_k(&k_row);
+            cache.heads[h].append_v(&v_row);
+        }
+
+        // Attend Q_new over full cached K, V (no causal mask needed —
+        // the cache only contains past tokens, so all are valid context)
+        let t_total = cache.heads[h].k.rows;
+        let k_full = TensorNode::leaf(cache.heads[h].k.clone());
+        let v_full = TensorNode::leaf(cache.heads[h].v.clone());
+
+        // Scaled dot-product: Q [t_new, dh] × K.T [dh, t_total] → [t_new, t_total]
+        let scale = (dh as f32).sqrt();
+        let scores_data = Mat::from_fn(t_new, t_total, |tq, tk| {
+            let dot: f32 = (0..dh).map(|d| q_new.data().at(tq, d) * k_full.data().at(tk, d)).sum();
+            dot / scale
+        });
+        // Softmax
+        let attn_weights_data = {
+            let mut w = Mat::zeros(t_new, t_total);
+            for r in 0..t_new {
+                let mx = (0..t_total).map(|c| scores_data.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = (0..t_total).map(|c| (scores_data.at(r, c) - mx).exp()).collect();
+                let s: f32 = exps.iter().sum();
+                for c in 0..t_total { *w.at_mut(r, c) = exps[c] / s; }
+            }
+            w
+        };
+        // Weighted sum of V: [t_new, t_total] × [t_total, dh] → [t_new, dh]
+        let out_data = Mat::from_fn(t_new, dh, |tq, d| {
+            (0..t_total).map(|tk| attn_weights_data.at(tq, tk) * v_full.data().at(tk, d)).sum()
+        });
+        head_outs.push(TensorNode::leaf(out_data));
+    }
+
+    // Concatenate heads → [t_new, d_model]
+    let concat_data = Mat::from_fn(t_new, d, |row, col| {
+        head_outs[col / dh].data().at(row, col % dh)
+    });
+    let concat = TensorNode::leaf(concat_data);
+    attn.w_o.forward(&concat)
+}
+
+/// Cached forward for a single `TransformerBlock2`.
+fn block_forward_cached(
+    block: &TransformerBlock2,
+    x: &TensorNode,
+    cache: &mut BlockKvCache,
+) -> TensorNode {
+    let attn_out = mha_forward_cached(&block.attn, &block.ln1.forward(x), cache);
+    let x2 = x.add(&attn_out);
+    let mlp_out = block.mlp.forward(&block.ln2.forward(&x2));
+    x2.add(&mlp_out)
+}
+
+impl Gpt2 {
+    /// Autoregressive generation with KV cache — O(T) per step.
+    ///
+    /// Equivalent to generating from `Gpt2` but avoids re-computing the full
+    /// context for every token.  Provides the same interface as
+    /// `GptOssModel::generate_cached`.
+    ///
+    /// ## Parameters
+    ///   token_ids:    prompt token ids
+    ///   max_new:      number of new tokens to generate
+    ///   temperature:  ≤ 0 = greedy, else temperature-scaled sampling
+    ///
+    /// ## Returns
+    ///   Vec of new token ids (not including the prompt).
+    pub fn generate_cached(&self, token_ids: &[usize], max_new: usize, temperature: f32) -> Vec<usize> {
+        let cache = Gpt2KvCache::new(&self.config);
+
+        // --- Prefill: run the full prompt, populate cache ---
+        let t_prompt = token_ids.len();
+        let mut x = self.embed.forward(token_ids);
+        for (bi, block) in self.blocks.iter().enumerate() {
+            x = block_forward_cached(block, &x, &mut cache.blocks[bi].borrow_mut());
+        }
+        let first_logits = self.lm_head.forward(&self.ln_final.forward(&x));
+
+        let mut generated = Vec::with_capacity(max_new);
+        let first_tok = gpt2_sample_token(&first_logits.data(), t_prompt - 1, temperature);
+        generated.push(first_tok);
+
+        // --- Decode: one token at a time ---
+        let mut prev_tok = first_tok;
+        for _ in 1..max_new {
+            let x = self.embed.forward(&[prev_tok]);
+            let mut x2 = x;
+            for (bi, block) in self.blocks.iter().enumerate() {
+                x2 = block_forward_cached(block, &x2, &mut cache.blocks[bi].borrow_mut());
+            }
+            let logits = self.lm_head.forward(&self.ln_final.forward(&x2));
+            prev_tok = gpt2_sample_token(&logits.data(), 0, temperature);
+            generated.push(prev_tok);
+        }
+        generated
+    }
+}
+
+/// Simple temperature sampler for Gpt2 generation (greedy or argmax).
+fn gpt2_sample_token(logits: &Mat, pos: usize, temperature: f32) -> usize {
+    let v = logits.cols;
+    if temperature <= 0.0 {
+        return (0..v).max_by(|&a, &b|
+            logits.at(pos, a).partial_cmp(&logits.at(pos, b)).unwrap()
+        ).unwrap();
+    }
+    let row_max = (0..v).map(|c| logits.at(pos, c)).fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = (0..v).map(|c| ((logits.at(pos, c) - row_max) / temperature).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+    probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap()
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -593,5 +830,57 @@ mod tests {
                 "gradient should be finite after backward"
             );
         }
+    }
+
+    // --- KV cache ---
+
+    #[test]
+    fn test_generate_cached_output_length() {
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let toks = model.generate_cached(&[0, 1, 2], 5, 0.0);
+        assert_eq!(toks.len(), 5, "expected 5 new tokens");
+    }
+
+    #[test]
+    fn test_generate_cached_tokens_in_vocab() {
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let toks = model.generate_cached(&[1, 2, 3], 4, 0.0);
+        for &t in &toks {
+            assert!(t < cfg.vocab_size, "token {} ≥ vocab_size {}", t, cfg.vocab_size);
+        }
+    }
+
+    #[test]
+    fn test_generate_cached_first_token_matches_forward() {
+        // The first generated token (greedy) must equal predict_next on the prompt.
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let prompt = vec![0usize, 2, 4];
+
+        // predict_next via full forward
+        let logits = model.forward(&prompt);
+        let ld = logits.data();
+        let t = ld.rows;
+        let v = ld.cols;
+        let uncached = (0..v).max_by(|&a, &b| ld.at(t-1, a).partial_cmp(&ld.at(t-1, b)).unwrap()).unwrap();
+
+        let cached = model.generate_cached(&prompt, 1, 0.0)[0];
+        assert_eq!(cached, uncached,
+            "cached first token {} != uncached {}", cached, uncached);
+    }
+
+    #[test]
+    fn test_generate_cached_deterministic() {
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let r1 = model.generate_cached(&[0, 1], 6, 0.0);
+        let r2 = model.generate_cached(&[0, 1], 6, 0.0);
+        assert_eq!(r1, r2, "greedy generation must be deterministic");
     }
 }
