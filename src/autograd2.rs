@@ -725,6 +725,226 @@ impl TensorNode {
     }
 
     // =========================================================================
+    // GPT-OSS inference primitives (forward only — no backward_fn)
+    // =========================================================================
+    //
+    // These ops implement the architectural features of GPT-OSS that are not
+    // present in GPT-2. They are inference-only: no backward_fn is registered,
+    // so gradients do not flow through them. This is intentional — GPT-OSS at
+    // 20B parameters cannot be trained in this codebase anyway.
+
+    /// RMS Layer Normalization — normalizes each row by its RMS value.
+    ///
+    /// RMSNorm(x) = x / sqrt(mean(x²) + eps) * gamma
+    ///
+    /// Compared to LayerNorm, RMSNorm:
+    ///   - Has no beta (no learned bias, just centering is skipped)
+    ///   - Divides by RMS instead of std deviation
+    ///   - Is simpler and slightly faster (no mean subtraction)
+    ///   - Used by LLaMA, Mistral, GPT-OSS, and most post-2022 models
+    ///
+    /// gamma: [1, d_model]  — learned scale (initialized to ones)
+    /// x:     [T, d_model]  — input
+    /// out:   [T, d_model]  — normalized output
+    ///
+    /// Backward (for reference, not implemented here):
+    ///   Similar to LayerNorm but simpler — no mean subtraction term.
+    pub fn rms_norm(&self, gamma: &TensorNode, eps: f32) -> TensorNode {
+        let x = self.data().clone();
+        let g = gamma.data().clone();
+        let (t, d) = (x.rows, x.cols);
+
+        let out_data = Mat::from_fn(t, d, |r, c| {
+            let rms = ((0..d).map(|j| x.at(r, j).powi(2)).sum::<f32>() / d as f32 + eps).sqrt();
+            x.at(r, c) / rms * g.at(0, c)
+        });
+
+        // Inference only: leaf node, no backward_fn
+        TensorNode::leaf(out_data)
+    }
+
+    /// SiLU (Sigmoid Linear Unit) activation: SiLU(x) = x * sigmoid(x)
+    ///
+    /// This is the activation used inside SwiGLU (the GPT-OSS FFN activation).
+    /// SiLU is smoother than ReLU and empirically outperforms GELU on many tasks.
+    ///
+    /// Note: our existing gelu() uses the approximation x*sigmoid(1.702x),
+    /// which is actually an approximation of SiLU. SiLU is the exact version.
+    ///
+    /// Backward (for reference, not implemented here):
+    ///   d/dx [x*σ(x)] = σ(x) + x*σ(x)*(1-σ(x)) = σ(x)*(1 + x*(1-σ(x)))
+    pub fn silu(&self) -> TensorNode {
+        let x = self.data().clone();
+        let out_data = x.map(|v| {
+            let s = 1.0 / (1.0 + (-v).exp()); // sigmoid(v)
+            v * s
+        });
+        TensorNode::leaf(out_data)
+    }
+
+    /// Element-wise multiplication of two same-shape TensorNodes.
+    ///
+    /// Used in SwiGLU: hidden = SiLU(gate) * up
+    /// This is a new inference-only op (the existing mul_elem is on Mat, not TensorNode).
+    ///
+    /// Backward (for reference, not implemented here):
+    ///   dA = dC * B,  dB = dC * A
+    pub fn mul_elem_node(&self, other: &TensorNode) -> TensorNode {
+        let a = self.data().clone();
+        let b = other.data().clone();
+        assert_eq!((a.rows, a.cols), (b.rows, b.cols),
+            "mul_elem_node: shape mismatch [{},{}] vs [{},{}]", a.rows, a.cols, b.rows, b.cols);
+        TensorNode::leaf(a.mul_elem(&b))
+    }
+
+    /// Apply Rotary Position Embeddings (RoPE) to a [T, d_head] tensor.
+    ///
+    /// RoPE encodes position by rotating pairs of dimensions in Q and K vectors.
+    /// Unlike learned positional embeddings (GPT-2) which add a fixed vector,
+    /// RoPE modifies the dot products Q·K such that the attention score between
+    /// positions i and j depends only on their *relative* distance (i - j).
+    ///
+    /// This is why RoPE generalizes better to sequence lengths longer than
+    /// those seen during training (with YaRN scaling).
+    ///
+    /// Algorithm for position t, dimension pair (2i, 2i+1):
+    ///   angle  = t / theta^(2i / d_head)
+    ///   x'[2i]   = x[2i]   * cos(angle) - x[2i+1] * sin(angle)
+    ///   x'[2i+1] = x[2i+1] * cos(angle) + x[2i]   * sin(angle)
+    ///
+    /// Parameters:
+    ///   self:       [T, d_head]  — Q or K for a single head
+    ///   seq_offset: position index of the first token (0 for new sequences)
+    ///   theta:      rope_theta from config (10000 for LLaMA, 150000 for GPT-OSS)
+    ///
+    /// Backward (for reference, not implemented here):
+    ///   Rotation is an orthogonal transform — backward is just rotation by -angle.
+    pub fn rope_apply(&self, seq_offset: usize, theta: f32) -> TensorNode {
+        let x = self.data().clone();
+        let (t, d) = (x.rows, x.cols);
+        assert!(d % 2 == 0, "rope_apply: d_head must be even, got {}", d);
+
+        let out_data = Mat::from_fn(t, d, |row, col| {
+            let pos = (seq_offset + row) as f32;
+            let pair = col / 2;       // which rotation pair
+            let is_odd = col % 2 == 1;
+            let angle = pos / theta.powf(2.0 * pair as f32 / d as f32);
+            let (cos_a, sin_a) = (angle.cos(), angle.sin());
+
+            if !is_odd {
+                // even index: x[2i]*cos - x[2i+1]*sin
+                x.at(row, col) * cos_a - x.at(row, col + 1) * sin_a
+            } else {
+                // odd index: x[2i+1]*cos + x[2i]*sin
+                x.at(row, col) * cos_a + x.at(row, col - 1) * sin_a
+            }
+        });
+
+        TensorNode::leaf(out_data)
+    }
+
+    /// Grouped Multi-Query Attention (GQA) with causal mask — inference only.
+    ///
+    /// GQA is a memory-efficient variant of multi-head attention where Q has
+    /// n_q_heads projection heads but K and V share only n_kv_heads heads.
+    ///
+    /// Each "group" of (n_q_heads / n_kv_heads) Q heads shares one K and V head.
+    /// This reduces the KV cache size by n_q_heads/n_kv_heads × during inference.
+    ///
+    /// For GPT-OSS-20b: n_q_heads=64, n_kv_heads=8, group_size=8.
+    ///
+    /// Parameters:
+    ///   q: [T, n_q_heads * d_head]   — all Q projections concatenated
+    ///   k: [T, n_kv_heads * d_head]  — all K projections concatenated
+    ///   v: [T, n_kv_heads * d_head]  — all V projections concatenated
+    ///
+    /// Returns: [T, n_q_heads * d_head]
+    ///
+    /// Algorithm:
+    ///   For each q_head h:
+    ///     kv_head = h / group_size
+    ///     Q_h = q[:, h*d_head:(h+1)*d_head]
+    ///     K_h = k[:, kv_head*d_head:(kv_head+1)*d_head]
+    ///     V_h = v[:, kv_head*d_head:(kv_head+1)*d_head]
+    ///     out_h = causal_softmax(Q_h @ K_h.T / sqrt(d_head)) @ V_h
+    ///   return concat(out_0, ..., out_{n_q_heads-1})
+    ///
+    /// Backward (for reference, not implemented here):
+    ///   Same as causal_attention but gradient for K/V accumulates from all
+    ///   Q heads in the group.
+    pub fn gqa_attention(
+        q: &TensorNode,
+        k: &TensorNode,
+        v: &TensorNode,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+    ) -> TensorNode {
+        let q_data = q.data().clone();
+        let k_data = k.data().clone();
+        let v_data = v.data().clone();
+        let t = q_data.rows;
+        let scale = 1.0 / (d_head as f32).sqrt();
+        let group_size = n_q_heads / n_kv_heads;
+
+        assert_eq!(q_data.cols, n_q_heads * d_head);
+        assert_eq!(k_data.cols, n_kv_heads * d_head);
+        assert_eq!(v_data.cols, n_kv_heads * d_head);
+
+        // Output: [T, n_q_heads * d_head]
+        let mut out_data = Mat::zeros(t, n_q_heads * d_head);
+
+        for qh in 0..n_q_heads {
+            let kvh = qh / group_size; // which KV head to use
+
+            // Extract Q slice: [T, d_head]
+            let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh * d_head + c));
+
+            // Extract K slice: [T, d_head]
+            let k_h = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+
+            // Extract V slice: [T, d_head]
+            let v_h = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+
+            // Causal attention for this head: scores = Q_h @ K_h.T / scale
+            let mut scores = q_h.matmul(&k_h.transpose()).scale(scale);
+            for i in 0..t {
+                for j in (i + 1)..t {
+                    *scores.at_mut(i, j) = -1e9; // causal mask
+                }
+            }
+
+            // Softmax row-wise
+            let weights = {
+                let mut w = Mat::zeros(t, t);
+                for r in 0..t {
+                    let row_max = (0..t).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                    let mut row_sum = 0.0f32;
+                    for c in 0..t {
+                        let e = (scores.at(r, c) - row_max).exp();
+                        *w.at_mut(r, c) = e;
+                        row_sum += e;
+                    }
+                    for c in 0..t { *w.at_mut(r, c) /= row_sum; }
+                }
+                w
+            };
+
+            // out_h = weights @ V_h : [T, d_head]
+            let out_h = weights.matmul(&v_h);
+
+            // Write into output slice
+            for r in 0..t {
+                for c in 0..d_head {
+                    *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c);
+                }
+            }
+        }
+
+        TensorNode::leaf(out_data)
+    }
+
+    // =========================================================================
     // Backward pass
     // =========================================================================
 

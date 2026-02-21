@@ -9,6 +9,7 @@ mod autograd2;
 mod nn2;
 mod transformer2;
 mod train2;
+mod transformer3;
 
 use tokenizer::CharTokenizer;
 use tokenizer::Tokenizer;

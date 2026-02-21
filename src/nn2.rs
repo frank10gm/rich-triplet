@@ -221,6 +221,92 @@ impl Module2 for Mlp2 {
 }
 
 // =============================================================================
+// RmsNorm2 — RMS Layer Normalization (used by GPT-OSS, LLaMA, Mistral)
+// =============================================================================
+//
+// RMSNorm(x) = x / RMS(x) * gamma
+//
+// Simpler than LayerNorm: no mean subtraction, no beta term.
+// Empirically just as effective, slightly faster.
+
+pub struct RmsNorm2 {
+    pub gamma: TensorNode,  // [1, d_model]  — initialized to ones
+    pub d_model: usize,
+}
+
+impl RmsNorm2 {
+    pub fn new(d_model: usize) -> Self {
+        RmsNorm2 {
+            gamma: TensorNode::leaf(Mat::ones(1, d_model)),
+            d_model,
+        }
+    }
+
+    /// x: [T, d_model]  →  normalized: [T, d_model]
+    pub fn forward(&self, x: &TensorNode) -> TensorNode {
+        x.rms_norm(&self.gamma, 1e-5)
+    }
+}
+
+impl Module2 for RmsNorm2 {
+    fn parameters(&self) -> Vec<TensorNode> {
+        vec![self.gamma.clone()]
+    }
+}
+
+// =============================================================================
+// SwiGluMlp2 — SwiGLU Feed-Forward Network (used by GPT-OSS, LLaMA, PaLM)
+// =============================================================================
+//
+// Standard FFN (GPT-2):  x → Linear → GELU → Linear
+//
+// SwiGLU FFN (GPT-OSS):
+//   gate  = x @ W_gate    [T, intermediate_size]
+//   up    = x @ W_up      [T, intermediate_size]
+//   hidden = SiLU(gate) * up   (element-wise; SiLU = x*sigmoid(x))
+//   out   = hidden @ W_down    [T, d_model]
+//
+// The "gating" mechanism (SiLU(gate) * up) allows the network to selectively
+// suppress or amplify each feature dimension — more expressive than a single
+// activation function.
+//
+// Note: no bias in projections (matches GPT-OSS config: attention_bias=true
+// only for attention, not for FFN).
+
+pub struct SwiGluMlp2 {
+    pub gate_proj: Linear2,   // d_model → intermediate_size
+    pub up_proj:   Linear2,   // d_model → intermediate_size
+    pub down_proj: Linear2,   // intermediate_size → d_model
+}
+
+impl SwiGluMlp2 {
+    pub fn new(d_model: usize, intermediate_size: usize, rng: &mut InitRng) -> Self {
+        SwiGluMlp2 {
+            gate_proj: Linear2::new(d_model, intermediate_size, rng),
+            up_proj:   Linear2::new(d_model, intermediate_size, rng),
+            down_proj: Linear2::new(intermediate_size, d_model, rng),
+        }
+    }
+
+    /// x: [T, d_model]  →  output: [T, d_model]
+    pub fn forward(&self, x: &TensorNode) -> TensorNode {
+        let gate   = self.gate_proj.forward(x).silu();   // SiLU(x @ W_gate)
+        let up     = self.up_proj.forward(x);             // x @ W_up
+        let hidden = gate.mul_elem_node(&up);             // element-wise product
+        self.down_proj.forward(&hidden)                   // hidden @ W_down
+    }
+}
+
+impl Module2 for SwiGluMlp2 {
+    fn parameters(&self) -> Vec<TensorNode> {
+        let mut p = self.gate_proj.parameters();
+        p.extend(self.up_proj.parameters());
+        p.extend(self.down_proj.parameters());
+        p
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
