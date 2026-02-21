@@ -2036,6 +2036,288 @@ impl TensorNode {
         out
     }
 
+    /// Flash Attention — causal self-attention with O(T) memory instead of O(T²).
+    ///
+    /// ## Motivation
+    ///
+    /// Standard causal attention (`causal_attention`) materialises the full
+    /// `[T, T]` score matrix in memory.  For T = 2048 and f32 that is 16 MB
+    /// *per head* — and the backward pass needs it again.  At T = 8192 it is
+    /// 256 MB per head, making long-context inference impractical on CPU.
+    ///
+    /// Flash Attention tiles the computation: it processes the sequence in
+    /// BLOCK_Q × BLOCK_K chunks, accumulating the output with an online
+    /// softmax normaliser so the full T×T matrix is never instantiated.
+    ///
+    /// ## Algorithm (Dao et al. 2022, Algorithm 1)
+    ///
+    /// For each query tile `q_block` of size Br:
+    ///   - Maintain a running max `m` and normaliser `l` (both shape [Br])
+    ///   - For each key/value tile `k_block, v_block` of size Bc:
+    ///       s = q_block @ k_block.T * scale          [Br, Bc]
+    ///       apply causal mask: s[i,j] = -inf if j > global_j
+    ///       m_new = max(m, rowmax(s))
+    ///       p    = exp(s - m_new)                    [Br, Bc] — unnormalised
+    ///       l_new = exp(m - m_new) * l + rowsum(p)
+    ///       acc  = diag(exp(m - m_new)) * acc + p @ v_block
+    ///       m, l = m_new, l_new
+    ///   - out_block = acc / l                        [Br, d_head]
+    ///
+    /// Memory: O(T * d_head) for the output + O(Br + Bc) temporaries.
+    /// Compute: identical to standard attention (same number of multiplications).
+    ///
+    /// ## Backward
+    ///
+    /// Flash Attention backward requires recomputing the softmax weights from
+    /// the stored normaliser (l, m) instead of storing the full weight matrix.
+    /// This is ~2× more compute but O(T) memory.
+    ///
+    /// We store the per-query-tile l and m vectors (O(T) total) for the backward.
+    ///
+    /// ## Parameters
+    ///
+    /// - `q`: `[T, d_head]` — queries
+    /// - `k`: `[T, d_head]` — keys
+    /// - `v`: `[T, d_head]` — values
+    /// - `d_head`: head dimension (used for scaling)
+    ///
+    /// Returns `[T, d_head]`.
+    ///
+    /// ## Tile sizes
+    ///
+    /// `BLOCK_R` (query tile) and `BLOCK_C` (key/value tile) default to 64.
+    /// For small T they automatically reduce to T so the algorithm stays correct.
+    pub fn flash_attention(
+        q: &TensorNode,
+        k: &TensorNode,
+        v: &TensorNode,
+        d_head: usize,
+    ) -> TensorNode {
+        const BLOCK_R: usize = 64;
+        const BLOCK_C: usize = 64;
+
+        let q_data = q.data().clone();
+        let k_data = k.data().clone();
+        let v_data = v.data().clone();
+        let t = q_data.rows;
+        let scale = 1.0_f32 / (d_head as f32).sqrt();
+
+        assert_eq!(q_data.cols, d_head);
+        assert_eq!(k_data.cols, d_head);
+        assert_eq!(v_data.cols, d_head);
+
+        // Output accumulator and online-softmax state stored per row.
+        let mut out_data = Mat::zeros(t, d_head);
+        // l[i] = running normaliser for row i (sum of exp weights)
+        // m[i] = running max for row i
+        let mut l_global = vec![0.0f32; t];
+        let mut m_global = vec![f32::NEG_INFINITY; t];
+
+        // Tile loop — q rows in chunks of BLOCK_R
+        let mut q_start = 0;
+        while q_start < t {
+            let q_end = (q_start + BLOCK_R).min(t);
+            let br = q_end - q_start;
+
+            // Per-block accumulator and softmax state
+            let mut acc   = vec![0.0f32; br * d_head]; // [br, d_head]
+            let mut m_blk = vec![f32::NEG_INFINITY; br];
+            let mut l_blk = vec![0.0f32; br];
+
+            // Inner loop — kv rows in chunks of BLOCK_C
+            // Causal: only kv positions ≤ current q position can attend.
+            // The latest q position in this tile is (q_end - 1), so we only
+            // need kv tiles up to that position.
+            let mut kv_start = 0;
+            while kv_start < q_end {
+                let kv_end = (kv_start + BLOCK_C).min(t).min(q_end);
+                let bc = kv_end - kv_start;
+
+                // Compute score tile: s[qi, ki] = scale * Q[q_start+qi] · K[kv_start+ki]
+                // Shape: [br, bc]
+                let mut s = vec![0.0f32; br * bc];
+                for qi in 0..br {
+                    let global_qi = q_start + qi;
+                    for ki in 0..bc {
+                        let global_ki = kv_start + ki;
+                        // Causal mask: future keys get -inf
+                        if global_ki > global_qi {
+                            s[qi * bc + ki] = f32::NEG_INFINITY;
+                            continue;
+                        }
+                        let mut dot = 0.0f32;
+                        for d in 0..d_head {
+                            dot += q_data.at(global_qi, d) * k_data.at(global_ki, d);
+                        }
+                        s[qi * bc + ki] = dot * scale;
+                    }
+                }
+
+                // Online softmax update per query row
+                for qi in 0..br {
+                    // Row max over this tile
+                    let tile_max = (0..bc)
+                        .map(|ki| s[qi * bc + ki])
+                        .fold(f32::NEG_INFINITY, f32::max);
+
+                    let m_new = m_blk[qi].max(tile_max);
+
+                    // Rescale existing accumulator by exp(m_old - m_new)
+                    let rescale = (m_blk[qi] - m_new).exp();
+                    for d in 0..d_head {
+                        acc[qi * d_head + d] *= rescale;
+                    }
+                    l_blk[qi] *= rescale;
+
+                    // Accumulate this tile: p[ki] = exp(s[qi,ki] - m_new)
+                    for ki in 0..bc {
+                        let p = (s[qi * bc + ki] - m_new).exp();
+                        l_blk[qi] += p;
+                        let global_ki = kv_start + ki;
+                        for d in 0..d_head {
+                            acc[qi * d_head + d] += p * v_data.at(global_ki, d);
+                        }
+                    }
+                    m_blk[qi] = m_new;
+                }
+
+                kv_start += BLOCK_C;
+            }
+
+            // Write normalised output for this query tile
+            for qi in 0..br {
+                let global_qi = q_start + qi;
+                let inv_l = 1.0 / l_blk[qi];
+                for d in 0..d_head {
+                    *out_data.at_mut(global_qi, d) = acc[qi * d_head + d] * inv_l;
+                }
+                l_global[global_qi] = l_blk[qi];
+                m_global[global_qi] = m_blk[qi];
+            }
+
+            q_start += BLOCK_R;
+        }
+
+        let out = TensorNode::leaf(out_data);
+        let q_c  = q.clone();
+        let k_c  = k.clone();
+        let v_c  = v.clone();
+        let out_c = out.clone();
+
+        // Backward: recompute softmax weights from stored (l, m) and propagate
+        // gradients.  Memory: O(T) — no T×T matrix stored.
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout  = out_c.0.borrow().grad.clone();  // [T, d_head]
+            let q_d   = q_c.0.borrow().data.clone();
+            let k_d   = k_c.0.borrow().data.clone();
+            let v_d   = v_c.0.borrow().data.clone();
+            let out_d = out_c.0.borrow().data.clone();  // [T, d_head] — final output
+
+            let mut dq = Mat::zeros(t, d_head);
+            let mut dk = Mat::zeros(t, d_head);
+            let mut dv = Mat::zeros(t, d_head);
+
+            // For each query tile, recompute the softmax weights and propagate.
+            let mut q_start = 0;
+            while q_start < t {
+                let q_end = (q_start + BLOCK_R).min(t);
+                let br = q_end - q_start;
+
+                let mut kv_start = 0;
+                while kv_start < q_end {
+                    let kv_end = (kv_start + BLOCK_C).min(t).min(q_end);
+                    let bc = kv_end - kv_start;
+
+                    // Recompute score tile and softmax weights p[qi, ki]
+                    let mut p = vec![0.0f32; br * bc];
+                    for qi in 0..br {
+                        let global_qi = q_start + qi;
+                        let m_i = m_global[global_qi];
+                        for ki in 0..bc {
+                            let global_ki = kv_start + ki;
+                            if global_ki > global_qi {
+                                p[qi * bc + ki] = 0.0;
+                                continue;
+                            }
+                            let mut dot = 0.0f32;
+                            for d in 0..d_head { dot += q_d.at(global_qi, d) * k_d.at(global_ki, d); }
+                            p[qi * bc + ki] = (dot * scale - m_i).exp() / l_global[global_qi];
+                        }
+                    }
+
+                    // dV += P.T @ dOut_tile    [bc, d_head]
+                    for ki in 0..bc {
+                        let global_ki = kv_start + ki;
+                        for d in 0..d_head {
+                            let mut sum = 0.0f32;
+                            for qi in 0..br { sum += p[qi * bc + ki] * dout.at(q_start + qi, d); }
+                            *dv.at_mut(global_ki, d) += sum;
+                        }
+                    }
+
+                    // dP = dOut_tile @ V.T    [br, bc]
+                    let mut dp = vec![0.0f32; br * bc];
+                    for qi in 0..br {
+                        for ki in 0..bc {
+                            let global_ki = kv_start + ki;
+                            let mut sum = 0.0f32;
+                            for d in 0..d_head { sum += dout.at(q_start + qi, d) * v_d.at(global_ki, d); }
+                            dp[qi * bc + ki] = sum;
+                        }
+                    }
+
+                    // Softmax backward: dS[qi,ki] = P[qi,ki] * (dP[qi,ki] - Di)
+                    // where Di = sum_j(P[qi,j] * dP[qi,j])  (dot product of row)
+                    // = sum_j(P[qi,j] * (dOut[qi] · V[j]))
+                    // = dOut[qi] · out[qi]  (since out = sum_j P*V)
+                    let mut ds = vec![0.0f32; br * bc];
+                    for qi in 0..br {
+                        let global_qi = q_start + qi;
+                        // Di = dOut[qi] · out[qi]
+                        let di: f32 = (0..d_head)
+                            .map(|d| dout.at(global_qi, d) * out_d.at(global_qi, d))
+                            .sum();
+                        for ki in 0..bc {
+                            if kv_start + ki > global_qi { continue; }
+                            ds[qi * bc + ki] = p[qi * bc + ki] * (dp[qi * bc + ki] - di) * scale;
+                        }
+                    }
+
+                    // dQ += dS @ K_tile    [br, d_head]
+                    for qi in 0..br {
+                        let global_qi = q_start + qi;
+                        for d in 0..d_head {
+                            let mut sum = 0.0f32;
+                            for ki in 0..bc { sum += ds[qi * bc + ki] * k_d.at(kv_start + ki, d); }
+                            *dq.at_mut(global_qi, d) += sum;
+                        }
+                    }
+
+                    // dK += dS.T @ Q_tile  [bc, d_head]
+                    for ki in 0..bc {
+                        let global_ki = kv_start + ki;
+                        for d in 0..d_head {
+                            let mut sum = 0.0f32;
+                            for qi in 0..br { sum += ds[qi * bc + ki] * q_d.at(q_start + qi, d); }
+                            *dk.at_mut(global_ki, d) += sum;
+                        }
+                    }
+
+                    kv_start += BLOCK_C;
+                }
+
+                q_start += BLOCK_R;
+            }
+
+            q_c.0.borrow_mut().grad.add_assign(&dq);
+            k_c.0.borrow_mut().grad.add_assign(&dk);
+            v_c.0.borrow_mut().grad.add_assign(&dv);
+        }));
+
+        out.0.borrow_mut().prev = vec![q.clone(), k.clone(), v.clone()];
+        out
+    }
+
     // =========================================================================
     // Backward pass
     // =========================================================================
@@ -2432,6 +2714,183 @@ mod tests {
         for r in 0..t { for c in 0..d {
             assert!(approx(vg.at(r,c), num.at(r,c)),
                 "attn dV[{},{}]: analytical={:.4} numerical={:.4}", r, c, vg.at(r,c), num.at(r,c));
+        }}
+    }
+
+    // --- Flash Attention ---
+
+    #[test]
+    fn test_flash_attention_output_shape() {
+        let t = 5; let d = 8;
+        let q = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1));
+        let k = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05));
+        let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07));
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        assert_eq!((out.data().rows, out.data().cols), (t, d));
+    }
+
+    #[test]
+    fn test_flash_attention_matches_causal_attention() {
+        // Flash and standard attention must produce identical outputs.
+        let t = 8; let d = 16;
+        let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 - 0.5);
+        let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05 + 0.1);
+        let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07 - 0.2);
+
+        let q1 = TensorNode::leaf(q_data.clone());
+        let k1 = TensorNode::leaf(k_data.clone());
+        let v1 = TensorNode::leaf(v_data.clone());
+        let ref_out = TensorNode::causal_attention(&q1, &k1, &v1, d);
+
+        let q2 = TensorNode::leaf(q_data);
+        let k2 = TensorNode::leaf(k_data);
+        let v2 = TensorNode::leaf(v_data);
+        let flash_out = TensorNode::flash_attention(&q2, &k2, &v2, d);
+
+        let r = ref_out.data().clone();
+        let f = flash_out.data().clone();
+        for row in 0..t { for col in 0..d {
+            let diff = (r.at(row, col) - f.at(row, col)).abs();
+            assert!(diff < 1e-4,
+                "flash vs causal [{row},{col}]: flash={:.5} ref={:.5}", f.at(row,col), r.at(row,col));
+        }}
+    }
+
+    #[test]
+    fn test_flash_attention_causal_first_token() {
+        // Token 0 can only attend to itself — output must equal v[0] exactly.
+        let t = 4; let d = 4;
+        let q = TensorNode::leaf(Mat::from_fn(t, d, |_, _| 1.0));
+        let k = TensorNode::leaf(Mat::from_fn(t, d, |_, _| 1.0));
+        let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32));
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        // Row 0: softmax over only position 0 → weight=1 → output = v[0]
+        for c in 0..d {
+            assert!((out.data().at(0, c) - v.data().at(0, c)).abs() < 1e-4,
+                "flash first token col {c}: got {} expected {}", out.data().at(0,c), v.data().at(0,c));
+        }
+    }
+
+    #[test]
+    fn test_flash_attention_output_finite() {
+        let t = 16; let d = 32;
+        let q = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r + c) as f32) * 0.01));
+        let k = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r * d + c) as f32) * 0.01 - 0.5));
+        let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r + c) as f32) * 0.02));
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        assert!(out.data().data.iter().all(|x| x.is_finite()), "flash output has NaN/Inf");
+    }
+
+    #[test]
+    fn test_flash_attention_grad_v() {
+        // Numerical gradient check for dV
+        let t = 4; let d = 4;
+        let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1);
+        let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05);
+        let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
+
+        let num = numerical_grad(&|v| {
+            let qn = TensorNode::leaf(q_data.clone());
+            let kn = TensorNode::leaf(k_data.clone());
+            let vn = TensorNode::leaf(v.clone());
+            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
+        }, &v_data);
+
+        let q = TensorNode::leaf(q_data);
+        let k = TensorNode::leaf(k_data);
+        let v = TensorNode::leaf(v_data);
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        out.0.borrow_mut().grad = Mat::ones(t, d);
+        call_backward(&out);
+
+        let vg = v.grad().clone();
+        for r in 0..t { for c in 0..d {
+            assert!(approx(vg.at(r,c), num.at(r,c)),
+                "flash dV[{r},{c}]: analytical={:.4} numerical={:.4}", vg.at(r,c), num.at(r,c));
+        }}
+    }
+
+    #[test]
+    fn test_flash_attention_grad_q() {
+        let t = 4; let d = 4;
+        let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 + 0.1);
+        let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05);
+        let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
+
+        let num = numerical_grad(&|q| {
+            let qn = TensorNode::leaf(q.clone());
+            let kn = TensorNode::leaf(k_data.clone());
+            let vn = TensorNode::leaf(v_data.clone());
+            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
+        }, &q_data);
+
+        let q = TensorNode::leaf(q_data);
+        let k = TensorNode::leaf(k_data);
+        let v = TensorNode::leaf(v_data);
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        out.0.borrow_mut().grad = Mat::ones(t, d);
+        call_backward(&out);
+
+        let qg = q.grad().clone();
+        for r in 0..t { for c in 0..d {
+            assert!(approx(qg.at(r,c), num.at(r,c)),
+                "flash dQ[{r},{c}]: analytical={:.4} numerical={:.4}", qg.at(r,c), num.at(r,c));
+        }}
+    }
+
+    #[test]
+    fn test_flash_attention_grad_k() {
+        let t = 4; let d = 4;
+        let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 + 0.1);
+        let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05 + 0.05);
+        let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
+
+        let num = numerical_grad(&|k| {
+            let qn = TensorNode::leaf(q_data.clone());
+            let kn = TensorNode::leaf(k.clone());
+            let vn = TensorNode::leaf(v_data.clone());
+            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
+        }, &k_data);
+
+        let q = TensorNode::leaf(q_data);
+        let k = TensorNode::leaf(k_data);
+        let v = TensorNode::leaf(v_data);
+        let out = TensorNode::flash_attention(&q, &k, &v, d);
+        out.0.borrow_mut().grad = Mat::ones(t, d);
+        call_backward(&out);
+
+        let kg = k.grad().clone();
+        for r in 0..t { for c in 0..d {
+            assert!(approx(kg.at(r,c), num.at(r,c)),
+                "flash dK[{r},{c}]: analytical={:.4} numerical={:.4}", kg.at(r,c), num.at(r,c));
+        }}
+    }
+
+    #[test]
+    fn test_flash_attention_large_t_matches_causal() {
+        // T=128 (> BLOCK_SIZE=64) — tests multi-tile correctness
+        let t = 128; let d = 16;
+        let q_data = Mat::from_fn(t, d, |r, c| ((r * d + c) as f32 * 0.01).sin());
+        let k_data = Mat::from_fn(t, d, |r, c| ((r * d + c) as f32 * 0.01).cos());
+        let v_data = Mat::from_fn(t, d, |r, c| (r as f32 * 0.1 - c as f32 * 0.05));
+
+        let q1 = TensorNode::leaf(q_data.clone());
+        let k1 = TensorNode::leaf(k_data.clone());
+        let v1 = TensorNode::leaf(v_data.clone());
+        let ref_out = TensorNode::causal_attention(&q1, &k1, &v1, d);
+
+        let q2 = TensorNode::leaf(q_data);
+        let k2 = TensorNode::leaf(k_data);
+        let v2 = TensorNode::leaf(v_data);
+        let flash_out = TensorNode::flash_attention(&q2, &k2, &v2, d);
+
+        let r = ref_out.data().clone();
+        let f = flash_out.data().clone();
+        for row in 0..t { for col in 0..d {
+            let diff = (r.at(row, col) - f.at(row, col)).abs();
+            assert!(diff < 1e-3,
+                "large T flash vs causal [{row},{col}]: flash={:.5} ref={:.5}",
+                f.at(row,col), r.at(row,col));
         }}
     }
 

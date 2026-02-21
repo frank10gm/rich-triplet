@@ -13,13 +13,13 @@ mod transformer3;
 #[cfg(feature = "metal")]
 mod metal_ops;
 
-use tokenizer::CharTokenizer;
-use tokenizer::Tokenizer;
+use tokenizer::{CharTokenizer, BpeTokenizer, Tokenizer};
 use dataset::TextDataset;
 use transformer::{Config, Gpt};
 use train::{TrainConfig, train, generate};
 use transformer2::Gpt2;
 use train2::{TrainConfig2, train2, generate2};
+use transformer3::{GptOssModel, Config3, SamplingParams};
 use nn::InitRng;
 
 // =============================================================================
@@ -75,23 +75,223 @@ oggi ieri domani adesso sempre mai spesso raramente
 today yesterday tomorrow now always never often rarely
 ";
 
+// =============================================================================
+// CLI argument parsing
+// =============================================================================
+
+struct CliArgs {
+    /// --prompt TEXT     : text to complete (triggers generation mode)
+    prompt:      Option<String>,
+    /// --weights DIR     : directory with .safetensors shards for GPT-OSS
+    weights:     Option<String>,
+    /// --vocab PATH      : BPE vocab.json (required with --weights)
+    vocab:       Option<String>,
+    /// --merges PATH     : BPE merges.txt (required with --weights)
+    merges:      Option<String>,
+    /// --max-new N       : tokens to generate (default 200)
+    max_new:     usize,
+    /// --temp T          : sampling temperature (default 0.8)
+    temperature: f32,
+    /// --top-k K         : top-k cutoff (default 40, 0 = disabled)
+    top_k:       usize,
+    /// --top-p P         : nucleus probability (default 1.0 = disabled)
+    top_p:       f32,
+    /// --seed S          : RNG seed (default 42)
+    seed:        u64,
+    /// --train-steps N   : steps for on-the-fly training (default 200)
+    train_steps: usize,
+}
+
+impl CliArgs {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut a = CliArgs {
+            prompt: None, weights: None, vocab: None, merges: None,
+            max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
+            seed: 42, train_steps: 200,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--prompt"      => { i += 1; if i < args.len() { a.prompt      = Some(args[i].clone()); } }
+                "--weights"     => { i += 1; if i < args.len() { a.weights     = Some(args[i].clone()); } }
+                "--vocab"       => { i += 1; if i < args.len() { a.vocab       = Some(args[i].clone()); } }
+                "--merges"      => { i += 1; if i < args.len() { a.merges      = Some(args[i].clone()); } }
+                "--max-new"     => { i += 1; if i < args.len() { a.max_new     = args[i].parse().unwrap_or(200); } }
+                "--temp"        => { i += 1; if i < args.len() { a.temperature = args[i].parse().unwrap_or(0.8); } }
+                "--top-k"       => { i += 1; if i < args.len() { a.top_k       = args[i].parse().unwrap_or(40); } }
+                "--top-p"       => { i += 1; if i < args.len() { a.top_p       = args[i].parse().unwrap_or(1.0); } }
+                "--seed"        => { i += 1; if i < args.len() { a.seed        = args[i].parse().unwrap_or(42); } }
+                "--train-steps" => { i += 1; if i < args.len() { a.train_steps = args[i].parse().unwrap_or(200); } }
+                "--help" | "-h" => { print_help(); std::process::exit(0); }
+                other => { eprintln!("Unknown argument: {other}"); print_help(); std::process::exit(1); }
+            }
+            i += 1;
+        }
+        a
+    }
+}
+
+fn print_help() {
+    println!("rich-triplet — LLM from scratch in Rust");
+    println!();
+    println!("USAGE:");
+    println!("  rich-triplet                          Run autograd benchmark");
+    println!("  rich-triplet --prompt TEXT            Train on corpus, then generate");
+    println!("  rich-triplet --prompt TEXT \\");
+    println!("               --weights DIR \\");
+    println!("               --vocab vocab.json \\");
+    println!("               --merges merges.txt      Load GPT-OSS weights, generate");
+    println!();
+    println!("OPTIONS:");
+    println!("  --prompt TEXT        Prompt text to complete");
+    println!("  --weights DIR        Directory with .safetensors shards (GPT-OSS)");
+    println!("  --vocab PATH         BPE vocab.json (required with --weights)");
+    println!("  --merges PATH        BPE merges.txt (required with --weights)");
+    println!("  --max-new N          Tokens to generate          [default: 200]");
+    println!("  --temp T             Sampling temperature        [default: 0.8]");
+    println!("  --top-k K            Top-K cutoff (0=disabled)   [default: 40]");
+    println!("  --top-p P            Nucleus probability         [default: 1.0]");
+    println!("  --seed S             RNG seed                    [default: 42]");
+    println!("  --train-steps N      Training steps (no-weights) [default: 200]");
+}
+
+// =============================================================================
+// Generation mode — GPT-OSS with loaded weights
+// =============================================================================
+
+fn run_gpt_oss(args: &CliArgs, prompt: &str) {
+    use std::io::Write;
+
+    let weights_dir = args.weights.as_deref().unwrap();
+    let vocab_path  = args.vocab.as_deref()
+        .expect("--vocab required with --weights (path to vocab.json)");
+    let merges_path = args.merges.as_deref()
+        .expect("--merges required with --weights (path to merges.txt)");
+
+    eprintln!("[ GPT-OSS ] Loading tokenizer...");
+    let tok = BpeTokenizer::from_files(vocab_path, merges_path)
+        .expect("failed to load BPE tokenizer");
+
+    eprintln!("[ GPT-OSS ] Building model (gpt-oss-20b config)...");
+    let config = Config3::gpt_oss_20b();
+    let mut rng = InitRng::new(0);
+    let mut model = GptOssModel::new(config, &mut rng);
+
+    eprintln!("[ GPT-OSS ] Loading weights from {}...", weights_dir);
+    model.load_weights_from_dir(weights_dir)
+        .expect("failed to load weights");
+
+    let raw_ids = tok.encode(prompt);
+    if raw_ids.is_empty() {
+        eprintln!("Error: prompt encodes to zero tokens");
+        std::process::exit(1);
+    }
+    let token_ids: Vec<usize> = raw_ids.iter().map(|&id| id as usize).collect();
+
+    let params = SamplingParams {
+        temperature: args.temperature,
+        top_k:       args.top_k,
+        top_p:       args.top_p,
+        seed:        args.seed,
+        ..SamplingParams::creative(args.seed)
+    };
+
+    // Print prompt first, then stream tokens
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+
+    model.generate_with_params_streaming(&token_ids, args.max_new, &params, |tok_id| {
+        let text = tok.decode(&[tok_id as u32]);
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+    });
+    println!();
+}
+
+// =============================================================================
+// Generation mode — trained Gpt2 on built-in corpus
+// =============================================================================
+
+fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
+    use std::io::Write;
+
+    let tokenizer = CharTokenizer::from_text(CORPUS);
+    let vocab_size = tokenizer.vocab_size();
+    let context_length = 64;
+
+    let (train_data, val_data) =
+        TextDataset::train_val_split(CORPUS, &tokenizer, context_length);
+
+    let model_config = Config {
+        vocab_size,
+        context_length,
+        d_model: 64,
+        n_layers: 4,
+        n_heads: 4,
+    };
+
+    eprintln!("[ Train ] vocab={} context={} steps={}", vocab_size, context_length, args.train_steps);
+
+    let mut rng = InitRng::new(42);
+    let model = Gpt2::new(model_config, &mut rng);
+
+    let cfg = TrainConfig2 {
+        max_steps:     args.train_steps,
+        eval_interval: args.train_steps / 5,
+        learning_rate: 3e-3,
+        grad_clip:     1.0,
+        ..TrainConfig2::default()
+    };
+    train2(&model, &tokenizer, &train_data, &val_data, &cfg);
+
+    // Encode prompt, clamp to context window
+    let mut token_ids = tokenizer.encode(prompt);
+    if token_ids.is_empty() {
+        // Use UNK if prompt has unknown chars — still generate something
+        token_ids = vec![tokenizer.unk_id()];
+    }
+    let max_ctx = context_length;
+    if token_ids.len() > max_ctx {
+        token_ids = token_ids[token_ids.len() - max_ctx..].to_vec();
+    }
+
+    // generate2 prints the prompt + continuation to stdout.
+    generate2(&model, &tokenizer, prompt, args.max_new, args.temperature, args.top_k);
+    println!();
+}
+
 fn main() {
+    let args = CliArgs::parse();
+
+    // -------------------------------------------------------------------------
+    // Generation mode
+    // -------------------------------------------------------------------------
+    if let Some(ref prompt) = args.prompt.clone() {
+        if args.weights.is_some() {
+            run_gpt_oss(&args, prompt);
+        } else {
+            run_gpt2_generate(&args, prompt);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Benchmark mode (default)
+    // -------------------------------------------------------------------------
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║        Rich Triplet — LLM from scratch in Rust              ║");
     println!("║        Scalar autograd  vs  Tensor autodiff benchmark       ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    // -------------------------------------------------------------------------
-    // Shared setup: tokenizer + dataset
-    // -------------------------------------------------------------------------
-    println!("[ Setup ] Building tokenizer and dataset...");
     let tokenizer = CharTokenizer::from_text(CORPUS);
     let vocab_size = tokenizer.vocab_size();
     let context_length = 16;
 
     let (train_data, val_data) = TextDataset::train_val_split(CORPUS, &tokenizer, context_length);
 
+    println!("[ Setup ] Building tokenizer and dataset...");
     println!("         Vocabulary:     {} unique characters", vocab_size);
     println!("         Context window: {} tokens", context_length);
     println!(
@@ -107,8 +307,8 @@ fn main() {
         n_heads: 2,
     };
 
-    let train_steps = 200;
-    let eval_interval = 40;
+    let train_steps = args.train_steps;
+    let eval_interval = (train_steps / 5).max(1);
 
     // =========================================================================
     // Phase A — Scalar autograd (original engine)
@@ -139,9 +339,7 @@ fn main() {
     let t_scalar = t_scalar_start.elapsed();
 
     println!("\n[ Generation — scalar model ]");
-    println!("  Italian:  ");
     generate(&scalar_model, &tokenizer, "Il ", 80, 0.8, 5);
-    println!("  English:  ");
     generate(&scalar_model, &tokenizer, "The ", 80, 0.8, 5);
 
     // =========================================================================
@@ -177,9 +375,7 @@ fn main() {
     let t_tensor = t_tensor_start.elapsed();
 
     println!("\n[ Generation — tensor model ]");
-    println!("  Italian:  ");
     generate2(&tensor_model, &tokenizer, "Il ", 80, 0.8, 5);
-    println!("  English:  ");
     generate2(&tensor_model, &tokenizer, "The ", 80, 0.8, 5);
 
     // =========================================================================
