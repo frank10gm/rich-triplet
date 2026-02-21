@@ -5,30 +5,23 @@ mod autograd;
 mod nn;
 mod transformer;
 mod train;
+mod autograd2;
+mod nn2;
+mod transformer2;
+mod train2;
 
 use tokenizer::CharTokenizer;
 use tokenizer::Tokenizer;
 use dataset::TextDataset;
 use transformer::{Config, Gpt};
 use train::{TrainConfig, train, generate};
-use nn::{InitRng, Module};
+use transformer2::Gpt2;
+use train2::{TrainConfig2, train2, generate2};
+use nn::InitRng;
 
 // =============================================================================
 // Bilingual training corpus — Italian and English
 // =============================================================================
-//
-// A small but real bilingual text. The model will learn:
-//   - Italian character patterns and common words
-//   - English character patterns and common words
-//   - That both languages co-exist (bilingual capability)
-//
-// For a real model you'd use gigabytes of text. For this educational model,
-// a few thousand characters is enough to see learning happen and generate
-// recognizable text patterns.
-//
-// The model has NO idea these are two languages. It just sees token sequences
-// and learns to predict the next token. The bilingual "understanding" emerges
-// purely from the statistical patterns in the data.
 
 const CORPUS: &str = "
 Il cielo sopra Milano era grigio come sempre. Giovanni guardava dalla finestra
@@ -80,92 +73,136 @@ today yesterday tomorrow now always never often rarely
 ";
 
 fn main() {
-    println!("╔══════════════════════════════════════════════════╗");
-    println!("║     Rich Triplet — LLM from scratch in Rust      ║");
-    println!("╚══════════════════════════════════════════════════╝");
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║        Rich Triplet — LLM from scratch in Rust              ║");
+    println!("║        Scalar autograd  vs  Tensor autodiff benchmark       ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
     // -------------------------------------------------------------------------
-    // Step 1: Build the tokenizer from the corpus
+    // Shared setup: tokenizer + dataset
     // -------------------------------------------------------------------------
-    println!("[ 1/4 ] Building tokenizer...");
+    println!("[ Setup ] Building tokenizer and dataset...");
     let tokenizer = CharTokenizer::from_text(CORPUS);
-    println!(
-        "        Vocabulary: {} unique characters",
-        tokenizer.vocab_size()
-    );
-
-    // -------------------------------------------------------------------------
-    // Step 2: Build the dataset
-    // -------------------------------------------------------------------------
-    println!("[ 2/4 ] Building dataset...");
-
-    // NOTE: Our scalar autograd engine is intentionally simple for learning —
-    // real frameworks use tensor-level autodiff and GPU parallelism.
-    // We use a short context and small model so training completes on CPU.
+    let vocab_size = tokenizer.vocab_size();
     let context_length = 16;
-    let (train_data, val_data) = TextDataset::train_val_split(
-        CORPUS,
-        &tokenizer,
-        context_length,
-    );
+
+    let (train_data, val_data) = TextDataset::train_val_split(CORPUS, &tokenizer, context_length);
+
+    println!("         Vocabulary:     {} unique characters", vocab_size);
+    println!("         Context window: {} tokens", context_length);
     println!(
-        "        Context window: {} tokens",
-        context_length
+        "         Random loss:    {:.4}  (= ln({}))",
+        (vocab_size as f32).ln(), vocab_size
     );
 
-    // -------------------------------------------------------------------------
-    // Step 3: Build the model
-    // -------------------------------------------------------------------------
-    println!("[ 3/4 ] Building model...");
-
-    let config = Config {
-        vocab_size: tokenizer.vocab_size(),
+    let model_config = Config {
+        vocab_size,
         context_length,
         d_model: 32,
         n_layers: 2,
         n_heads: 2,
     };
 
-    let mut rng = InitRng::new(42);
-    let model = Gpt::new(config.clone(), &mut rng);
+    let train_steps = 200;
+    let eval_interval = 40;
 
-    let n_params = model.parameters().len();
-    println!("        Parameters:    {}", n_params);
-    println!("        d_model:       {}", config.d_model);
-    println!("        n_layers:      {}", config.n_layers);
-    println!("        n_heads:       {}", config.n_heads);
-    println!(
-        "        Random baseline loss: {:.4}  (= log({}))",
-        (tokenizer.vocab_size() as f32).ln(),
-        tokenizer.vocab_size()
-    );
+    // =========================================================================
+    // Phase A — Scalar autograd (original engine)
+    // =========================================================================
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!(" PHASE A: Scalar autograd  (one Value node per weight element)");
+    println!("═══════════════════════════════════════════════════════════════");
 
-    // -------------------------------------------------------------------------
-    // Step 4: Train
-    // -------------------------------------------------------------------------
-    println!("[ 4/4 ] Training...");
+    let mut rng_a = InitRng::new(42);
+    let scalar_model = Gpt::new(model_config.clone(), &mut rng_a);
 
-    let train_cfg = TrainConfig {
-        max_steps: 200,
-        eval_interval: 40,
+    {
+        use nn::Module;
+        let n = scalar_model.parameters().len();
+        println!(" Model:  {:.1}K scalar nodes  ({} param matrices × ~{} elements avg)",
+            n as f32 / 1000.0, 0, n);
+    }
+
+    let scalar_cfg = TrainConfig {
+        max_steps: train_steps,
+        eval_interval,
         learning_rate: 1e-3,
         grad_clip: 1.0,
     };
 
-    train(&model, &tokenizer, &train_data, &val_data, &train_cfg);
+    let t_scalar_start = std::time::Instant::now();
+    train(&scalar_model, &tokenizer, &train_data, &val_data, &scalar_cfg);
+    let t_scalar = t_scalar_start.elapsed();
 
-    // -------------------------------------------------------------------------
-    // Step 5: Generate text
-    // -------------------------------------------------------------------------
-    println!("\n[ Generation ] Italian prompt:");
-    generate(&model, &tokenizer, "Il ", 80, 0.8, 5);
+    println!("\n[ Generation — scalar model ]");
+    println!("  Italian:  ");
+    generate(&scalar_model, &tokenizer, "Il ", 80, 0.8, 5);
+    println!("  English:  ");
+    generate(&scalar_model, &tokenizer, "The ", 80, 0.8, 5);
 
-    println!("\n[ Generation ] English prompt:");
-    generate(&model, &tokenizer, "The ", 80, 0.8, 5);
+    // =========================================================================
+    // Phase B — Tensor autodiff (new engine)
+    // =========================================================================
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!(" PHASE B: Tensor autodiff  (one TensorNode per weight matrix)");
+    println!("═══════════════════════════════════════════════════════════════");
 
-    println!("\n[ Generation ] Bilingual prompt:");
-    generate(&model, &tokenizer, "La ", 80, 0.8, 5);
+    let mut rng_b = InitRng::new(42);
+    let tensor_model = Gpt2::new(model_config.clone(), &mut rng_b);
+
+    {
+        use nn2::Module2;
+        let params = tensor_model.parameters();
+        let total_elems: usize = params.iter()
+            .map(|p| p.data().rows * p.data().cols)
+            .sum();
+        println!(" Model:  {} tensor nodes  ({} elements total)",
+            params.len(), total_elems);
+    }
+
+    let tensor_cfg = TrainConfig2 {
+        max_steps: train_steps,
+        eval_interval,
+        learning_rate: 1e-3,
+        grad_clip: 1.0,
+    };
+
+    let t_tensor_start = std::time::Instant::now();
+    train2(&tensor_model, &tokenizer, &train_data, &val_data, &tensor_cfg);
+    let t_tensor = t_tensor_start.elapsed();
+
+    println!("\n[ Generation — tensor model ]");
+    println!("  Italian:  ");
+    generate2(&tensor_model, &tokenizer, "Il ", 80, 0.8, 5);
+    println!("  English:  ");
+    generate2(&tensor_model, &tokenizer, "The ", 80, 0.8, 5);
+
+    // =========================================================================
+    // Benchmark summary
+    // =========================================================================
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                   Benchmark Summary                         ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Steps: {:4}                                                ║", train_steps);
+    println!("║                                                              ║");
+    println!("║  Scalar autograd:   {:>8.2}s   ({:>5.0} ms/step)           ║",
+        t_scalar.as_secs_f64(),
+        t_scalar.as_millis() as f64 / train_steps as f64);
+    println!("║  Tensor autodiff:   {:>8.2}s   ({:>5.0} ms/step)           ║",
+        t_tensor.as_secs_f64(),
+        t_tensor.as_millis() as f64 / train_steps as f64);
+
+    let speedup = t_scalar.as_secs_f64() / t_tensor.as_secs_f64();
+    println!("║                                                              ║");
+    println!("║  Speedup:           {:>7.1}x                                ║", speedup);
+    println!("║                                                              ║");
+    println!("║  Why faster?                                                 ║");
+    println!("║  • Scalar: ~400K nodes in graph → 400K backward visits      ║");
+    println!("║  • Tensor:    ~60 nodes in graph →   60 backward visits     ║");
+    println!("║  • Each tensor backward does a SIMD-able matmul instead     ║");
+    println!("║    of millions of individual scalar multiply-accumulate ops  ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
 
     println!("\nDone.");
 }
