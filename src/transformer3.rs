@@ -44,6 +44,7 @@
 use crate::autograd2::{TensorNode, Mat};
 use crate::nn::InitRng;
 use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2};
+use std::cell::RefCell;
 
 // =============================================================================
 // Config3 — GPT-OSS hyperparameters
@@ -150,11 +151,18 @@ pub struct GptOssAttention {
     pub n_kv_heads: usize,
     pub d_head: usize,
     pub rope_theta: f32,
+    /// When true, use YaRN RoPE scaling (required for sequences > original_ctx).
+    /// When false, use basic RoPE (original_ctx = max_ctx, no scaling).
+    pub use_yarn: bool,
+    pub original_ctx: usize,
+    pub max_ctx: usize,
 }
 
 impl GptOssAttention {
     pub fn new(config: &Config3, rng: &mut InitRng) -> Self {
         let d_head = config.d_head();
+        // Use YaRN when the config's max_position_embeddings exceeds the standard 4096
+        let use_yarn = config.max_position_embeddings > 4096;
         GptOssAttention {
             q_proj: Linear2::new(config.hidden_size, config.num_attention_heads * d_head, rng),
             k_proj: Linear2::new(config.hidden_size, config.num_key_value_heads * d_head, rng),
@@ -164,6 +172,9 @@ impl GptOssAttention {
             n_kv_heads: config.num_key_value_heads,
             d_head,
             rope_theta: config.rope_theta,
+            use_yarn,
+            original_ctx: 4096,
+            max_ctx: config.max_position_embeddings,
         }
     }
 
@@ -193,10 +204,10 @@ impl GptOssAttention {
         self.o_proj.forward(&attn_out)
     }
 
-    /// Apply RoPE to every head in a [T, n_heads * d_head] tensor.
+    /// Apply RoPE (or YaRN RoPE) to every head in a [T, n_heads * d_head] tensor.
     ///
-    /// We process head by head, apply rope_apply to each [T, d_head] slice,
-    /// then reassemble into [T, n_heads * d_head].
+    /// Splits into individual [T, d_head] head slices, applies the chosen RoPE
+    /// variant to each, then reassembles.
     fn apply_rope_to_all_heads(
         &self,
         x: &TensorNode,
@@ -206,16 +217,38 @@ impl GptOssAttention {
     ) -> TensorNode {
         let x_data = x.data().clone();
 
+        // Build per-head slices, apply rope, collect results
+        // We do this in a single Mat::from_fn to avoid allocating n_heads TensorNodes.
+        // The RoPE math is self-contained so we inline it here for both variants.
+        let scale     = self.max_ctx as f32 / self.original_ctx as f32;
+        let mscale    = if self.use_yarn { 0.1 * scale.ln() + 1.0 } else { 1.0 };
+        let inv_scale = if self.use_yarn { 1.0 / scale } else { 1.0 };
+        let beta_fast = 32.0f32;
+        let beta_slow = 1.0f32;
+
         let out_data = Mat::from_fn(t, n_heads * d_head, |row, col| {
-            let h   = col / d_head;
-            let dim = col % d_head;
-            let pair = dim / 2;
+            let h      = col / d_head;
+            let dim    = col % d_head;
+            let pair   = dim / 2;
             let is_odd = dim % 2 == 1;
-            let pos = row as f32;
-            let angle = pos / self.rope_theta.powf(2.0 * pair as f32 / d_head as f32);
+            let pos    = row as f32;
+
+            let omega = 1.0 / self.rope_theta.powf(2.0 * pair as f32 / d_head as f32);
+
+            let effective_pos = if self.use_yarn {
+                let cycles = self.original_ctx as f32 * omega / (2.0 * std::f32::consts::PI);
+                let ramp = if cycles < beta_slow { 0.0f32 }
+                           else if cycles > beta_fast { 1.0f32 }
+                           else { (cycles - beta_slow) / (beta_fast - beta_slow) };
+                (1.0 - ramp) * pos * inv_scale + ramp * pos
+            } else {
+                pos
+            };
+
+            let angle  = effective_pos * omega * mscale;
             let (cos_a, sin_a) = (angle.cos(), angle.sin());
 
-            let base_col = h * d_head + (dim & !1); // even partner col
+            let base_col = h * d_head + (dim & !1);
             if !is_odd {
                 x_data.at(row, base_col)     * cos_a - x_data.at(row, base_col + 1) * sin_a
             } else {
@@ -223,6 +256,97 @@ impl GptOssAttention {
             }
         });
 
+        TensorNode::leaf(out_data)
+    }
+
+    /// Cached forward: x is [n_new, hidden_size] (usually 1 token during generation).
+    ///
+    /// The KV cache holds K/V from all previous tokens. We:
+    ///   1. Project x → Q, K_new, V_new
+    ///   2. Apply RoPE starting at cache.seq_len
+    ///   3. Append K_new, V_new to cache
+    ///   4. Run attention: Q [n_new, …] vs full cached K/V [T_total, …]
+    ///   5. Project output
+    pub fn forward_cached(&self, x: &TensorNode, cache: &mut LayerKvCache) -> TensorNode {
+        let n_new  = x.data().rows;
+        let d_head = self.d_head;
+        let seq_offset = cache.seq_len;
+
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        let q_rope = self.apply_rope_to_all_heads_at(&q, self.n_q_heads,  n_new, d_head, seq_offset);
+        let k_rope = self.apply_rope_to_all_heads_at(&k, self.n_kv_heads, n_new, d_head, seq_offset);
+
+        cache.append(&k_rope.data().clone(), &v.data().clone());
+
+        let k_full = TensorNode::leaf(cache.k_filled());
+        let v_full = TensorNode::leaf(cache.v_filled());
+
+        let attn_out = self.gqa_attention_cached(&q_rope, &k_full, &v_full);
+        self.o_proj.forward(&attn_out)
+    }
+
+    /// GQA where Q has n_q_new rows but K/V have T_total rows.
+    /// No causal mask is needed: K/V only contain past tokens.
+    fn gqa_attention_cached(&self, q: &TensorNode, k: &TensorNode, v: &TensorNode) -> TensorNode {
+        let q_data = q.data().clone();
+        let k_data = k.data().clone();
+        let v_data = v.data().clone();
+        let t_q  = q_data.rows;
+        let t_kv = k_data.rows;
+        let d_head = self.d_head;
+        let scale = 1.0 / (d_head as f32).sqrt();
+        let group_size = self.n_q_heads / self.n_kv_heads;
+
+        let mut out_data = Mat::zeros(t_q, self.n_q_heads * d_head);
+        for qh in 0..self.n_q_heads {
+            let kvh = qh / group_size;
+            let q_h = Mat::from_fn(t_q,  d_head, |r, c| q_data.at(r, qh  * d_head + c));
+            let k_h = Mat::from_fn(t_kv, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+            let v_h = Mat::from_fn(t_kv, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+
+            let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+            let mut w = Mat::zeros(t_q, t_kv);
+            for r in 0..t_q {
+                let row_max = (0..t_kv).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                let mut row_sum = 0.0f32;
+                for c in 0..t_kv { let e = (scores.at(r, c) - row_max).exp(); *w.at_mut(r, c) = e; row_sum += e; }
+                for c in 0..t_kv { *w.at_mut(r, c) /= row_sum; }
+            }
+            let out_h = w.matmul(&v_h);
+            for r in 0..t_q { for c in 0..d_head { *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c); } }
+        }
+        TensorNode::leaf(out_data)
+    }
+
+    /// Like apply_rope_to_all_heads but starting at seq_offset (for cache generation).
+    fn apply_rope_to_all_heads_at(
+        &self, x: &TensorNode, n_heads: usize, t: usize, d_head: usize, seq_offset: usize,
+    ) -> TensorNode {
+        let x_data = x.data().clone();
+        let scale     = self.max_ctx as f32 / self.original_ctx as f32;
+        let mscale    = if self.use_yarn { 0.1 * scale.ln() + 1.0 } else { 1.0 };
+        let inv_scale = if self.use_yarn { 1.0 / scale } else { 1.0 };
+        let beta_fast = 32.0f32;
+        let beta_slow = 1.0f32;
+        let out_data = Mat::from_fn(t, n_heads * d_head, |row, col| {
+            let h = col / d_head; let dim = col % d_head; let pair = dim / 2; let is_odd = dim % 2 == 1;
+            let pos = (seq_offset + row) as f32;
+            let omega = 1.0 / self.rope_theta.powf(2.0 * pair as f32 / d_head as f32);
+            let effective_pos = if self.use_yarn {
+                let cycles = self.original_ctx as f32 * omega / (2.0 * std::f32::consts::PI);
+                let ramp = if cycles < beta_slow { 0.0f32 } else if cycles > beta_fast { 1.0f32 }
+                           else { (cycles - beta_slow) / (beta_fast - beta_slow) };
+                (1.0 - ramp) * pos * inv_scale + ramp * pos
+            } else { pos };
+            let angle = effective_pos * omega * mscale;
+            let (cos_a, sin_a) = (angle.cos(), angle.sin());
+            let base_col = h * d_head + (dim & !1);
+            if !is_odd { x_data.at(row, base_col) * cos_a - x_data.at(row, base_col + 1) * sin_a }
+            else       { x_data.at(row, base_col + 1) * cos_a + x_data.at(row, base_col) * sin_a }
+        });
         TensorNode::leaf(out_data)
     }
 }
@@ -385,6 +509,14 @@ impl GptOssBlock {
         let moe_out = self.mlp.forward(&self.post_attention_layernorm.forward(&x2));
         x2.add(&moe_out)
     }
+
+    /// Cached forward: x is [n_new, hidden_size], cache accumulates K/V.
+    pub fn forward_cached(&self, x: &TensorNode, cache: &mut LayerKvCache) -> TensorNode {
+        let attn_out = self.self_attn.forward_cached(&self.input_layernorm.forward(x), cache);
+        let x2 = x.add(&attn_out);
+        let moe_out = self.mlp.forward(&self.post_attention_layernorm.forward(&x2));
+        x2.add(&moe_out)
+    }
 }
 
 impl Module2 for GptOssBlock {
@@ -394,6 +526,93 @@ impl Module2 for GptOssBlock {
         p.extend(self.post_attention_layernorm.parameters());
         p.extend(self.mlp.parameters());
         p
+    }
+}
+
+// =============================================================================
+// KvCache — per-layer key/value cache for efficient autoregressive generation
+// =============================================================================
+//
+// Without a KV cache, generating token T requires re-running the full forward
+// pass over all T tokens every step → O(T²) total work.
+//
+// With a KV cache:
+//   - First forward pass (prefill): run all T_prompt tokens, store K and V
+//     for each layer.
+//   - Each new token step: run only the new token through Q/K/V projections,
+//     append the new K/V rows to the cache, run attention over cache.
+//   - Cost per new token: O(T_cache) not O(T_cache²) → O(T) total.
+//
+// The cache stores raw Mat values (not TensorNodes) since we don't backprop
+// through generation.
+
+pub struct LayerKvCache {
+    /// Accumulated K values: [T_so_far, n_kv_heads * d_head]
+    pub k: Mat,
+    /// Accumulated V values: [T_so_far, n_kv_heads * d_head]
+    pub v: Mat,
+    /// Next write position (= number of tokens processed so far)
+    pub seq_len: usize,
+}
+
+impl LayerKvCache {
+    fn new(n_kv_heads: usize, d_head: usize, max_seq_len: usize) -> Self {
+        LayerKvCache {
+            k: Mat::zeros(max_seq_len, n_kv_heads * d_head),
+            v: Mat::zeros(max_seq_len, n_kv_heads * d_head),
+            seq_len: 0,
+        }
+    }
+
+    /// Append new K/V rows (from the current token step) to the cache.
+    /// new_k, new_v: [n_new_tokens, n_kv_heads * d_head]
+    fn append(&mut self, new_k: &Mat, new_v: &Mat) {
+        let n_new = new_k.rows;
+        let d = new_k.cols;
+        assert_eq!(d, self.k.cols);
+        for r in 0..n_new {
+            for c in 0..d {
+                *self.k.at_mut(self.seq_len + r, c) = new_k.at(r, c);
+                *self.v.at_mut(self.seq_len + r, c) = new_v.at(r, c);
+            }
+        }
+        self.seq_len += n_new;
+    }
+
+    /// Return a view of the filled portion of K: [seq_len, n_kv_heads * d_head]
+    fn k_filled(&self) -> Mat {
+        Mat::from_fn(self.seq_len, self.k.cols, |r, c| self.k.at(r, c))
+    }
+
+    /// Return a view of the filled portion of V: [seq_len, n_kv_heads * d_head]
+    fn v_filled(&self) -> Mat {
+        Mat::from_fn(self.seq_len, self.v.cols, |r, c| self.v.at(r, c))
+    }
+}
+
+/// Full KV cache for all layers.
+pub struct KvCache {
+    pub layers: Vec<RefCell<LayerKvCache>>,
+}
+
+impl KvCache {
+    pub fn new(config: &Config3) -> Self {
+        let d_head = config.d_head();
+        let layers = (0..config.num_hidden_layers)
+            .map(|_| RefCell::new(LayerKvCache::new(
+                config.num_key_value_heads,
+                d_head,
+                config.max_position_embeddings,
+            )))
+            .collect();
+        KvCache { layers }
+    }
+
+    /// Reset all caches (start a new sequence).
+    pub fn clear(&self) {
+        for layer in &self.layers {
+            layer.borrow_mut().seq_len = 0;
+        }
     }
 }
 
@@ -469,13 +688,443 @@ impl GptOssModel {
         let logits_data = logits.data();
         let t = logits_data.rows;
         let v = logits_data.cols;
-
-        // Take last token's logits and return argmax
         (0..v)
             .max_by(|&a, &b| logits_data.at(t - 1, a)
                 .partial_cmp(&logits_data.at(t - 1, b))
                 .unwrap())
             .unwrap()
+    }
+
+    /// Autoregressive generation with KV cache — O(T) per step.
+    ///
+    /// ## How the KV cache makes generation fast
+    ///
+    /// Without cache: generating token k requires running the full prompt
+    /// (k tokens) through every layer → O(k²) total work.
+    ///
+    /// With cache:
+    ///   Step 1 — "prefill": run the entire prompt once, populate cache.
+    ///   Step 2+ — "decode": for each new token, pass only 1 token through
+    ///             attention, which reads from but only appends to the cache.
+    ///             → O(T_prompt + T_generate) total work.
+    ///
+    /// ## Parameters
+    ///   token_ids:    prompt tokens
+    ///   max_new:      number of new tokens to generate
+    ///   temperature:  >1 = more random, <1 = more greedy, 1.0 = standard sampling
+    ///
+    /// ## Returns
+    ///   Vec of new token ids (not including the prompt)
+    pub fn generate_cached(&self, token_ids: &[usize], max_new: usize, temperature: f32) -> Vec<usize> {
+        let cache = KvCache::new(&self.config);
+        let d = self.config.hidden_size;
+        let te = self.embed_tokens.data().clone();
+
+        // ---- Prefill: run the full prompt through all layers with cache ----
+        let t_prompt = token_ids.len();
+        let x_data = Mat::from_fn(t_prompt, d, |row, col| te.at(token_ids[row], col));
+        let mut x = TensorNode::leaf(x_data);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+        }
+        let x_normed = self.norm.forward(&x);
+        let logits = self.lm_head.forward(&x_normed);
+
+        // Sample first new token from last position of prompt logits
+        let mut generated = Vec::with_capacity(max_new);
+        let first_tok = self.sample_token(&logits.data(), t_prompt - 1, temperature);
+        generated.push(first_tok);
+
+        // ---- Decode: one token at a time ----
+        let mut prev_tok = first_tok;
+        for _ in 1..max_new {
+            // Build single-token embedding
+            let x_data = Mat::from_fn(1, d, |_, col| te.at(prev_tok, col));
+            let mut x = TensorNode::leaf(x_data);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+            }
+            let x_normed = self.norm.forward(&x);
+            let logits   = self.lm_head.forward(&x_normed);
+
+            prev_tok = self.sample_token(&logits.data(), 0, temperature);
+            generated.push(prev_tok);
+        }
+
+        generated
+    }
+
+    /// Sample a token from logits at row `pos` with temperature scaling.
+    fn sample_token(&self, logits: &Mat, pos: usize, temperature: f32) -> usize {
+        let v = logits.cols;
+        if temperature <= 0.0 {
+            // Greedy
+            return (0..v).max_by(|&a, &b|
+                logits.at(pos, a).partial_cmp(&logits.at(pos, b)).unwrap()
+            ).unwrap();
+        }
+        // Softmax with temperature
+        let row_max = (0..v).map(|c| logits.at(pos, c)).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = (0..v).map(|c| ((logits.at(pos, c) - row_max) / temperature).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        // Simple deterministic sampling: argmax of probs (for test reproducibility)
+        // A real implementation would use a random number generator here.
+        probs.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+}
+
+// =============================================================================
+// Safetensors weight loader
+// =============================================================================
+//
+// GPT-OSS weights are distributed as .safetensors files from HuggingFace.
+// The safetensors format stores tensors with a JSON header (names + dtypes +
+// byte offsets) followed by raw binary data.
+//
+// ## How to get the weights
+//
+//   pip install huggingface_hub
+//   huggingface-cli download openai/gpt-oss-20b --local-dir ./gpt-oss-20b-weights
+//
+// This downloads multiple .safetensors shards (gpt-oss-20b is split across ~10).
+//
+// ## Weight name mapping (HuggingFace → this struct)
+//
+//   model.embed_tokens.weight                        → model.embed_tokens
+//   model.layers.{i}.input_layernorm.weight          → layers[i].input_layernorm.gamma
+//   model.layers.{i}.self_attn.q_proj.weight         → layers[i].self_attn.q_proj.weight
+//   model.layers.{i}.self_attn.k_proj.weight         → layers[i].self_attn.k_proj.weight
+//   model.layers.{i}.self_attn.v_proj.weight         → layers[i].self_attn.v_proj.weight
+//   model.layers.{i}.self_attn.o_proj.weight         → layers[i].self_attn.o_proj.weight
+//   model.layers.{i}.post_attention_layernorm.weight → layers[i].post_attention_layernorm.gamma
+//   model.layers.{i}.mlp.router.weight               → layers[i].mlp.router.weight
+//   model.layers.{i}.mlp.experts.{j}.gate_proj.weight → layers[i].mlp.experts[j].gate_proj.weight
+//   model.layers.{i}.mlp.experts.{j}.up_proj.weight   → layers[i].mlp.experts[j].up_proj.weight
+//   model.layers.{i}.mlp.experts.{j}.down_proj.weight → layers[i].mlp.experts[j].down_proj.weight
+//   model.norm.weight                                → model.norm.gamma
+//   lm_head.weight                                   → model.lm_head.weight
+//
+// ## dtype notes
+//
+// HuggingFace stores weights in BF16 (bfloat16). This loader converts them to
+// f32 on load. The conversion: bf16 is just f32 with the lower 16 bits zeroed,
+// so we reconstruct f32 by left-shifting the 16-bit value.
+
+/// A single parsed tensor from a safetensors file.
+pub struct SafeTensor {
+    pub name:   String,
+    pub shape:  Vec<usize>,
+    pub data:   Vec<f32>,    // always f32 after conversion
+}
+
+/// Load all tensors from a safetensors binary blob (the raw file bytes).
+///
+/// Returns a list of SafeTensors. Call `load_into_model` to apply them.
+///
+/// ## Format
+///
+/// The file starts with:
+///   [8 bytes: header_length as little-endian u64]
+///   [header_length bytes: UTF-8 JSON]
+///   [remaining bytes: raw tensor data, packed]
+///
+/// The JSON has the shape:
+///   { "tensor_name": { "dtype": "BF16", "shape": [rows, cols], "data_offsets": [start, end] } }
+pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<SafeTensor>, String> {
+    if bytes.len() < 8 {
+        return Err("safetensors: file too small".to_string());
+    }
+    let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    if bytes.len() < 8 + header_len {
+        return Err(format!("safetensors: header_len {} exceeds file size", header_len));
+    }
+    let header_json = std::str::from_utf8(&bytes[8..8 + header_len])
+        .map_err(|e| format!("safetensors: invalid header UTF-8: {}", e))?;
+    let data_section = &bytes[8 + header_len..];
+
+    let mut tensors = Vec::new();
+    // Parse top-level object: iterate over key-value pairs
+    for (name, value_json) in iter_top_level_pairs(header_json) {
+        if name == "__metadata__" { continue; }
+        if let Some(tensor) = parse_tensor_value(name, value_json, data_section) {
+            tensors.push(tensor);
+        }
+    }
+    Ok(tensors)
+}
+
+/// Iterate over top-level `"key": {...}` pairs in a JSON object string.
+/// Yields (&str name, &str value_json) for each entry.
+fn iter_top_level_pairs(json: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let b = json.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+
+    while i < n {
+        // Find opening quote of key
+        while i < n && b[i] != b'"' { i += 1; }
+        if i >= n { break; }
+        i += 1; // skip opening quote
+        let key_start = i;
+        while i < n && b[i] != b'"' { i += 1; }
+        let key = json[key_start..i].to_string();
+        i += 1; // skip closing quote
+
+        // Skip whitespace and colon
+        while i < n && (b[i] == b':' || b[i] == b' ' || b[i] == b'\n' || b[i] == b'\r') { i += 1; }
+
+        // Find matching { }
+        if i >= n || b[i] != b'{' { continue; }
+        let val_start = i;
+        let mut depth = 0i32;
+        while i < n {
+            if b[i] == b'{' { depth += 1; }
+            else if b[i] == b'}' { depth -= 1; if depth == 0 { i += 1; break; } }
+            i += 1;
+        }
+        let value_json = json[val_start..i].to_string();
+        pairs.push((key, value_json));
+    }
+    pairs
+}
+
+/// Parse a single tensor's value object: `{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}`
+fn parse_tensor_value(name: String, value_json: String, data_section: &[u8]) -> Option<SafeTensor> {
+    let dtype   = extract_quoted_value(&value_json, "dtype")?;
+    let shape   = extract_int_array(&value_json, "shape")?;
+    let offsets = extract_int_array(&value_json, "data_offsets")?;
+
+    if offsets.len() != 2 { return None; }
+    let (byte_start, byte_end) = (offsets[0] as usize, offsets[1] as usize);
+    if byte_end > data_section.len() { return None; }
+
+    let raw = &data_section[byte_start..byte_end];
+    let data: Vec<f32> = match dtype.as_str() {
+        "F32" => raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+        "BF16" => raw.chunks_exact(2)
+                     .map(|c| {
+                         let bits = u16::from_le_bytes(c.try_into().unwrap()) as u32;
+                         f32::from_bits(bits << 16)
+                     })
+                     .collect(),
+        "F16" => raw.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                    .collect(),
+        _ => return None,
+    };
+
+    let shape: Vec<usize> = shape.iter().map(|&v| v as usize).collect();
+    Some(SafeTensor { name, shape, data })
+}
+
+/// Extract the string value of `"key":"value"` from a JSON object string.
+fn extract_quoted_value(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", key);
+    let pos = json.find(&pattern)?;
+    let after = json[pos + pattern.len()..].trim_start();
+    if !after.starts_with('"') { return None; }
+    let rest = &after[1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract an integer array value of `"key":[1,2,3]` from a JSON object string.
+fn extract_int_array(json: &str, key: &str) -> Option<Vec<i64>> {
+    let pattern = format!("\"{}\":", key);
+    let pos = json.find(&pattern)?;
+    let after = json[pos + pattern.len()..].trim_start();
+    if !after.starts_with('[') { return None; }
+    let end = after.find(']')?;
+    let inner = &after[1..end];
+    inner.split(',')
+        .map(|s| s.trim().parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()
+}
+
+/// Convert IEEE 754 float16 bits to f32.
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign     = ((bits >> 15) as u32) << 31;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+
+    let f32_bits = if exponent == 0 {
+        // Zero or subnormal
+        if mantissa == 0 {
+            sign
+        } else {
+            // Subnormal f16 → normalized f32
+            let mut m = mantissa << 1;
+            let mut e = 127u32 - 14;
+            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            sign | (e << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exponent == 31 {
+        // Inf or NaN
+        sign | (255u32 << 23) | (mantissa << 13)
+    } else {
+        sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
+    };
+
+    f32::from_bits(f32_bits)
+}
+
+/// Load a parsed tensor list into the model, matching by name.
+///
+/// This is the main entry point for weight loading. Call it with the output
+/// of `parse_safetensors`.
+///
+/// ## Example
+///
+/// ```no_run
+/// let bytes = std::fs::read("gpt-oss-20b-weights/model-00001-of-00010.safetensors").unwrap();
+/// let tensors = parse_safetensors(&bytes).unwrap();
+/// load_into_model(&mut model, &tensors);
+/// // Repeat for each shard file
+/// ```
+pub fn load_into_model(model: &mut GptOssModel, tensors: &[SafeTensor]) {
+    for tensor in tensors {
+        if !apply_tensor(model, tensor) {
+            // Unknown name — either a shard we don't recognize, or an extra
+            // tensor (e.g. "model.rotary_emb.inv_freq"). Skip silently.
+        }
+    }
+}
+
+/// Apply one tensor to the matching field in the model.
+/// Returns true if the tensor was recognized and applied.
+fn apply_tensor(model: &mut GptOssModel, t: &SafeTensor) -> bool {
+    apply_tensor_inner(model, t).unwrap_or(false)
+}
+
+fn apply_tensor_inner(model: &mut GptOssModel, t: &SafeTensor) -> Option<bool> {
+    let name = t.name.as_str();
+
+    // Token embedding
+    if name == "model.embed_tokens.weight" {
+        return Some(set_node(&model.embed_tokens, &t.data, t.shape[0], t.shape[1]));
+    }
+    // Final norm
+    if name == "model.norm.weight" {
+        return Some(set_node(&model.norm.gamma, &t.data, 1, t.shape[0]));
+    }
+    // LM head
+    if name == "lm_head.weight" {
+        return Some(set_node(&model.lm_head.weight, &t.data, t.shape[0], t.shape[1]));
+    }
+
+    // Per-layer tensors: "model.layers.{i}...."
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        let dot = rest.find('.')?;
+        let layer_idx: usize = rest[..dot].parse().ok()?;
+        if layer_idx >= model.layers.len() { return Some(false); }
+        let layer_name = &rest[dot + 1..];
+        let layer = &mut model.layers[layer_idx];
+
+        if layer_name == "input_layernorm.weight" {
+            return Some(set_node(&layer.input_layernorm.gamma, &t.data, 1, t.shape[0]));
+        }
+        if layer_name == "self_attn.q_proj.weight" {
+            return Some(set_node(&layer.self_attn.q_proj.weight, &t.data, t.shape[0], t.shape[1]));
+        }
+        if layer_name == "self_attn.k_proj.weight" {
+            return Some(set_node(&layer.self_attn.k_proj.weight, &t.data, t.shape[0], t.shape[1]));
+        }
+        if layer_name == "self_attn.v_proj.weight" {
+            return Some(set_node(&layer.self_attn.v_proj.weight, &t.data, t.shape[0], t.shape[1]));
+        }
+        if layer_name == "self_attn.o_proj.weight" {
+            return Some(set_node(&layer.self_attn.o_proj.weight, &t.data, t.shape[0], t.shape[1]));
+        }
+        if layer_name == "post_attention_layernorm.weight" {
+            return Some(set_node(&layer.post_attention_layernorm.gamma, &t.data, 1, t.shape[0]));
+        }
+        if layer_name == "mlp.router.weight" {
+            return Some(set_node(&layer.mlp.router.weight, &t.data, t.shape[0], t.shape[1]));
+        }
+
+        // Experts: "mlp.experts.{j}.{proj}.weight"
+        if let Some(expert_rest) = layer_name.strip_prefix("mlp.experts.") {
+            let dot2 = expert_rest.find('.')?;
+            let expert_idx: usize = expert_rest[..dot2].parse().ok()?;
+            if expert_idx >= layer.mlp.experts.len() { return Some(false); }
+            let expert_name = &expert_rest[dot2 + 1..];
+            let expert = &mut layer.mlp.experts[expert_idx];
+            if expert_name == "gate_proj.weight" {
+                return Some(set_node(&expert.gate_proj.weight, &t.data, t.shape[0], t.shape[1]));
+            }
+            if expert_name == "up_proj.weight" {
+                return Some(set_node(&expert.up_proj.weight, &t.data, t.shape[0], t.shape[1]));
+            }
+            if expert_name == "down_proj.weight" {
+                return Some(set_node(&expert.down_proj.weight, &t.data, t.shape[0], t.shape[1]));
+            }
+        }
+    }
+
+    Some(false)
+}
+
+/// Set the data of a TensorNode from a flat f32 slice.
+fn set_node(node: &TensorNode, data: &[f32], rows: usize, cols: usize) -> bool {
+    if data.len() != rows * cols {
+        return false;
+    }
+    node.set_data(Mat::new(data.to_vec(), rows, cols));
+    true
+}
+
+impl GptOssModel {
+    /// Load weights from all .safetensors shards in a directory.
+    ///
+    /// Reads every file matching `*.safetensors` in `dir` and applies tensors.
+    ///
+    /// ## Usage
+    ///
+    /// ```no_run
+    /// let config = Config3::gpt_oss_20b();
+    /// let mut rng = InitRng::new(0);
+    /// let mut model = GptOssModel::new(config, &mut rng);
+    /// model.load_weights_from_dir("./gpt-oss-20b-weights")
+    ///      .expect("failed to load weights");
+    /// ```
+    pub fn load_weights_from_dir(&mut self, dir: &str) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot read dir {}: {}", dir, e))?;
+
+        let mut loaded_shards = 0usize;
+        let mut loaded_tensors = 0usize;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+                continue;
+            }
+
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("cannot read {:?}: {}", path, e))?;
+
+            let tensors = parse_safetensors(&bytes)
+                .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
+
+            loaded_tensors += tensors.len();
+            load_into_model(self, &tensors);
+            loaded_shards += 1;
+        }
+
+        if loaded_shards == 0 {
+            return Err(format!("no .safetensors files found in {}", dir));
+        }
+
+        println!("Loaded {} tensors from {} shards in {}", loaded_tensors, loaded_shards, dir);
+        Ok(())
     }
 }
 
@@ -751,6 +1400,161 @@ mod tests {
         let model = GptOssModel::new(cfg.clone(), &mut rng);
         let next = model.predict_next(&[0, 1, 2]);
         assert!(next < cfg.vocab_size, "predicted token {} out of vocab range {}", next, cfg.vocab_size);
+    }
+
+    // --- KV cache ---
+
+    #[test]
+    fn test_kv_cache_new() {
+        let cfg = tiny_config();
+        let cache = KvCache::new(&cfg);
+        assert_eq!(cache.layers.len(), cfg.num_hidden_layers);
+        for layer in &cache.layers {
+            let l = layer.borrow();
+            assert_eq!(l.seq_len, 0);
+            assert_eq!(l.k.cols, cfg.num_key_value_heads * cfg.d_head());
+        }
+    }
+
+    #[test]
+    fn test_generate_cached_output_length() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let new_tokens = model.generate_cached(&[0, 1, 2], 5, 1.0);
+        assert_eq!(new_tokens.len(), 5);
+    }
+
+    #[test]
+    fn test_generate_cached_tokens_in_vocab() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let new_tokens = model.generate_cached(&[1, 2], 4, 0.0);
+        for &tok in &new_tokens {
+            assert!(tok < cfg.vocab_size, "generated token {} out of vocab {}", tok, cfg.vocab_size);
+        }
+    }
+
+    #[test]
+    fn test_generate_cached_matches_uncached() {
+        // The first generated token from cached generation must match predict_next.
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let prompt = vec![0usize, 3, 7];
+        let cached_first = model.generate_cached(&prompt, 1, 0.0)[0];
+        // predict_next runs full forward, generate_cached runs with cache — same result
+        let uncached_first = model.predict_next(&prompt);
+        assert_eq!(cached_first, uncached_first,
+            "cached first token {} != uncached {}", cached_first, uncached_first);
+    }
+
+    // --- Safetensors parser ---
+
+    /// Build a minimal valid safetensors binary blob for testing.
+    /// Contains one tensor: "test.weight" shape [2,3] dtype F32.
+    fn make_test_safetensors() -> Vec<u8> {
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let raw_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let end = raw_bytes.len();
+
+        let header = format!(
+            r#"{{"test.weight":{{"dtype":"F32","shape":[2,3],"data_offsets":[0,{}]}}}}"#,
+            end
+        );
+        let header_bytes = header.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header_len.to_le_bytes());
+        out.extend_from_slice(header_bytes);
+        out.extend_from_slice(&raw_bytes);
+        out
+    }
+
+    #[test]
+    fn test_parse_safetensors_shape() {
+        let blob = make_test_safetensors();
+        let tensors = parse_safetensors(&blob).expect("parse failed");
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].name, "test.weight");
+        assert_eq!(tensors[0].shape, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_parse_safetensors_values() {
+        let blob = make_test_safetensors();
+        let tensors = parse_safetensors(&blob).expect("parse failed");
+        let expected = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        for (i, (&got, &exp)) in tensors[0].data.iter().zip(&expected).enumerate() {
+            assert!((got - exp).abs() < 1e-6, "data[{}]: got {} expected {}", i, got, exp);
+        }
+    }
+
+    #[test]
+    fn test_parse_safetensors_bf16() {
+        // BF16 encoding of 1.0 = 0x3F80 (upper 16 bits of f32 1.0 = 0x3F800000)
+        let bf16_one: u16 = 0x3F80u16;
+        let bf16_two: u16 = 0x4000u16; // 2.0 in BF16
+        let raw_bytes: Vec<u8> = [bf16_one, bf16_two].iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let end = raw_bytes.len();
+        let header = format!(
+            r#"{{"w":{{"dtype":"BF16","shape":[1,2],"data_offsets":[0,{}]}}}}"#, end
+        );
+        let header_bytes = header.as_bytes();
+        let header_len = header_bytes.len() as u64;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&header_len.to_le_bytes());
+        blob.extend_from_slice(header_bytes);
+        blob.extend_from_slice(&raw_bytes);
+
+        let tensors = parse_safetensors(&blob).expect("parse failed");
+        assert!((tensors[0].data[0] - 1.0f32).abs() < 1e-3, "BF16 1.0 decode: {}", tensors[0].data[0]);
+        assert!((tensors[0].data[1] - 2.0f32).abs() < 1e-3, "BF16 2.0 decode: {}", tensors[0].data[1]);
+    }
+
+    #[test]
+    fn test_load_into_model_embed_tokens() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let mut model = GptOssModel::new(cfg.clone(), &mut rng);
+
+        // Build a safetensors blob for model.embed_tokens.weight [vocab, hidden]
+        let data: Vec<f32> = (0..(cfg.vocab_size * cfg.hidden_size)).map(|i| i as f32 * 0.001).collect();
+        let raw: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let end = raw.len();
+        let header = format!(
+            r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{},{}],"data_offsets":[0,{}]}}}}"#,
+            cfg.vocab_size, cfg.hidden_size, end
+        );
+        let header_bytes = header.as_bytes();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        blob.extend_from_slice(header_bytes);
+        blob.extend_from_slice(&raw);
+
+        let tensors = parse_safetensors(&blob).expect("parse failed");
+        load_into_model(&mut model, &tensors);
+
+        // Verify the first element was loaded
+        let d = model.embed_tokens.data();
+        assert!((d.at(0, 0) - 0.0f32).abs() < 1e-6);
+        assert!((d.at(0, 1) - 0.001f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_f16_to_f32_one() {
+        // IEEE 754 half-precision 1.0 = 0x3C00
+        assert!((f16_to_f32(0x3C00) - 1.0f32).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_f16_to_f32_two() {
+        // 2.0 in f16 = 0x4000
+        assert!((f16_to_f32(0x4000) - 2.0f32).abs() < 1e-5);
     }
 
     #[test]

@@ -8,5 +8,9 @@ name = "rich-triplet"
 path = "src/main.rs"
 
 [dependencies]
+safetensors = { version = "0.4", optional = true }
+
+[features]
+weight-loading = ["safetensors"]
 
 [dev-dependencies]

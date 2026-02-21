@@ -747,20 +747,68 @@ impl TensorNode {
     /// x:     [T, d_model]  — input
     /// out:   [T, d_model]  — normalized output
     ///
-    /// Backward (for reference, not implemented here):
-    ///   Similar to LayerNorm but simpler — no mean subtraction term.
+    /// Backward:
+    ///   Let r[t] = 1/sqrt(mean(x[t]²) + eps)  (per-row RMS inverse)
+    ///       x̂[t] = x[t] * r[t]                (normalized row, before gamma)
+    ///
+    ///   dγ = sum_t(dout[t] * x̂[t])            shape [1, d]
+    ///   dx[t,i] = r[t] * (dout[t,i]*γ[i] - x̂[t,i] * mean(dout[t]*γ*x̂[t]) / 1)
+    ///           = r[t] * (D[t,i] - x̂[t,i] * mean(D[t]*x̂[t]))
+    ///   where D = dout * gamma (element-wise broadcast)
     pub fn rms_norm(&self, gamma: &TensorNode, eps: f32) -> TensorNode {
         let x = self.data().clone();
         let g = gamma.data().clone();
         let (t, d) = (x.rows, x.cols);
+        let inv_d = 1.0 / d as f32;
 
-        let out_data = Mat::from_fn(t, d, |r, c| {
-            let rms = ((0..d).map(|j| x.at(r, j).powi(2)).sum::<f32>() / d as f32 + eps).sqrt();
-            x.at(r, c) / rms * g.at(0, c)
-        });
+        // Forward: compute per-row RMS and normalized values
+        let mut rms_inv = vec![0.0f32; t]; // r[t]
+        let mut x_hat   = Mat::zeros(t, d); // x̂ = x * r
 
-        // Inference only: leaf node, no backward_fn
-        TensorNode::leaf(out_data)
+        for r in 0..t {
+            let mean_sq = (0..d).map(|c| x.at(r, c).powi(2)).sum::<f32>() * inv_d;
+            rms_inv[r] = 1.0 / (mean_sq + eps).sqrt();
+            for c in 0..d {
+                *x_hat.at_mut(r, c) = x.at(r, c) * rms_inv[r];
+            }
+        }
+
+        let out_data = Mat::from_fn(t, d, |r, c| x_hat.at(r, c) * g.at(0, c));
+        let out = TensorNode::leaf(out_data);
+
+        let self_c  = self.clone();
+        let gamma_c = gamma.clone();
+        let out_c   = out.clone();
+        let x_hat_s = x_hat.clone();
+        let rms_inv_s = rms_inv.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout = out_c.0.borrow().grad.clone();
+            let g    = gamma_c.0.borrow().data.clone();
+
+            // dγ = sum_t(dout[t] * x̂[t])   shape [1, d]
+            let mut dg = Mat::zeros(1, d);
+            for c in 0..d {
+                for r in 0..t { *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c); }
+            }
+            gamma_c.0.borrow_mut().grad.add_assign(&dg);
+
+            // dx[t] = r[t] * (D[t] - x̂[t]*mean(D[t]*x̂[t]))
+            // where D[t,i] = dout[t,i]*γ[i]
+            let mut dx = Mat::zeros(t, d);
+            for r in 0..t {
+                let d_row: Vec<f32> = (0..d).map(|c| dout.at(r, c) * g.at(0, c)).collect();
+                let mean_dxh = d_row.iter().enumerate()
+                    .map(|(c, &dv)| dv * x_hat_s.at(r, c))
+                    .sum::<f32>() * inv_d;
+                for c in 0..d {
+                    *dx.at_mut(r, c) = rms_inv_s[r] * (d_row[c] - x_hat_s.at(r, c) * mean_dxh);
+                }
+            }
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone(), gamma.clone()];
+        out
     }
 
     /// SiLU (Sigmoid Linear Unit) activation: SiLU(x) = x * sigmoid(x)
@@ -771,30 +819,73 @@ impl TensorNode {
     /// Note: our existing gelu() uses the approximation x*sigmoid(1.702x),
     /// which is actually an approximation of SiLU. SiLU is the exact version.
     ///
-    /// Backward (for reference, not implemented here):
+    /// Backward:
     ///   d/dx [x*σ(x)] = σ(x) + x*σ(x)*(1-σ(x)) = σ(x)*(1 + x*(1-σ(x)))
     pub fn silu(&self) -> TensorNode {
         let x = self.data().clone();
-        let out_data = x.map(|v| {
-            let s = 1.0 / (1.0 + (-v).exp()); // sigmoid(v)
-            v * s
+
+        // Precompute sigmoid for reuse in backward
+        let sig = Mat::from_fn(x.rows, x.cols, |r, c| {
+            1.0 / (1.0 + (-x.at(r, c)).exp())
         });
-        TensorNode::leaf(out_data)
+
+        let out_data = Mat::from_fn(x.rows, x.cols, |r, c| x.at(r, c) * sig.at(r, c));
+        let out = TensorNode::leaf(out_data);
+
+        let self_c = self.clone();
+        let out_c  = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout   = out_c.0.borrow().grad.clone();
+            let x_data = self_c.0.borrow().data.clone();
+
+            let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
+                let xv = x_data.at(r, c);
+                let s  = 1.0 / (1.0 + (-xv).exp());
+                // d/dx[x*σ] = σ + x*σ*(1-σ)
+                let dsilu = s + xv * s * (1.0 - s);
+                dout.at(r, c) * dsilu
+            });
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone()];
+        out
     }
 
     /// Element-wise multiplication of two same-shape TensorNodes.
     ///
     /// Used in SwiGLU: hidden = SiLU(gate) * up
-    /// This is a new inference-only op (the existing mul_elem is on Mat, not TensorNode).
     ///
-    /// Backward (for reference, not implemented here):
+    /// Backward:
     ///   dA = dC * B,  dB = dC * A
     pub fn mul_elem_node(&self, other: &TensorNode) -> TensorNode {
         let a = self.data().clone();
         let b = other.data().clone();
         assert_eq!((a.rows, a.cols), (b.rows, b.cols),
             "mul_elem_node: shape mismatch [{},{}] vs [{},{}]", a.rows, a.cols, b.rows, b.cols);
-        TensorNode::leaf(a.mul_elem(&b))
+
+        let out_data = a.mul_elem(&b);
+        let out = TensorNode::leaf(out_data);
+
+        let self_c  = self.clone();
+        let other_c = other.clone();
+        let out_c   = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout  = out_c.0.borrow().grad.clone();
+            let a_data = self_c.0.borrow().data.clone();
+            let b_data = other_c.0.borrow().data.clone();
+
+            // dA = dC * B
+            let da = dout.mul_elem(&b_data);
+            self_c.0.borrow_mut().grad.add_assign(&da);
+
+            // dB = dC * A
+            let db = dout.mul_elem(&a_data);
+            other_c.0.borrow_mut().grad.add_assign(&db);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone(), other.clone()];
+        out
     }
 
     /// Apply Rotary Position Embeddings (RoPE) to a [T, d_head] tensor.
@@ -817,33 +908,177 @@ impl TensorNode {
     ///   seq_offset: position index of the first token (0 for new sequences)
     ///   theta:      rope_theta from config (10000 for LLaMA, 150000 for GPT-OSS)
     ///
-    /// Backward (for reference, not implemented here):
-    ///   Rotation is an orthogonal transform — backward is just rotation by -angle.
+    /// Backward:
+    ///   RoPE is an orthogonal rotation — its inverse is rotation by -angle.
+    ///   For each pair (2i, 2i+1) at row t:
+    ///     dx[2i]   = dout[2i]  * cos(a) + dout[2i+1] * sin(a)
+    ///     dx[2i+1] = dout[2i+1]* cos(a) - dout[2i]   * sin(a)
     pub fn rope_apply(&self, seq_offset: usize, theta: f32) -> TensorNode {
         let x = self.data().clone();
         let (t, d) = (x.rows, x.cols);
         assert!(d % 2 == 0, "rope_apply: d_head must be even, got {}", d);
 
-        let out_data = Mat::from_fn(t, d, |row, col| {
+        // Precompute cos/sin table — reused in backward
+        let angles = Mat::from_fn(t, d / 2, |row, pair| {
             let pos = (seq_offset + row) as f32;
-            let pair = col / 2;       // which rotation pair
-            let is_odd = col % 2 == 1;
-            let angle = pos / theta.powf(2.0 * pair as f32 / d as f32);
-            let (cos_a, sin_a) = (angle.cos(), angle.sin());
+            pos / theta.powf(2.0 * pair as f32 / d as f32)
+        });
 
+        let out_data = Mat::from_fn(t, d, |row, col| {
+            let pair   = col / 2;
+            let is_odd = col % 2 == 1;
+            let angle  = angles.at(row, pair);
+            let (cos_a, sin_a) = (angle.cos(), angle.sin());
             if !is_odd {
-                // even index: x[2i]*cos - x[2i+1]*sin
                 x.at(row, col) * cos_a - x.at(row, col + 1) * sin_a
             } else {
-                // odd index: x[2i+1]*cos + x[2i]*sin
                 x.at(row, col) * cos_a + x.at(row, col - 1) * sin_a
             }
         });
 
-        TensorNode::leaf(out_data)
+        let out = TensorNode::leaf(out_data);
+        let self_c  = self.clone();
+        let out_c   = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout = out_c.0.borrow().grad.clone();
+
+            // Backward: inverse rotation by -angle
+            let dx = Mat::from_fn(t, d, |row, col| {
+                let pair   = col / 2;
+                let is_odd = col % 2 == 1;
+                let angle  = angles.at(row, pair);
+                let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                if !is_odd {
+                    // dx[2i] = dout[2i]*cos + dout[2i+1]*sin
+                    dout.at(row, col) * cos_a + dout.at(row, col + 1) * sin_a
+                } else {
+                    // dx[2i+1] = dout[2i+1]*cos - dout[2i]*sin
+                    dout.at(row, col) * cos_a - dout.at(row, col - 1) * sin_a
+                }
+            });
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone()];
+        out
     }
 
-    /// Grouped Multi-Query Attention (GQA) with causal mask — inference only.
+    /// Apply RoPE with YaRN frequency scaling — extends context to 128k tokens.
+    ///
+    /// ## Why basic RoPE fails at long sequences
+    ///
+    /// Basic RoPE (rope_apply) was designed for context lengths ≤ 4096. The angle
+    /// formula uses pos / theta^(2i/d). For high-frequency pairs (small i), this
+    /// produces very rapidly cycling angles, which the model was trained to
+    /// recognize. At positions >> 4096, these cycles repeat in patterns the model
+    /// has never seen, causing incoherent attention.
+    ///
+    /// ## YaRN fix: interpolate the position, scale the temperature
+    ///
+    /// YaRN (Yet Another RoPE extensioN) rescales the effective position for
+    /// each frequency dimension independently:
+    ///
+    ///   - "low frequencies" (large i, slow rotation): linear interpolation
+    ///     effective_pos = pos / scale
+    ///   - "high frequencies" (small i, fast rotation): no interpolation
+    ///     effective_pos = pos  (unchanged, stays in trained range)
+    ///   - "medium frequencies": smooth blend between the two
+    ///
+    /// Additionally a global "attention temperature" factor `mscale` is applied
+    /// to keep attention scores well-calibrated at long range.
+    ///
+    /// ## Parameters (from GPT-OSS config)
+    ///   theta:        150000.0   base frequency
+    ///   original_ctx: 4096       context length the model was trained with
+    ///   max_ctx:      131072     desired extended context
+    ///   beta_fast:    32         freq threshold for "high freq" (no interpolation)
+    ///   beta_slow:    1          freq threshold for "low freq" (full interpolation)
+    ///
+    /// Backward: same inverse-rotation as rope_apply, using the YaRN-scaled angles.
+    pub fn rope_apply_yarn(
+        &self,
+        seq_offset:   usize,
+        theta:        f32,
+        original_ctx: usize,
+        max_ctx:      usize,
+        beta_fast:    f32,
+        beta_slow:    f32,
+    ) -> TensorNode {
+        let x = self.data().clone();
+        let (t, d) = (x.rows, x.cols);
+        assert!(d % 2 == 0, "rope_apply_yarn: d_head must be even, got {}", d);
+
+        let scale = max_ctx as f32 / original_ctx as f32;
+
+        // mscale: attention temperature correction — keeps softmax numerically
+        // stable at long range.  Formula from the YaRN paper (eq. 12).
+        let mscale = 0.1 * scale.ln() + 1.0;
+
+        // Precompute per-pair effective angles.
+        // For dimension pair i (0-indexed), the original frequency is:
+        //   omega_i = 1 / theta^(2i/d)
+        // YaRN interpolates based on how "fast" this frequency rotates at
+        // the trained context boundary.
+        let angles = Mat::from_fn(t, d / 2, |row, pair| {
+            let pos = (seq_offset + row) as f32;
+            let omega = 1.0 / theta.powf(2.0 * pair as f32 / d as f32);
+
+            // How many cycles does this frequency complete per trained context?
+            // cycles_per_ctx = original_ctx * omega / (2π)
+            let cycles_per_ctx = original_ctx as f32 * omega / (2.0 * std::f32::consts::PI);
+
+            // Ramp: 0 = fully interpolated (slow freq), 1 = no interpolation (fast freq)
+            let ramp = if cycles_per_ctx < beta_slow {
+                0.0f32
+            } else if cycles_per_ctx > beta_fast {
+                1.0f32
+            } else {
+                (cycles_per_ctx - beta_slow) / (beta_fast - beta_slow)
+            };
+
+            // Blend between interpolated and original position
+            let effective_pos = (1.0 - ramp) * (pos / scale) + ramp * pos;
+
+            // Apply mscale correction and compute angle
+            effective_pos * omega * mscale
+        });
+
+        let out_data = Mat::from_fn(t, d, |row, col| {
+            let pair   = col / 2;
+            let is_odd = col % 2 == 1;
+            let angle  = angles.at(row, pair);
+            let (cos_a, sin_a) = (angle.cos(), angle.sin());
+            if !is_odd {
+                x.at(row, col) * cos_a - x.at(row, col + 1) * sin_a
+            } else {
+                x.at(row, col) * cos_a + x.at(row, col - 1) * sin_a
+            }
+        });
+
+        let out    = TensorNode::leaf(out_data);
+        let self_c = self.clone();
+        let out_c  = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout = out_c.0.borrow().grad.clone();
+            let dx = Mat::from_fn(t, d, |row, col| {
+                let pair   = col / 2;
+                let is_odd = col % 2 == 1;
+                let angle  = angles.at(row, pair);
+                let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                if !is_odd {
+                    dout.at(row, col) * cos_a + dout.at(row, col + 1) * sin_a
+                } else {
+                    dout.at(row, col) * cos_a - dout.at(row, col - 1) * sin_a
+                }
+            });
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone()];
+        out
+    }
+
+    /// Grouped Multi-Query Attention (GQA) with causal mask and full backward.
     ///
     /// GQA is a memory-efficient variant of multi-head attention where Q has
     /// n_q_heads projection heads but K and V share only n_kv_heads heads.
@@ -860,18 +1095,14 @@ impl TensorNode {
     ///
     /// Returns: [T, n_q_heads * d_head]
     ///
-    /// Algorithm:
-    ///   For each q_head h:
-    ///     kv_head = h / group_size
-    ///     Q_h = q[:, h*d_head:(h+1)*d_head]
-    ///     K_h = k[:, kv_head*d_head:(kv_head+1)*d_head]
-    ///     V_h = v[:, kv_head*d_head:(kv_head+1)*d_head]
-    ///     out_h = causal_softmax(Q_h @ K_h.T / sqrt(d_head)) @ V_h
-    ///   return concat(out_0, ..., out_{n_q_heads-1})
-    ///
-    /// Backward (for reference, not implemented here):
-    ///   Same as causal_attention but gradient for K/V accumulates from all
-    ///   Q heads in the group.
+    /// Backward:
+    ///   Same as causal_attention per head, but dK and dV accumulate from all
+    ///   Q-heads in the group:
+    ///     For each q_head h, kv_head = h/group_size:
+    ///       dV_kvh  += W_h.T @ dOut_h
+    ///       dW_h     = dOut_h @ V_h.T  (then softmax backward)
+    ///       dQ_h    += dScores_h @ K_kvh * scale
+    ///       dK_kvh  += dScores_h.T @ Q_h * scale
     pub fn gqa_attention(
         q: &TensorNode,
         k: &TensorNode,
@@ -891,57 +1122,91 @@ impl TensorNode {
         assert_eq!(k_data.cols, n_kv_heads * d_head);
         assert_eq!(v_data.cols, n_kv_heads * d_head);
 
-        // Output: [T, n_q_heads * d_head]
-        let mut out_data = Mat::zeros(t, n_q_heads * d_head);
+        // Forward: run attention per q-head, storing weights for backward
+        let mut out_data    = Mat::zeros(t, n_q_heads * d_head);
+        let mut all_weights = vec![Mat::zeros(t, t); n_q_heads]; // one per q-head
 
         for qh in 0..n_q_heads {
-            let kvh = qh / group_size; // which KV head to use
+            let kvh = qh / group_size;
 
-            // Extract Q slice: [T, d_head]
-            let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh * d_head + c));
-
-            // Extract K slice: [T, d_head]
+            let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
             let k_h = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
-
-            // Extract V slice: [T, d_head]
             let v_h = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
 
-            // Causal attention for this head: scores = Q_h @ K_h.T / scale
             let mut scores = q_h.matmul(&k_h.transpose()).scale(scale);
-            for i in 0..t {
-                for j in (i + 1)..t {
-                    *scores.at_mut(i, j) = -1e9; // causal mask
-                }
-            }
+            for i in 0..t { for j in (i+1)..t { *scores.at_mut(i, j) = -1e9; } }
 
-            // Softmax row-wise
-            let weights = {
-                let mut w = Mat::zeros(t, t);
-                for r in 0..t {
-                    let row_max = (0..t).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
-                    let mut row_sum = 0.0f32;
-                    for c in 0..t {
-                        let e = (scores.at(r, c) - row_max).exp();
-                        *w.at_mut(r, c) = e;
-                        row_sum += e;
-                    }
-                    for c in 0..t { *w.at_mut(r, c) /= row_sum; }
-                }
-                w
-            };
-
-            // out_h = weights @ V_h : [T, d_head]
-            let out_h = weights.matmul(&v_h);
-
-            // Write into output slice
+            let mut w = Mat::zeros(t, t);
             for r in 0..t {
-                for c in 0..d_head {
-                    *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c);
+                let row_max = (0..t).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                let mut row_sum = 0.0f32;
+                for c in 0..t {
+                    let e = (scores.at(r, c) - row_max).exp();
+                    *w.at_mut(r, c) = e; row_sum += e;
                 }
+                for c in 0..t { *w.at_mut(r, c) /= row_sum; }
             }
+
+            let out_h = w.matmul(&v_h);
+            for r in 0..t { for c in 0..d_head { *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c); } }
+            all_weights[qh] = w;
         }
 
-        TensorNode::leaf(out_data)
+        let out = TensorNode::leaf(out_data);
+        let q_c = q.clone();
+        let k_c = k.clone();
+        let v_c = v.clone();
+        let out_c = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout   = out_c.0.borrow().grad.clone();
+            let q_data = q_c.0.borrow().data.clone();
+            let k_data = k_c.0.borrow().data.clone();
+            let v_data = v_c.0.borrow().data.clone();
+
+            let mut dq_data = Mat::zeros(t, n_q_heads  * d_head);
+            let mut dk_data = Mat::zeros(t, n_kv_heads * d_head);
+            let mut dv_data = Mat::zeros(t, n_kv_heads * d_head);
+
+            for qh in 0..n_q_heads {
+                let kvh = qh / group_size;
+                let w = &all_weights[qh];
+
+                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh  * d_head + c));
+                let q_h    = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
+                let k_h    = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+                let v_h    = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+
+                // dV_kvh += W.T @ dOut_h
+                let dv_h = w.transpose().matmul(&dout_h);
+                for r in 0..t { for c in 0..d_head { *dv_data.at_mut(r, kvh * d_head + c) += dv_h.at(r, c); } }
+
+                // dW = dOut_h @ V_h.T  [T, T]
+                let dw = dout_h.matmul(&v_h.transpose());
+
+                // Backward through causal softmax
+                let mut dscores = Mat::zeros(t, t);
+                for r in 0..t {
+                    let dot: f32 = (0..=r).map(|c| dw.at(r, c) * w.at(r, c)).sum();
+                    for c in 0..=r { *dscores.at_mut(r, c) = w.at(r, c) * (dw.at(r, c) - dot); }
+                }
+                let dscores = dscores.scale(scale);
+
+                // dQ_h += dScores @ K_h
+                let dq_h = dscores.matmul(&k_h);
+                for r in 0..t { for c in 0..d_head { *dq_data.at_mut(r, qh * d_head + c) += dq_h.at(r, c); } }
+
+                // dK_kvh += dScores.T @ Q_h
+                let dk_h = dscores.transpose().matmul(&q_h);
+                for r in 0..t { for c in 0..d_head { *dk_data.at_mut(r, kvh * d_head + c) += dk_h.at(r, c); } }
+            }
+
+            q_c.0.borrow_mut().grad.add_assign(&dq_data);
+            k_c.0.borrow_mut().grad.add_assign(&dk_data);
+            v_c.0.borrow_mut().grad.add_assign(&dv_data);
+        }));
+        out.0.borrow_mut().prev = vec![q.clone(), k.clone(), v.clone()];
+        out
     }
 
     // =========================================================================
@@ -1320,6 +1585,167 @@ mod tests {
         for r in 0..t { for c in 0..d {
             assert!(approx(vg.at(r,c), num.at(r,c)),
                 "attn dV[{},{}]: analytical={:.4} numerical={:.4}", r, c, vg.at(r,c), num.at(r,c));
+        }}
+    }
+
+    // --- RMSNorm backward ---
+
+    #[test]
+    fn test_rms_norm_grad_x() {
+        let x_data = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
+        let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
+
+        let num = numerical_grad(&|x| {
+            let xn = TensorNode::leaf(x.clone());
+            let gn = TensorNode::leaf(g_data.clone());
+            let out = xn.rms_norm(&gn, 1e-5);
+            out.data().data.iter().sum::<f32>()
+        }, &x_data);
+
+        let x = TensorNode::leaf(x_data);
+        let g = TensorNode::leaf(g_data);
+        let out = x.rms_norm(&g, 1e-5);
+        out.0.borrow_mut().grad = Mat::ones(1, 4);
+        call_backward(&out);
+
+        let xg = x.grad().clone();
+        for c in 0..4 {
+            assert!(approx(xg.at(0, c), num.at(0, c)),
+                "RMSNorm dX[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0, c), num.at(0, c));
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_grad_gamma() {
+        let x_data = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
+        let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
+
+        let num = numerical_grad(&|g| {
+            let xn = TensorNode::leaf(x_data.clone());
+            let gn = TensorNode::leaf(g.clone());
+            let out = xn.rms_norm(&gn, 1e-5);
+            out.data().data.iter().sum::<f32>()
+        }, &g_data);
+
+        let x = TensorNode::leaf(x_data);
+        let g = TensorNode::leaf(g_data);
+        let out = x.rms_norm(&g, 1e-5);
+        out.0.borrow_mut().grad = Mat::ones(1, 4);
+        call_backward(&out);
+
+        let gg = g.grad().clone();
+        for c in 0..4 {
+            assert!(approx(gg.at(0, c), num.at(0, c)),
+                "RMSNorm dGamma[{}]: analytical={:.4} numerical={:.4}", c, gg.at(0, c), num.at(0, c));
+        }
+    }
+
+    // --- SiLU backward ---
+
+    #[test]
+    fn test_silu_grad() {
+        let x_data = Mat::new(vec![-1.0, 0.0, 0.5, 2.0], 1, 4);
+
+        let num = numerical_grad(&|x| {
+            let xn = TensorNode::leaf(x.clone());
+            xn.silu().data().data.iter().sum::<f32>()
+        }, &x_data);
+
+        let x   = TensorNode::leaf(x_data);
+        let out = x.silu();
+        out.0.borrow_mut().grad = Mat::ones(1, 4);
+        call_backward(&out);
+
+        let xg = x.grad().clone();
+        for c in 0..4 {
+            assert!(approx(xg.at(0, c), num.at(0, c)),
+                "SiLU grad[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0, c), num.at(0, c));
+        }
+    }
+
+    // --- mul_elem_node backward ---
+
+    #[test]
+    fn test_mul_elem_node_grad() {
+        let a_data = Mat::new(vec![1.0, 2.0, 0.5, -1.0], 1, 4);
+        let b_data = Mat::new(vec![0.3, -0.5, 1.2, 0.8], 1, 4);
+
+        let num_a = numerical_grad(&|a| {
+            let an = TensorNode::leaf(a.clone());
+            let bn = TensorNode::leaf(b_data.clone());
+            an.mul_elem_node(&bn).data().data.iter().sum::<f32>()
+        }, &a_data);
+
+        let a   = TensorNode::leaf(a_data);
+        let b   = TensorNode::leaf(b_data);
+        let out = a.mul_elem_node(&b);
+        out.0.borrow_mut().grad = Mat::ones(1, 4);
+        call_backward(&out);
+
+        let ag = a.grad().clone();
+        for c in 0..4 {
+            assert!(approx(ag.at(0, c), num_a.at(0, c)),
+                "mul_elem dA[{}]: analytical={:.4} numerical={:.4}", c, ag.at(0, c), num_a.at(0, c));
+        }
+    }
+
+    // --- RoPE backward ---
+
+    #[test]
+    fn test_rope_grad() {
+        // Use slightly looser tolerance for RoPE: trig functions accumulate more
+        // floating-point error in the central-difference approximation.
+        let tol = 5e-3f32;
+        let x_data = Mat::from_fn(3, 8, |r, c| (r * 8 + c) as f32 * 0.1 + 0.1);
+
+        let num = numerical_grad(&|x| {
+            let xn = TensorNode::leaf(x.clone());
+            xn.rope_apply(0, 10000.0).data().data.iter().sum::<f32>()
+        }, &x_data);
+
+        let x   = TensorNode::leaf(x_data);
+        let out = x.rope_apply(0, 10000.0);
+        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        out.0.borrow_mut().grad = Mat::ones(r, c);
+        call_backward(&out);
+
+        let xg = x.grad().clone();
+        for row in 0..3 { for col in 0..8 {
+            assert!((xg.at(row, col) - num.at(row, col)).abs() < tol,
+                "RoPE dX[{},{}]: analytical={:.4} numerical={:.4}",
+                row, col, xg.at(row, col), num.at(row, col));
+        }}
+    }
+
+    // --- GQA backward ---
+
+    #[test]
+    fn test_gqa_grad_q() {
+        let t = 3; let n_q = 4; let n_kv = 2; let dh = 4;
+        let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+
+        let num = numerical_grad(&|q| {
+            let qn = TensorNode::leaf(q.clone());
+            let kn = TensorNode::leaf(k_data.clone());
+            let vn = TensorNode::leaf(v_data.clone());
+            TensorNode::gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh).data().data.iter().sum::<f32>()
+        }, &q_data);
+
+        let q   = TensorNode::leaf(q_data);
+        let k   = TensorNode::leaf(k_data);
+        let v   = TensorNode::leaf(v_data);
+        let out = TensorNode::gqa_attention(&q, &k, &v, n_q, n_kv, dh);
+        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        out.0.borrow_mut().grad = Mat::ones(r, c);
+        call_backward(&out);
+
+        let qg = q.grad().clone();
+        for row in 0..t { for col in 0..(n_q * dh) {
+            assert!(approx(qg.at(row, col), num.at(row, col)),
+                "GQA dQ[{},{}]: analytical={:.4} numerical={:.4}",
+                row, col, qg.at(row, col), num.at(row, col));
         }}
     }
 
