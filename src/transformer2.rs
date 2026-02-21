@@ -428,6 +428,34 @@ impl Module2 for Gpt2 {
     }
 }
 
+impl Gpt2 {
+    /// Tie the language model head weights to the token embedding weights.
+    ///
+    /// ## Why weight tying?
+    ///
+    /// The embedding table maps token id → d_model vector.
+    /// The lm_head maps d_model vector → logit per token.
+    ///
+    /// These two operations are inverses of each other: both learn a
+    /// per-token representation in the same d_model space.  Sharing them:
+    ///   - Reduces total parameters by vocab_size * d_model (≈25M for GPT-2)
+    ///   - Improves generalisation (the embedding and output projection stay consistent)
+    ///   - Is the standard in GPT-2, LLaMA, Mistral, and most open-weight models
+    ///
+    /// After calling this, `lm_head.weight` and `embed.token_embed` point to
+    /// the same `TensorNode`.  Both the forward pass and the backward pass
+    /// will accumulate gradients into the same underlying storage.
+    pub fn tie_weights(&mut self) {
+        // lm_head.weight has shape [vocab_size, d_model]  (same as token_embed)
+        assert_eq!(
+            (self.lm_head.weight.data().rows, self.lm_head.weight.data().cols),
+            (self.embed.token_embed.data().rows, self.embed.token_embed.data().cols),
+            "tie_weights: lm_head.weight and embed.token_embed have different shapes"
+        );
+        self.lm_head.weight = self.embed.token_embed.clone();
+    }
+}
+
 // =============================================================================
 // KV Cache for Gpt2
 // =============================================================================
@@ -882,5 +910,89 @@ mod tests {
         let r1 = model.generate_cached(&[0, 1], 6, 0.0);
         let r2 = model.generate_cached(&[0, 1], 6, 0.0);
         assert_eq!(r1, r2, "greedy generation must be deterministic");
+    }
+
+    // --- Weight tying ---
+
+    #[test]
+    fn test_tie_weights_shares_tensor() {
+        // After tie_weights(), mutating lm_head.weight data should affect embed.token_embed
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let mut model = Gpt2::new(cfg.clone(), &mut rng);
+        model.tie_weights();
+
+        // Write a distinctive value into lm_head.weight[0,0]
+        let mut wd = model.lm_head.weight.data().clone();
+        *wd.at_mut(0, 0) = 99.0;
+        model.lm_head.weight.set_data(wd);
+
+        // embed.token_embed must see the same change (same Rc)
+        assert_eq!(model.embed.token_embed.data().at(0, 0), 99.0,
+            "tie_weights: embed.token_embed and lm_head.weight must share storage");
+    }
+
+    #[test]
+    fn test_tie_weights_forward_still_runs() {
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let mut model = Gpt2::new(cfg.clone(), &mut rng);
+        model.tie_weights();
+        let logits = model.forward(&[0, 1, 2, 3]);
+        let d = logits.data();
+        assert_eq!((d.rows, d.cols), (4, cfg.vocab_size));
+        assert!(d.data.iter().all(|v| v.is_finite()), "tied-weight forward should be finite");
+    }
+
+    #[test]
+    fn test_tie_weights_reduces_parameter_count() {
+        // Count duplicate TensorNode pointers in parameters() BEFORE and AFTER tying.
+        // Before: all parameter TensorNodes should be distinct.
+        // After tying: lm_head.weight == embed.token_embed → one duplicate entry in the list.
+        let cfg = nano_config();
+        let mut rng = make_rng();
+
+        let count_duplicates = |m: &Gpt2| {
+            let ps = m.parameters();
+            let total = ps.len();
+            let mut ptrs: Vec<*const f32> = ps.iter()
+                .map(|p| p.data().data.as_ptr())
+                .collect();
+            ptrs.sort();
+            ptrs.dedup();
+            total - ptrs.len() // number of duplicates
+        };
+
+        let m = Gpt2::new(cfg.clone(), &mut rng);
+        let dups_before = count_duplicates(&m);
+
+        let mut m2 = Gpt2::new(cfg.clone(), &mut rng);
+        m2.tie_weights();
+        let dups_after = count_duplicates(&m2);
+
+        assert!(dups_after > dups_before,
+            "tie_weights should introduce at least 1 duplicate: before={} after={}", dups_before, dups_after);
+    }
+
+    #[test]
+    fn test_tie_weights_backward_accumulates_into_embed() {
+        // After tying, the grad of lm_head.weight and embed.token_embed should be the same object
+        let cfg = nano_config();
+        let mut rng = make_rng();
+        let mut model = Gpt2::new(cfg.clone(), &mut rng);
+        model.tie_weights();
+
+        let loss = model.loss(&[0, 1, 2], &[1, 2, 3]);
+        loss.backward();
+
+        // The gradient on lm_head.weight and embed.token_embed must be identical
+        let g_lm   = model.lm_head.weight.grad().clone();
+        let g_emb  = model.embed.token_embed.grad().clone();
+        assert_eq!(g_lm.rows, g_emb.rows);
+        assert_eq!(g_lm.cols, g_emb.cols);
+        // Both point to same storage, so values must be equal
+        for (a, b) in g_lm.data.iter().zip(g_emb.data.iter()) {
+            assert_eq!(*a, *b, "tied weight grads must be identical");
+        }
     }
 }

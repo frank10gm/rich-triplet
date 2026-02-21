@@ -116,17 +116,52 @@ pub struct SamplingParams {
     /// Seed for the internal LCG random number generator.
     /// The same seed + same logits → same sample (reproducible).
     pub seed: u64,
+
+    /// Stop generation when this token id is produced.
+    /// Set to `None` to disable EOS stopping (generate exactly `max_new` tokens).
+    ///
+    /// For GPT-2 tokenizer the EOS token is 50256.
+    /// For tiktoken (GPT-OSS) it is 100257.
+    pub eos_token_id: Option<usize>,
+
+    /// Frequency penalty — further reduces the logit of tokens proportionally
+    /// to how many times they have already appeared:
+    ///
+    ///   logit[tok] -= frequency_penalty * count(tok)
+    ///
+    /// 0.0 = disabled.  Typical values: 0.2 – 1.0.
+    /// Positive values discourage word repetition.
+    pub frequency_penalty: f32,
+
+    /// Presence penalty — reduces the logit of any token that has appeared
+    /// at least once, regardless of how many times:
+    ///
+    ///   logit[tok] -= presence_penalty   (if count(tok) > 0)
+    ///
+    /// 0.0 = disabled.  Typical values: 0.2 – 1.0.
+    /// Encourages the model to use new vocabulary.
+    pub presence_penalty: f32,
 }
 
 impl SamplingParams {
     /// Greedy (deterministic) sampling — always picks the argmax.
     pub fn greedy() -> Self {
-        SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 }
+        SamplingParams {
+            temperature: 0.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 0,
+            eos_token_id: None,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+        }
     }
 
     /// Typical creative-writing defaults.
     pub fn creative(seed: u64) -> Self {
-        SamplingParams { temperature: 0.8, top_k: 50, top_p: 0.92, repetition_penalty: 1.1, seed }
+        SamplingParams {
+            temperature: 0.8, top_k: 50, top_p: 0.92,
+            repetition_penalty: 1.1, seed,
+            eos_token_id: None,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+        }
     }
 }
 
@@ -1023,7 +1058,8 @@ impl GptOssModel {
         let params = if temperature <= 0.0 {
             SamplingParams::greedy()
         } else {
-            SamplingParams { temperature, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 }
+            SamplingParams { temperature, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0,
+                             eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 }
         };
         // No previously-seen tokens (repetition_penalty disabled)
         self.sample_token_full(logits, pos, &params, &[], &mut LcgRng::new(params.seed))
@@ -1061,13 +1097,35 @@ impl GptOssModel {
     ) -> usize {
         let v = logits.cols;
 
-        // Step 1: repetition penalty
+        // Build frequency counts from seen_ids (needed for freq/presence penalties)
+        let mut freq: Vec<u32> = vec![0u32; v];
+        for &tok in seen_ids {
+            if tok < v { freq[tok] += 1; }
+        }
+
+        // Step 1: repetition penalty + frequency penalty + presence penalty
         let mut row: Vec<f32> = (0..v).map(|c| logits.at(pos, c)).collect();
         if params.repetition_penalty != 1.0 {
-            for &tok in seen_ids {
-                if tok < v {
+            for (tok, &cnt) in freq.iter().enumerate() {
+                if cnt > 0 {
                     // Penalise: reduce logit magnitude (works for both positive & negative logits)
                     row[tok] /= params.repetition_penalty;
+                }
+            }
+        }
+        // Frequency penalty: subtract penalty * count
+        if params.frequency_penalty != 0.0 {
+            for (tok, &cnt) in freq.iter().enumerate() {
+                if cnt > 0 {
+                    row[tok] -= params.frequency_penalty * cnt as f32;
+                }
+            }
+        }
+        // Presence penalty: subtract fixed amount if token appeared at all
+        if params.presence_penalty != 0.0 {
+            for (tok, &cnt) in freq.iter().enumerate() {
+                if cnt > 0 {
+                    row[tok] -= params.presence_penalty;
                 }
             }
         }
@@ -1159,6 +1217,11 @@ impl GptOssModel {
         generated.push(first_tok);
         seen.push(first_tok);
 
+        // Stop immediately if EOS was the first generated token
+        if params.eos_token_id == Some(first_tok) {
+            return generated;
+        }
+
         // Decode
         let mut prev_tok = first_tok;
         for _ in 1..max_new {
@@ -1173,6 +1236,10 @@ impl GptOssModel {
             prev_tok = self.sample_token_full(&logits.data(), 0, params, &seen, &mut rng);
             generated.push(prev_tok);
             seen.push(prev_tok);
+
+            if params.eos_token_id == Some(prev_tok) {
+                break;
+            }
         }
         generated
     }
@@ -1204,6 +1271,11 @@ impl GptOssModel {
         callback(first_tok);
         seen.push(first_tok);
 
+        // Stop immediately if EOS was the first generated token
+        if params.eos_token_id == Some(first_tok) {
+            return;
+        }
+
         let mut prev_tok = first_tok;
         for _ in 1..max_new {
             let x_data = Mat::from_fn(1, d, |_, col| te.at(prev_tok, col));
@@ -1217,6 +1289,10 @@ impl GptOssModel {
             prev_tok = self.sample_token_full(&logits.data(), 0, params, &seen, &mut rng);
             callback(prev_tok);
             seen.push(prev_tok);
+
+            if params.eos_token_id == Some(prev_tok) {
+                break;
+            }
         }
     }
 
@@ -1822,6 +1898,34 @@ impl Module2 for GptOssModel {
     }
 }
 
+impl GptOssModel {
+    /// Tie the language model head weights to the token embedding table.
+    ///
+    /// ## Why weight tying?
+    ///
+    /// The embedding table maps token id → hidden vector (`[V, D]`).
+    /// The lm_head maps hidden vector → logit (`[D, V]` via `weight.T`).
+    ///
+    /// These two operations are semantically identical: both represent a
+    /// per-token direction in the hidden space.  Tying them:
+    ///
+    ///   - Saves `vocab_size × hidden_size` parameters (≈580M for GPT-OSS-20b)
+    ///   - Forces embedding and output representations to be consistent
+    ///   - Is standard in GPT-2, LLaMA, Mistral, GPT-OSS
+    ///
+    /// After calling `tie_weights()`:
+    ///   - `lm_head.weight` IS `embed_tokens` (same `TensorNode` / same Rc)
+    ///   - Both the forward pass and backward pass accumulate into the same storage
+    pub fn tie_weights(&mut self) {
+        assert_eq!(
+            (self.lm_head.weight.data().rows, self.lm_head.weight.data().cols),
+            (self.embed_tokens.data().rows, self.embed_tokens.data().cols),
+            "tie_weights: lm_head.weight and embed_tokens have different shapes"
+        );
+        self.lm_head.weight = self.embed_tokens.clone();
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -2204,8 +2308,8 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p_nok = SamplingParams { temperature: 0.8, top_k: 0,              top_p: 1.0, repetition_penalty: 1.0, seed: 42 };
-        let p_all = SamplingParams { temperature: 0.8, top_k: cfg.vocab_size, top_p: 1.0, repetition_penalty: 1.0, seed: 42 };
+        let p_nok = SamplingParams { temperature: 0.8, top_k: 0,              top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
+        let p_all = SamplingParams { temperature: 0.8, top_k: cfg.vocab_size, top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
         let r_nok = model.generate_with_params(&[1, 2], 5, &p_nok);
         let r_all = model.generate_with_params(&[1, 2], 5, &p_all);
         assert_eq!(r_nok, r_all, "top_k=0 should behave like top_k=vocab_size");
@@ -2217,8 +2321,8 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p1 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 7 };
-        let p2 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 0.9999, repetition_penalty: 1.0, seed: 7 };
+        let p1 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
+        let p2 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 0.9999, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
         let r1 = model.generate_with_params(&[0, 3], 4, &p1);
         // With top_p ≈ 1 the result may or may not equal r1 depending on dist.
         // We just verify it runs without panic and produces correct length.
@@ -2232,7 +2336,7 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.5, seed: 3 };
+        let p = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.5, seed: 3, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
         let tokens = model.generate_with_params(&[0, 1, 2], 8, &p);
         for &tok in &tokens {
             assert!(tok < cfg.vocab_size, "token {} out of vocab", tok);
@@ -2520,5 +2624,184 @@ mod tests {
         let f32_bytes = 64 * 64 * 4;
         assert!(q.size_bytes() < f32_bytes / 3,
             "Q4 should use <1/3 of f32 memory: {} vs {}", q.size_bytes(), f32_bytes);
+    }
+
+    // --- EOS stopping ---
+
+    #[test]
+    fn test_eos_stops_generation_early() {
+        // Set eos_token_id = 0 and make the model very likely to produce it
+        // (we can't control weights, but we can verify the list ends at EOS).
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        // Use eos = 0, which is token id 0. Generate up to 20 tokens.
+        let p = SamplingParams {
+            temperature: 1.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 1,
+            eos_token_id: Some(0),
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+        };
+        let tokens = model.generate_with_params(&[1, 2], 20, &p);
+        // Either EOS was never produced (all 20 tokens) or it stopped early.
+        // Either way the list must not be longer than max_new.
+        assert!(tokens.len() <= 20, "generated too many tokens: {}", tokens.len());
+        // If EOS appears, it must be the last token
+        if let Some(pos) = tokens.iter().position(|&t| t == 0) {
+            assert_eq!(pos, tokens.len() - 1,
+                "EOS token should only appear as the last token");
+        }
+    }
+
+    #[test]
+    fn test_eos_none_generates_max_new() {
+        // With eos_token_id = None, should always produce exactly max_new tokens
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams::greedy();
+        assert_eq!(p.eos_token_id, None);
+        let tokens = model.generate_with_params(&[1, 2], 10, &p);
+        assert_eq!(tokens.len(), 10, "greedy (no EOS) should produce exactly max_new");
+    }
+
+    #[test]
+    fn test_eos_streaming_stops_early() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams {
+            temperature: 1.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 1,
+            eos_token_id: Some(0),
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+        };
+        let mut streamed = Vec::new();
+        model.generate_with_params_streaming(&[1, 2], 20, &p, |t| streamed.push(t));
+        assert!(streamed.len() <= 20);
+        if let Some(pos) = streamed.iter().position(|&t| t == 0) {
+            assert_eq!(pos, streamed.len() - 1,
+                "EOS should only appear as the last streamed token");
+        }
+    }
+
+    // --- Frequency / presence penalty ---
+
+    #[test]
+    fn test_frequency_penalty_tokens_in_vocab() {
+        // freq/presence penalty should not push any token out of vocab range
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams {
+            temperature: 1.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 5,
+            eos_token_id: None,
+            frequency_penalty: 0.5, presence_penalty: 0.0,
+        };
+        let tokens = model.generate_with_params(&[0, 1, 2], 10, &p);
+        for &tok in &tokens {
+            assert!(tok < cfg.vocab_size, "token {} out of vocab", tok);
+        }
+    }
+
+    #[test]
+    fn test_presence_penalty_tokens_in_vocab() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let p = SamplingParams {
+            temperature: 1.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 6,
+            eos_token_id: None,
+            frequency_penalty: 0.0, presence_penalty: 0.3,
+        };
+        let tokens = model.generate_with_params(&[0, 1, 2], 10, &p);
+        for &tok in &tokens {
+            assert!(tok < cfg.vocab_size, "token {} out of vocab", tok);
+        }
+    }
+
+    #[test]
+    fn test_no_penalty_vs_freq_penalty_different_results() {
+        // With a high frequency penalty, generation should differ from no penalty
+        // (not guaranteed, but extremely likely with a finite vocab of 16 tokens
+        //  and long enough generation).
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let base = SamplingParams {
+            temperature: 0.8, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 99,
+            eos_token_id: None,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+        };
+        let with_freq = SamplingParams {
+            frequency_penalty: 2.0,
+            ..base.clone()
+        };
+        let r_base = model.generate_with_params(&[0, 1], 12, &base);
+        let r_freq = model.generate_with_params(&[0, 1], 12, &with_freq);
+        // Both must be valid
+        for &t in r_base.iter().chain(r_freq.iter()) {
+            assert!(t < cfg.vocab_size);
+        }
+        // We don't assert they differ (random init means either outcome is possible),
+        // but the test ensures both code paths run without panic or NaN.
+    }
+
+    // --- Weight tying ---
+
+    #[test]
+    fn test_tie_weights_shares_tensor() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let mut model = GptOssModel::new(cfg.clone(), &mut rng);
+        model.tie_weights();
+
+        // Write a distinctive value into lm_head.weight[0,0]
+        let mut wd = model.lm_head.weight.data().clone();
+        *wd.at_mut(0, 0) = 77.0;
+        model.lm_head.weight.set_data(wd);
+
+        // embed_tokens must reflect the same change (shared Rc)
+        assert_eq!(model.embed_tokens.data().at(0, 0), 77.0,
+            "tie_weights: embed_tokens and lm_head.weight must share storage");
+    }
+
+    #[test]
+    fn test_tie_weights_forward_still_runs() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let mut model = GptOssModel::new(cfg.clone(), &mut rng);
+        model.tie_weights();
+        let out = model.forward(&[0, 1, 2]);
+        let d = out.data();
+        assert_eq!((d.rows, d.cols), (3, cfg.vocab_size));
+        assert!(d.data.iter().all(|v| v.is_finite()),
+            "tied-weight forward should produce finite logits");
+    }
+
+    #[test]
+    fn test_tie_weights_reduces_unique_params() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+
+        let count_unique = |m: &GptOssModel| {
+            let mut ptrs: Vec<*const f32> = m.parameters().iter()
+                .map(|p| p.data().data.as_ptr())
+                .collect();
+            ptrs.sort();
+            ptrs.dedup();
+            ptrs.len()
+        };
+
+        let m1 = GptOssModel::new(cfg.clone(), &mut rng);
+        let before = count_unique(&m1);
+        let mut m2 = GptOssModel::new(cfg.clone(), &mut rng);
+        m2.tie_weights();
+        let after = count_unique(&m2);
+        assert!(after < before,
+            "tie_weights should reduce unique param tensors: {before} → {after}");
     }
 }

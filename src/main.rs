@@ -167,6 +167,7 @@ fn main() {
         eval_interval,
         learning_rate: 1e-3,
         grad_clip: 1.0,
+        ..TrainConfig2::default()
     };
 
     let t_tensor_start = std::time::Instant::now();

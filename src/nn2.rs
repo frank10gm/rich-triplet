@@ -307,6 +307,111 @@ impl Module2 for SwiGluMlp2 {
 }
 
 // =============================================================================
+// Dropout2
+// =============================================================================
+//
+// ## What dropout does
+//
+// During training, each element is independently set to zero with probability p
+// (the "drop rate"), and the surviving elements are scaled up by 1/(1-p) so
+// the expected value is unchanged.  During inference, nothing is dropped.
+//
+// ## Why it works
+//
+// By randomly disabling neurons, dropout:
+//   - Forces the network to learn redundant representations
+//   - Acts as an ensemble: each mini-batch trains a different sub-network
+//   - Reduces co-adaptation of neurons → better generalisation
+//
+// ## p choices
+//
+//   p = 0.0  → no dropout (same as not using it)
+//   p = 0.1  → mild; good for residual streams in transformers
+//   p = 0.5  → aggressive; common in fully-connected classifiers
+//
+// ## Implementation note
+//
+// The backward rule is simple:
+//   Forward:  mask = Bernoulli(1-p); y = x * mask / (1-p)
+//   Backward: dx = dy * mask / (1-p)   (same mask reused)
+//
+// The mask is generated fresh for each forward call using a simple LCG RNG
+// seeded by an atomic counter, giving different masks per step without
+// requiring the caller to manage a PRNG state.
+//
+// ## Usage
+//
+//   let drop = Dropout2::new(0.1);  // drop 10% of activations
+//   let y = drop.forward(&x, true); // training=true
+//   let y = drop.forward(&x, false); // inference — identity
+
+pub struct Dropout2 {
+    /// Drop probability (0 = no dropout, 1 = drop everything)
+    pub p: f32,
+    /// LCG seed counter — advanced atomically each forward call
+    seed: std::sync::atomic::AtomicU64,
+}
+
+impl Dropout2 {
+    pub fn new(p: f32) -> Self {
+        assert!(p >= 0.0 && p < 1.0, "dropout p must be in [0, 1)");
+        Dropout2 { p, seed: std::sync::atomic::AtomicU64::new(12345) }
+    }
+
+    /// x: [T, D]  →  output: [T, D]
+    ///
+    /// training=true:   apply random mask
+    /// training=false:  identity (return x unchanged)
+    pub fn forward(&self, x: &TensorNode, training: bool) -> TensorNode {
+        if !training || self.p == 0.0 {
+            return x.clone();
+        }
+
+        let keep_prob = 1.0 - self.p;
+        let scale = 1.0 / keep_prob;
+
+        // Generate mask using LCG — one call per element
+        let seed0 = self.seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let xd = x.data().clone();
+        let mask = Mat::from_fn(xd.rows, xd.cols, |r, c| {
+            // Per-element LCG: mix seed with position
+            let s = seed0
+                .wrapping_add((r * xd.cols + c) as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (s >> 33) as f32 / (1u64 << 31) as f32;
+            if u > self.p { scale } else { 0.0 }
+        });
+
+        // out = x * mask
+        let out_data = Mat::from_fn(xd.rows, xd.cols, |r, c| xd.at(r, c) * mask.at(r, c));
+        let out = TensorNode::leaf(out_data);
+
+        let x_c = x.clone();
+        let out_c = out.clone();
+        let mask_c = mask;
+
+        out.set_backward(Box::new(move || {
+            // dx = dout * mask (same mask as forward)
+            let dout = out_c.grad().clone();
+            let mut dx = x_c.grad().clone();
+            for i in 0..dx.data.len() {
+                dx.data[i] += dout.data[i] * mask_c.data[i];
+            }
+            x_c.set_grad(dx);
+            x_c.call_backward_fn();
+        }), vec![x.clone()]);
+
+        out
+    }
+}
+
+impl Module2 for Dropout2 {
+    /// Dropout has no learnable parameters.
+    fn parameters(&self) -> Vec<TensorNode> { vec![] }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -420,6 +525,73 @@ mod tests {
         let mean = vals.iter().sum::<f32>() / 4.0;
         let std = (vals.iter().map(|&v| (v-mean).powi(2)).sum::<f32>() / 4.0).sqrt();
         assert!((std - 1.0).abs() < 1e-4, "LN std should be 1, got {}", std);
+    }
+
+    // --- Dropout2 ---
+
+    #[test]
+    fn test_dropout_inference_is_identity() {
+        let drop = Dropout2::new(0.5);
+        let x = TensorNode::leaf(Mat::from_fn(4, 8, |r, c| (r * 8 + c) as f32));
+        let out = drop.forward(&x, false);
+        let xd = x.data();
+        let od = out.data();
+        for r in 0..4 { for c in 0..8 {
+            assert_eq!(xd.at(r, c), od.at(r, c), "inference dropout must be identity");
+        }}
+    }
+
+    #[test]
+    fn test_dropout_training_zeros_some_elements() {
+        let drop = Dropout2::new(0.5);
+        let x = TensorNode::leaf(Mat::from_fn(8, 16, |_, _| 1.0));
+        let out = drop.forward(&x, true);
+        let zeros = out.data().data.iter().filter(|&&v| v == 0.0).count();
+        // With p=0.5 and 128 elements, expect roughly 64 zeros.
+        // Accept anything in [20, 108] — very wide to avoid flakiness.
+        assert!(zeros > 20 && zeros < 108,
+            "expected ~50% zeros with p=0.5, got {}/128", zeros);
+    }
+
+    #[test]
+    fn test_dropout_zero_p_is_identity() {
+        let drop = Dropout2::new(0.0);
+        let x = TensorNode::leaf(Mat::from_fn(3, 4, |r, c| (r * 4 + c) as f32 * 0.1));
+        let out = drop.forward(&x, true); // even in training, p=0 → identity
+        let xd = x.data(); let od = out.data();
+        for r in 0..3 { for c in 0..4 {
+            assert_eq!(xd.at(r, c), od.at(r, c));
+        }}
+    }
+
+    #[test]
+    fn test_dropout_scales_surviving_elements() {
+        // With p=0.5, surviving elements should be scaled by 2.0
+        let drop = Dropout2::new(0.5);
+        let x = TensorNode::leaf(Mat::from_fn(4, 4, |_, _| 1.0));
+        let out = drop.forward(&x, true);
+        for &v in &out.data().data {
+            assert!(v == 0.0 || (v - 2.0).abs() < 1e-5,
+                "dropout output should be 0 or 2 (scale=1/(1-0.5)), got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dropout_backward_finite() {
+        let drop = Dropout2::new(0.3);
+        let x = TensorNode::leaf(Mat::from_fn(2, 4, |r, c| (r * 4 + c) as f32 * 0.5));
+        let out = drop.forward(&x, true);
+        let sum_val: f32 = out.data().data.iter().sum();
+        let loss = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
+        let out_c = out.clone();
+        loss.set_backward(Box::new(move || {
+            let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
+            out_c.set_grad(ones);
+            out_c.call_backward_fn();
+        }), vec![out]);
+        loss.backward();
+        assert!(x.grad().data.iter().all(|v| v.is_finite()),
+            "dropout backward should produce finite gradients");
     }
 
     // --- Mlp2 ---

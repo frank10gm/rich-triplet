@@ -815,6 +815,242 @@ impl Q4Mat {
 }
 
 // =============================================================================
+// Q8Mat — 8-bit symmetric block quantization
+// =============================================================================
+//
+// ## Why Q8 when Q4 already exists?
+//
+// Q4 achieves 8× compression (4 bits instead of 32), but with 7 distinct
+// quantization levels per block it can introduce noticeable accuracy loss on
+// models with narrow weight distributions.
+//
+// Q8 uses 8-bit signed integers (range -127..127), giving 255 distinct levels.
+// Quantization error is at most 0.4% of the block max (vs ~7% for Q4).
+// Memory is 4× smaller than f32 (still 2× larger than Q4).
+//
+// Typical use case:
+//   - KV cache quantization (low error tolerance)
+//   - Activations (also low error tolerance)
+//   - Small models where Q4 is too lossy
+//
+// ## Format
+//
+//   packed[k] = round(data[k] / scale[block(k)])  — one i8 per element
+//   scale[b]  = absmax(block b) / 127.0
+//
+// ## Compression vs f32
+//
+//   Q8: 1 byte/element + 4 bytes/block (scales)
+//   f32: 4 bytes/element
+//   Ratio ≈ 4× (exact ratio depends on block size)
+
+/// Block size for Q8 quantization.
+/// Larger blocks → fewer scale values → higher compression, lower accuracy.
+const Q8_BLOCK_SIZE: usize = 64;
+
+/// 8-bit symmetric block-quantized matrix.
+pub struct Q8Mat {
+    pub rows: usize,
+    pub cols: usize,
+    /// One i8 per element, in row-major order.
+    pub packed: Vec<i8>,
+    /// One f32 scale per block of `Q8_BLOCK_SIZE` elements.
+    pub scales: Vec<f32>,
+}
+
+impl Q8Mat {
+    /// Quantize a `Mat` to 8-bit symmetric block quantization.
+    pub fn quantize(mat: &Mat) -> Self {
+        let n = mat.rows * mat.cols;
+        let n_blocks = n.div_ceil(Q8_BLOCK_SIZE);
+        let mut packed = vec![0i8; n];
+        let mut scales = vec![0.0f32; n_blocks];
+
+        for block in 0..n_blocks {
+            let start = block * Q8_BLOCK_SIZE;
+            let end   = (start + Q8_BLOCK_SIZE).min(n);
+
+            let absmax = mat.data[start..end]
+                .iter()
+                .map(|x| x.abs())
+                .fold(0.0f32, f32::max);
+
+            let scale = if absmax == 0.0 { 1.0 } else { absmax / 127.0 };
+            scales[block] = scale;
+
+            for k in start..end {
+                packed[k] = (mat.data[k] / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+
+        Q8Mat { rows: mat.rows, cols: mat.cols, packed, scales }
+    }
+
+    /// Dequantize: recover an approximate `Mat`.
+    ///
+    /// Quantization error per element ≤ 0.5 * scale ≤ absmax/254.
+    pub fn dequantize(&self) -> Mat {
+        let n = self.rows * self.cols;
+        let data: Vec<f32> = (0..n).map(|k| {
+            let block = k / Q8_BLOCK_SIZE;
+            self.packed[k] as f32 * self.scales[block]
+        }).collect();
+        Mat::new(data, self.rows, self.cols)
+    }
+
+    /// Fused matrix multiplication: (A: f32) @ (B: Q8).T
+    ///
+    /// Shape: A is [M, K], B is [N, K] → [M, N]
+    ///
+    /// Dequantizes B row-by-row on the fly (no full materialization).
+    pub fn matmul_q8_t(&self, a: &Mat) -> Mat {
+        let (m, k, nn) = (a.rows, a.cols, self.rows);
+        assert_eq!(k, self.cols, "matmul_q8_t: a.cols {} != q8.cols {}", k, self.cols);
+
+        let mut out = Mat::zeros(m, nn);
+        for j in 0..nn {
+            let row_start = j * k;
+            for i in 0..m {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let flat = row_start + p;
+                    let block = flat / Q8_BLOCK_SIZE;
+                    let w = self.packed[flat] as f32 * self.scales[block];
+                    acc += a.at(i, p) * w;
+                }
+                *out.at_mut(i, j) = acc;
+            }
+        }
+        out
+    }
+
+    /// Memory usage in bytes (excluding struct overhead).
+    pub fn size_bytes(&self) -> usize {
+        self.packed.len() + self.scales.len() * 4
+    }
+
+    /// Compression ratio vs f32 storage.
+    pub fn compression_ratio(&self) -> f32 {
+        let f32_bytes = self.rows * self.cols * 4;
+        f32_bytes as f32 / self.size_bytes() as f32
+    }
+}
+
+// =============================================================================
+// Checkpoint save/load — binary format for TensorNode weights
+// =============================================================================
+//
+// ## Format
+//
+// A checkpoint file stores a flat sequence of tensors in binary:
+//
+//   [magic: u32 = 0x4358504B "CXPK"]
+//   [version: u32 = 1]
+//   [n_tensors: u32]
+//   For each tensor:
+//     [name_len: u32]
+//     [name: name_len bytes, UTF-8]
+//     [rows: u32]
+//     [cols: u32]
+//     [data: rows*cols f32 in little-endian]
+//
+// ## Usage
+//
+//   save_checkpoint("model.ckpt", &[("embed", &embed_node), ("lm_head.w", &lm_node)]).unwrap();
+//   let ckpt = load_checkpoint("model.ckpt").unwrap();
+//   for (name, mat) in &ckpt { ... }
+
+const CKPT_MAGIC: u32 = 0x4358504B; // "CXPK"
+const CKPT_VERSION: u32 = 1;
+
+/// Save a list of named tensors to a binary checkpoint file.
+///
+/// The tensors are identified by name, so the order does not have to match
+/// the loading order.
+pub fn save_checkpoint(path: &str, tensors: &[(&str, &TensorNode)]) -> Result<(), String> {
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Header
+    buf.extend_from_slice(&CKPT_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&CKPT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+
+    for (name, node) in tensors {
+        let name_bytes = name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        let data = node.data();
+        buf.extend_from_slice(&(data.rows as u32).to_le_bytes());
+        buf.extend_from_slice(&(data.cols as u32).to_le_bytes());
+        for &v in &data.data {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("save_checkpoint: cannot create {}: {}", path, e))?;
+    file.write_all(&buf)
+        .map_err(|e| format!("save_checkpoint: write failed: {}", e))?;
+    Ok(())
+}
+
+/// Load a checkpoint file, returning a list of (name, Mat) pairs.
+///
+/// The caller is responsible for matching names to model parameters.
+pub fn load_checkpoint(path: &str) -> Result<Vec<(String, Mat)>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("load_checkpoint: cannot read {}: {}", path, e))?;
+
+    let mut pos = 0usize;
+
+    let read_u32 = |b: &[u8], p: &mut usize| -> Result<u32, String> {
+        if *p + 4 > b.len() { return Err("unexpected EOF reading u32".to_string()); }
+        let v = u32::from_le_bytes(b[*p..*p+4].try_into().unwrap());
+        *p += 4;
+        Ok(v)
+    };
+    let read_f32 = |b: &[u8], p: &mut usize| -> Result<f32, String> {
+        if *p + 4 > b.len() { return Err("unexpected EOF reading f32".to_string()); }
+        let v = f32::from_le_bytes(b[*p..*p+4].try_into().unwrap());
+        *p += 4;
+        Ok(v)
+    };
+
+    let magic   = read_u32(&bytes, &mut pos)?;
+    let version = read_u32(&bytes, &mut pos)?;
+    if magic != CKPT_MAGIC {
+        return Err(format!("load_checkpoint: bad magic 0x{:08X} (expected 0x{:08X})", magic, CKPT_MAGIC));
+    }
+    if version != CKPT_VERSION {
+        return Err(format!("load_checkpoint: unsupported version {}", version));
+    }
+
+    let n_tensors = read_u32(&bytes, &mut pos)? as usize;
+    let mut tensors = Vec::with_capacity(n_tensors);
+
+    for _ in 0..n_tensors {
+        let name_len = read_u32(&bytes, &mut pos)? as usize;
+        if pos + name_len > bytes.len() { return Err("unexpected EOF reading name".to_string()); }
+        let name = std::str::from_utf8(&bytes[pos..pos + name_len])
+            .map_err(|e| format!("invalid UTF-8 name: {}", e))?
+            .to_string();
+        pos += name_len;
+
+        let rows = read_u32(&bytes, &mut pos)? as usize;
+        let cols = read_u32(&bytes, &mut pos)? as usize;
+        let n_elem = rows * cols;
+        let mut data = Vec::with_capacity(n_elem);
+        for _ in 0..n_elem {
+            data.push(read_f32(&bytes, &mut pos)?);
+        }
+        tensors.push((name, Mat::new(data, rows, cols)));
+    }
+
+    Ok(tensors)
+}
+
+// =============================================================================
 // TensorNode — one node in the computation graph, holding a full matrix
 // =============================================================================
 
@@ -2615,5 +2851,151 @@ mod tests {
         let out = chk.forward(&x);
         assert_eq!(out.0.borrow().prev.len(), 1,
             "checkpointed output should have exactly 1 prev");
+    }
+
+    // -------------------------------------------------------------------------
+    // Q8 quantization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_q8_quantize_shape_preserved() {
+        let m = Mat::from_fn(8, 16, |r, c| (r * 16 + c) as f32 * 0.1 - 1.0);
+        let q = Q8Mat::quantize(&m);
+        assert_eq!(q.rows, 8);
+        assert_eq!(q.cols, 16);
+        assert_eq!(q.packed.len(), 8 * 16);
+    }
+
+    #[test]
+    fn test_q8_roundtrip_accurate() {
+        // Small matrix: deq(quant(x)) should closely approximate x
+        let m = Mat::from_fn(4, 8, |r, c| (r as f32 - 1.5) * (c as f32 + 0.5));
+        let q = Q8Mat::quantize(&m);
+        let back = q.dequantize();
+        assert_eq!((back.rows, back.cols), (m.rows, m.cols));
+        for r in 0..m.rows { for c in 0..m.cols {
+            let err = (back.at(r, c) - m.at(r, c)).abs();
+            // Q8 max error = absmax/254 per block
+            let absmax = m.data.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
+            let max_err = absmax / 254.0 + 1e-5;
+            assert!(err <= max_err,
+                "Q8 roundtrip [{r},{c}]: orig={} deq={} err={:.4} max={:.4}",
+                m.at(r,c), back.at(r,c), err, max_err);
+        }}
+    }
+
+    #[test]
+    fn test_q8_size_bytes_less_than_f32() {
+        let m = Mat::from_fn(32, 64, |r, c| (r * 64 + c) as f32 * 0.01);
+        let q = Q8Mat::quantize(&m);
+        let f32_bytes = 32 * 64 * 4;
+        assert!(q.size_bytes() < f32_bytes,
+            "Q8 must use less memory than f32: {} vs {}", q.size_bytes(), f32_bytes);
+    }
+
+    #[test]
+    fn test_q8_compression_ratio() {
+        // 32*64 = 2048 elements, 1 byte each = 2048 bytes packed
+        // + ceil(2048/64)=32 scale values * 4 = 128 bytes → total 2176 bytes
+        // f32: 2048 * 4 = 8192 bytes → ratio ≈ 3.77
+        let m = Mat::from_fn(32, 64, |_, _| 1.0);
+        let q = Q8Mat::quantize(&m);
+        assert!(q.compression_ratio() > 2.0,
+            "Q8 should compress by at least 2×, got {:.2}×", q.compression_ratio());
+    }
+
+    #[test]
+    fn test_q8_matmul_matches_f32() {
+        // Q8 matmul must closely approximate f32 matmul
+        let a = Mat::from_fn(3, 8, |r, c| (r * 8 + c) as f32 * 0.1 - 1.0);
+        let b = Mat::from_fn(4, 8, |r, c| (r * 8 + c) as f32 * 0.05 - 0.5);
+        let q = Q8Mat::quantize(&b);
+
+        let exact  = a.matmul(&b.transpose());
+        let approx = q.matmul_q8_t(&a);
+
+        assert_eq!((approx.rows, approx.cols), (3, 4));
+        for r in 0..3 { for c in 0..4 {
+            let err = (approx.at(r, c) - exact.at(r, c)).abs();
+            assert!(err < 0.1,
+                "Q8 matmul [{r},{c}]: exact={:.4} approx={:.4} err={:.4}",
+                exact.at(r,c), approx.at(r,c), err);
+        }}
+    }
+
+    #[test]
+    fn test_q8_zero_matrix() {
+        let m = Mat::zeros(4, 4);
+        let q = Q8Mat::quantize(&m);
+        let back = q.dequantize();
+        for &v in &back.data { assert_eq!(v, 0.0, "zero matrix should roundtrip to zero"); }
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint save/load tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_save_load_checkpoint_roundtrip() {
+        let tmp = std::env::temp_dir().join("test_ckpt_roundtrip.bin");
+        let path = tmp.to_str().unwrap();
+
+        let t1 = TensorNode::leaf(Mat::new(vec![1.0f32, 2.0, 3.0, 4.0], 2, 2));
+        let t2 = TensorNode::leaf(Mat::new(vec![5.0f32, 6.0], 1, 2));
+
+        save_checkpoint(path, &[("layer.w", &t1), ("layer.b", &t2)])
+            .expect("save_checkpoint failed");
+
+        let loaded = load_checkpoint(path).expect("load_checkpoint failed");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].0, "layer.w");
+        assert_eq!(loaded[1].0, "layer.b");
+
+        let m1 = &loaded[0].1;
+        assert_eq!((m1.rows, m1.cols), (2, 2));
+        assert_eq!(m1.at(0, 0), 1.0);
+        assert_eq!(m1.at(1, 1), 4.0);
+
+        let m2 = &loaded[1].1;
+        assert_eq!((m2.rows, m2.cols), (1, 2));
+        assert_eq!(m2.at(0, 0), 5.0);
+        assert_eq!(m2.at(0, 1), 6.0);
+    }
+
+    #[test]
+    fn test_save_load_checkpoint_large_tensor() {
+        let tmp = std::env::temp_dir().join("test_ckpt_large.bin");
+        let path = tmp.to_str().unwrap();
+        let rows = 64usize; let cols = 128usize;
+        let data: Vec<f32> = (0..rows*cols).map(|i| i as f32 * 0.001 - 0.5).collect();
+        let node = TensorNode::leaf(Mat::new(data.clone(), rows, cols));
+
+        save_checkpoint(path, &[("big", &node)]).expect("save failed");
+        let loaded = load_checkpoint(path).expect("load failed");
+        let m = &loaded[0].1;
+        assert_eq!((m.rows, m.cols), (rows, cols));
+        for (i, (&orig, &got)) in data.iter().zip(m.data.iter()).enumerate() {
+            assert_eq!(orig, got, "data mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_load_checkpoint_bad_magic_returns_err() {
+        let tmp = std::env::temp_dir().join("test_ckpt_bad.bin");
+        let path = tmp.to_str().unwrap();
+        // Write garbage
+        std::fs::write(path, b"BADM\x01\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        let res = load_checkpoint(path);
+        assert!(res.is_err(), "bad magic should return Err");
+    }
+
+    #[test]
+    fn test_checkpoint_name_survives_roundtrip() {
+        let tmp = std::env::temp_dir().join("test_ckpt_name.bin");
+        let path = tmp.to_str().unwrap();
+        let node = TensorNode::leaf(Mat::ones(1, 4));
+        save_checkpoint(path, &[("model.layers.0.attn.q_proj.weight", &node)]).unwrap();
+        let loaded = load_checkpoint(path).unwrap();
+        assert_eq!(loaded[0].0, "model.layers.0.attn.q_proj.weight");
     }
 }

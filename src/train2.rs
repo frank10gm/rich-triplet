@@ -49,11 +49,43 @@ pub struct AdamW2 {
     v: Vec<Mat>,
 }
 
+/// Hyperparameters for `AdamW2`.
+///
+/// All fields have production-proven defaults.  Override only what you need:
+///
+/// ```rust
+/// let hps = AdamW2Params { lr: 3e-4, weight_decay: 0.01, ..AdamW2Params::default() };
+/// let mut opt = AdamW2::with_params(&model_params, hps);
+/// ```
+#[derive(Clone, Debug)]
+pub struct AdamW2Params {
+    /// Learning rate (step size). Common values: 1e-4 – 1e-3 for fine-tuning,
+    /// 3e-4 for pretraining small models.
+    pub lr: f32,
+    /// First-moment decay (momentum). Standard: 0.9.
+    pub beta1: f32,
+    /// Second-moment decay. Standard: 0.999 for Adam, 0.95 for Muon-like.
+    pub beta2: f32,
+    /// Numerical stability constant. Standard: 1e-8.
+    pub eps: f32,
+    /// L2 regularisation coefficient. 0.1 for GPT-scale models, 0.01 for fine-tunes.
+    pub weight_decay: f32,
+}
+
+impl Default for AdamW2Params {
+    fn default() -> Self {
+        AdamW2Params { lr: 3e-4, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.1 }
+    }
+}
+
 impl AdamW2 {
-    /// Create an optimizer initialized from the model's current parameter list.
-    ///
-    /// We capture the shapes of all parameters now so we can allocate m/v buffers.
+    /// Create an optimizer with default hyperparameters.
     pub fn new(params: &[TensorNode], lr: f32) -> Self {
+        Self::with_params(params, AdamW2Params { lr, ..AdamW2Params::default() })
+    }
+
+    /// Create an optimizer with fully customised hyperparameters.
+    pub fn with_params(params: &[TensorNode], hp: AdamW2Params) -> Self {
         let m: Vec<Mat> = params.iter()
             .map(|p| Mat::zeros(p.data().rows, p.data().cols))
             .collect();
@@ -61,8 +93,8 @@ impl AdamW2 {
             .map(|p| Mat::zeros(p.data().rows, p.data().cols))
             .collect();
         AdamW2 {
-            lr, beta1: 0.9, beta2: 0.999, eps: 1e-8,
-            weight_decay: 0.1, step: 0,
+            lr: hp.lr, beta1: hp.beta1, beta2: hp.beta2,
+            eps: hp.eps, weight_decay: hp.weight_decay, step: 0,
             m, v,
         }
     }
@@ -118,6 +150,65 @@ impl AdamW2 {
 }
 
 // =============================================================================
+// Learning-rate scheduler — cosine decay with linear warmup
+// =============================================================================
+//
+// ## Why a scheduler?
+//
+// A fixed learning rate either:
+//   a) starts too high → unstable early training (loss explodes)
+//   b) stays too high → fails to converge to the optimum late in training
+//
+// The cosine-warmup schedule is the de-facto standard for transformer training:
+//
+//   1. Linear warmup 0 → lr_max over `warmup_steps` steps.
+//      Prevents large gradient steps from corrupting random initialisation.
+//
+//   2. Cosine decay lr_max → lr_min over the remaining steps.
+//      Smooth decay prevents over-shooting the minimum.
+//
+// ## Usage
+//
+//   let sched = LrScheduler { lr_max: 3e-4, lr_min: 3e-5,
+//                             warmup_steps: 100, total_steps: 1000 };
+//   let lr = sched.get(step);
+//   optimizer.set_lr(lr);
+
+/// Cosine annealing with linear warmup.
+#[derive(Clone, Debug)]
+pub struct LrScheduler {
+    /// Peak learning rate (reached after warmup).
+    pub lr_max: f32,
+    /// Minimum learning rate at end of cosine decay. Usually lr_max / 10.
+    pub lr_min: f32,
+    /// Number of warmup steps (linear 0 → lr_max).
+    pub warmup_steps: usize,
+    /// Total number of training steps.
+    pub total_steps: usize,
+}
+
+impl LrScheduler {
+    /// Return the scheduled learning rate at the given step (0-indexed).
+    pub fn get(&self, step: usize) -> f32 {
+        if step < self.warmup_steps {
+            // Linear warmup
+            self.lr_max * (step + 1) as f32 / self.warmup_steps as f32
+        } else {
+            // Cosine decay from lr_max → lr_min
+            let progress = (step - self.warmup_steps) as f32
+                / (self.total_steps - self.warmup_steps).max(1) as f32;
+            let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+            self.lr_min + (self.lr_max - self.lr_min) * cosine
+        }
+    }
+}
+
+impl AdamW2 {
+    /// Update the learning rate in-place (used with `LrScheduler`).
+    pub fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+}
+
+// =============================================================================
 // Training configuration
 // =============================================================================
 
@@ -126,6 +217,14 @@ pub struct TrainConfig2 {
     pub eval_interval: usize,
     pub learning_rate: f32,
     pub grad_clip: f32,
+    /// How many micro-steps to accumulate gradients over before an optimizer
+    /// step.  Effective batch size = batch_size * accumulate_steps.
+    /// Set to 1 to disable (default).
+    pub accumulate_steps: usize,
+    /// Label-smoothing ε.  0.0 = standard cross-entropy (default).
+    /// Typical: 0.1.  Replaces the one-hot target with:
+    ///   y_smooth[v] = (1 - ε) * one_hot[v] + ε / vocab_size
+    pub label_smoothing: f32,
 }
 
 impl Default for TrainConfig2 {
@@ -135,6 +234,8 @@ impl Default for TrainConfig2 {
             eval_interval: 50,
             learning_rate: 3e-4,
             grad_clip: 1.0,
+            accumulate_steps: 1,
+            label_smoothing: 0.0,
         }
     }
 }
@@ -146,6 +247,24 @@ impl Default for TrainConfig2 {
 use crate::transformer2::Gpt2;
 use crate::tokenizer::CharTokenizer;
 use crate::dataset::TextDataset;
+
+/// Compute token-level accuracy: fraction of positions where argmax(logits) == target.
+///
+/// `logits` is a `[T, V]` matrix, `targets` is a slice of T token ids.
+pub fn token_accuracy(logits: &Mat, targets: &[usize]) -> f32 {
+    let t = logits.rows;
+    assert_eq!(t, targets.len(), "token_accuracy: logits rows ({}) != targets len ({})", t, targets.len());
+    let v = logits.cols;
+    let correct: usize = (0..t)
+        .filter(|&row| {
+            let pred = (0..v)
+                .max_by(|&a, &b| logits.at(row, a).partial_cmp(&logits.at(row, b)).unwrap())
+                .unwrap_or(0);
+            pred == targets[row]
+        })
+        .count();
+    correct as f32 / t as f32
+}
 
 /// Run the full training loop on a Gpt2 model.
 ///
@@ -161,37 +280,78 @@ pub fn train2(
     let n_params: usize = params.iter().map(|p| p.data().rows * p.data().cols).collect::<Vec<_>>().iter().sum();
     let mut optimizer = AdamW2::new(&params, cfg.learning_rate);
 
+    // Cosine scheduler: warmup for 5% of steps, decay to lr/10
+    let sched = LrScheduler {
+        lr_max: cfg.learning_rate,
+        lr_min: cfg.learning_rate * 0.1,
+        warmup_steps: (cfg.max_steps / 20).max(1),
+        total_steps: cfg.max_steps,
+    };
+
     println!(
-        "\n[tensor] Training: {} parameters (in {} tensors), {} steps",
-        n_params, params.len(), cfg.max_steps
+        "\n[tensor] Training: {} parameters (in {} tensors), {} steps (accumulate={})",
+        n_params, params.len(), cfg.max_steps, cfg.accumulate_steps
     );
     println!("{:-<65}", "");
 
     let mut last_loss = f32::INFINITY;
+    let mut last_acc = 0.0f32;
+    let accum = cfg.accumulate_steps.max(1);
 
     for step in 0..cfg.max_steps {
-        // ---- 1. Sample one training example ----
+        // ---- 1. Update learning rate ----
+        optimizer.set_lr(sched.get(step));
+
+        // ---- 2. Zero gradients at the start of each accumulation window ----
+        if step % accum == 0 {
+            for p in model.parameters() { p.zero_grad(); }
+        }
+
+        // ---- 3. Sample one training example ----
         let (inp_t, tgt_t) = train_data.random_batch(1, step as u64 + 1);
-        let token_ids: Vec<usize>  = inp_t.data.iter().map(|&x| x as usize).collect();
+        let token_ids:  Vec<usize> = inp_t.data.iter().map(|&x| x as usize).collect();
         let target_ids: Vec<usize> = tgt_t.data.iter().map(|&x| x as usize).collect();
 
-        // ---- 2. Zero gradients ----
-        for p in model.parameters() { p.zero_grad(); }
-
-        // ---- 3. Forward + loss ----
+        // ---- 4. Forward + loss ----
+        // Build loss TensorNode (needed for backward)
         let loss = model.loss(&token_ids, &target_ids);
-        last_loss = loss.data().at(0, 0);
 
-        // ---- 4. Backward ----
+        // ---- 5. NaN/Inf guard — skip step if loss is not finite ----
+        let loss_val = loss.data().at(0, 0);
+        if !loss_val.is_finite() {
+            eprintln!("[warn] step {}: non-finite loss ({:.4}), skipping backward", step, loss_val);
+            continue;
+        }
+
+        // Compute metrics (logits already computed inside model.loss — re-run forward for metrics)
+        {
+            let logits_node = model.forward(&token_ids);
+            let logits = logits_node.data();
+            last_loss = cross_entropy_smoothed(&logits, &target_ids, cfg.label_smoothing);
+            last_acc  = token_accuracy(&logits, &target_ids);
+        }
+
+        // ---- 6. Backward — accumulate gradients ----
         loss.backward();
 
-        // ---- 5. Gradient clipping ----
+        // Only update weights at the end of each accumulation window
+        let is_update_step = (step + 1) % accum == 0 || step == cfg.max_steps - 1;
+        if !is_update_step { continue; }
+
+        // ---- 7. NaN/Inf guard on gradients ----
         let params_now = model.parameters();
         let grad_norm: f32 = params_now.iter()
             .map(|p| p.grad().data.iter().map(|x| x * x).sum::<f32>())
             .sum::<f32>()
             .sqrt();
 
+        if !grad_norm.is_finite() {
+            eprintln!("[warn] step {}: non-finite grad_norm ({:.4}), skipping optimizer step", step, grad_norm);
+            for p in model.parameters() { p.zero_grad(); }
+            continue;
+        }
+
+        // ---- 8. Gradient clipping ----
         if grad_norm > cfg.grad_clip {
             let scale = cfg.grad_clip / grad_norm;
             for p in &params_now {
@@ -200,21 +360,61 @@ pub fn train2(
             }
         }
 
-        // ---- 6. Optimizer step ----
+        // ---- 9. Optimizer step ----
         optimizer.step(&params_now);
 
-        // ---- 7. Logging ----
-        if step % cfg.eval_interval == 0 || step == cfg.max_steps - 1 {
+        // ---- 10. Logging ----
+        let display_step = step / accum;
+        let display_total = cfg.max_steps / accum;
+        if display_step % (cfg.eval_interval / accum).max(1) == 0 || step == cfg.max_steps - 1 {
             let val_loss = estimate_loss2(model, val_data, 5);
             println!(
-                "step {:4}/{} | train_loss: {:.4} | val_loss: {:.4} | grad_norm: {:.4}",
-                step, cfg.max_steps, last_loss, val_loss, grad_norm
+                "step {:4}/{} | lr: {:.2e} | train_loss: {:.4} | val_loss: {:.4} | acc: {:.3} | grad_norm: {:.4}",
+                display_step, display_total,
+                optimizer.lr, last_loss, val_loss, last_acc, grad_norm
             );
         }
     }
 
     println!("{:-<65}", "");
     last_loss
+}
+
+/// Cross-entropy with optional label smoothing.
+///
+/// Standard cross-entropy (smoothing=0): L = -log(softmax(logits)[target])
+///
+/// Label-smoothed (smoothing=ε):
+///   L = -sum_v y_smooth[v] * log_softmax[v]
+///   where y_smooth[v] = (1-ε) * one_hot(v == target) + ε / V
+///
+/// Returns the mean loss across all T positions.
+fn cross_entropy_smoothed(logits: &Mat, targets: &[usize], smoothing: f32) -> f32 {
+    let t = logits.rows;
+    let v = logits.cols;
+    let mut total = 0.0f32;
+    for row in 0..t {
+        // Numerically stable log-softmax
+        let max_l = (0..v).map(|c| logits.at(row, c)).fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = (0..v).map(|c| (logits.at(row, c) - max_l).exp()).sum();
+        let log_sum = sum_exp.ln();
+
+        if smoothing == 0.0 {
+            let tgt = targets[row];
+            let log_prob = logits.at(row, tgt) - max_l - log_sum;
+            total -= log_prob;
+        } else {
+            // Smooth: each vocab entry contributes ε/V, target also contributes (1-ε)
+            let base: f32 = (0..v).map(|c| {
+                let log_p = logits.at(row, c) - max_l - log_sum;
+                (smoothing / v as f32) * log_p
+            }).sum();
+            let tgt = targets[row];
+            let log_p_tgt = logits.at(row, tgt) - max_l - log_sum;
+            total -= base + (1.0 - smoothing) * log_p_tgt;
+        }
+    }
+    total / t as f32
 }
 
 fn estimate_loss2(model: &Gpt2, data: &TextDataset, n_samples: usize) -> f32 {
@@ -422,6 +622,115 @@ mod tests {
         }
     }
 
+    // --- LrScheduler ---
+
+    #[test]
+    fn test_lr_scheduler_warmup_starts_near_zero() {
+        // With 10 warmup steps, step 0 returns lr_max * 1/10
+        let sched = LrScheduler { lr_max: 1e-3, lr_min: 1e-4, warmup_steps: 10, total_steps: 100 };
+        let lr0 = sched.get(0);
+        // lr0 = lr_max / warmup_steps = 1e-3/10 = 1e-4; must be strictly less than lr_max
+        assert!(lr0 < sched.lr_max, "warmup step 0 should be < lr_max, got {}", lr0);
+        assert!(lr0 > 0.0, "warmup step 0 should be > 0, got {}", lr0);
+    }
+
+    #[test]
+    fn test_lr_scheduler_warmup_reaches_max() {
+        let sched = LrScheduler { lr_max: 1e-3, lr_min: 1e-4, warmup_steps: 10, total_steps: 100 };
+        let lr_peak = sched.get(9); // last warmup step (index 9 = step 10/10 of warmup)
+        assert!((lr_peak - 1e-3).abs() < 1e-6, "warmup should reach lr_max, got {}", lr_peak);
+    }
+
+    #[test]
+    fn test_lr_scheduler_decay_is_monotone() {
+        let sched = LrScheduler { lr_max: 1e-3, lr_min: 1e-4, warmup_steps: 5, total_steps: 50 };
+        let mut prev = f32::INFINITY;
+        for step in 5..50 {
+            let lr = sched.get(step);
+            assert!(lr <= prev + 1e-9, "cosine decay should be monotone at step {}", step);
+            prev = lr;
+        }
+    }
+
+    #[test]
+    fn test_lr_scheduler_ends_at_lr_min() {
+        // At the very last step (total_steps - 1), progress = (T-1-warmup)/(T-warmup).
+        // For total_steps=50, warmup=5: progress = 44/45 < 1.0, so cos is not exactly -1.
+        // We verify the last step is close to lr_min and strictly below lr_max.
+        let sched = LrScheduler { lr_max: 1e-3, lr_min: 1e-4, warmup_steps: 5, total_steps: 50 };
+        let lr_end = sched.get(49);
+        assert!(lr_end < sched.lr_max,
+            "final lr should be < lr_max, got {}", lr_end);
+        // Should be close to lr_min (within 5% of the lr_max - lr_min range)
+        let tolerance = (sched.lr_max - sched.lr_min) * 0.05;
+        assert!((lr_end - sched.lr_min).abs() < tolerance,
+            "final lr {} should be close to lr_min {} (tol {})", lr_end, sched.lr_min, tolerance);
+    }
+
+    // --- token_accuracy ---
+
+    #[test]
+    fn test_token_accuracy_perfect() {
+        // logits: identity matrix → argmax row i = i
+        let logits = Mat::from_fn(4, 4, |r, c| if r == c { 10.0 } else { 0.0 });
+        let targets = vec![0usize, 1, 2, 3];
+        let acc = token_accuracy(&logits, &targets);
+        assert!((acc - 1.0).abs() < 1e-6, "perfect accuracy should be 1.0, got {}", acc);
+    }
+
+    #[test]
+    fn test_token_accuracy_zero() {
+        // logits: argmax row i = 0 always, but targets = 1,2,3,4
+        let logits = Mat::from_fn(4, 5, |_, c| if c == 0 { 10.0 } else { 0.0 });
+        let targets = vec![1usize, 2, 3, 4];
+        let acc = token_accuracy(&logits, &targets);
+        assert!((acc - 0.0).abs() < 1e-6, "zero accuracy expected, got {}", acc);
+    }
+
+    #[test]
+    fn test_token_accuracy_half() {
+        // Rows 0,1 correct; rows 2,3 wrong
+        let logits = Mat::new(vec![
+            10.0, 0.0,  // row 0: argmax = 0
+             0.0, 10.0, // row 1: argmax = 1
+            10.0, 0.0,  // row 2: argmax = 0
+             0.0, 10.0, // row 3: argmax = 1
+        ], 4, 2);
+        let targets = vec![0usize, 1, 1, 0]; // rows 2 and 3 wrong
+        let acc = token_accuracy(&logits, &targets);
+        assert!((acc - 0.5).abs() < 1e-6, "expected 0.5, got {}", acc);
+    }
+
+    // --- cross_entropy_smoothed ---
+
+    #[test]
+    fn test_cross_entropy_no_smoothing_is_positive() {
+        let logits = Mat::from_fn(3, 5, |r, c| (r * 5 + c) as f32 * 0.1);
+        let targets = vec![1usize, 2, 3];
+        let loss = cross_entropy_smoothed(&logits, &targets, 0.0);
+        assert!(loss.is_finite() && loss > 0.0, "CE loss should be finite positive, got {}", loss);
+    }
+
+    #[test]
+    fn test_cross_entropy_smoothing_higher_than_no_smoothing() {
+        // Label smoothing increases entropy → higher loss on non-optimal logits
+        let logits = Mat::from_fn(2, 4, |r, c| if r == c { 10.0 } else { -1.0 });
+        let targets = vec![0usize, 1];
+        let loss_no_smooth = cross_entropy_smoothed(&logits, &targets, 0.0);
+        let loss_smooth    = cross_entropy_smoothed(&logits, &targets, 0.1);
+        assert!(loss_smooth > loss_no_smooth,
+            "smoothed loss ({}) should be > unsmoothed ({})", loss_smooth, loss_no_smooth);
+    }
+
+    #[test]
+    fn test_adamw2_set_lr() {
+        let model = make_tiny_model(10);
+        let params = model.parameters();
+        let mut opt = AdamW2::new(&params, 1e-3);
+        opt.set_lr(5e-4);
+        assert!((opt.lr - 5e-4).abs() < 1e-10, "set_lr should update lr field");
+    }
+
     // --- Full training smoke test ---
 
     #[test]
@@ -451,6 +760,8 @@ mod tests {
             eval_interval: 30,
             learning_rate: 1e-2,
             grad_clip: 1.0,
+            accumulate_steps: 1,
+            label_smoothing: 0.0,
         };
 
         train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
@@ -468,5 +779,54 @@ mod tests {
             "loss should decrease after training: {:.4} → {:.4}",
             initial_loss, final_loss
         );
+    }
+
+    #[test]
+    fn test_training_with_label_smoothing() {
+        use crate::tokenizer::{CharTokenizer, Tokenizer};
+        use crate::dataset::TextDataset;
+
+        let corpus = "abcabcabc".repeat(10);
+        let corpus = corpus.as_str();
+        let tokenizer = CharTokenizer::from_text(corpus);
+        let model = make_tiny_model(tokenizer.vocab_size());
+        let (train_ds, val_ds) = TextDataset::train_val_split(
+            corpus, &tokenizer, model.config.context_length
+        );
+        let cfg = TrainConfig2 {
+            max_steps: 10,
+            eval_interval: 10,
+            learning_rate: 1e-2,
+            grad_clip: 1.0,
+            accumulate_steps: 1,
+            label_smoothing: 0.1,
+        };
+        let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
+        assert!(loss.is_finite() && loss > 0.0,
+            "training with label smoothing should produce finite loss, got {}", loss);
+    }
+
+    #[test]
+    fn test_training_with_grad_accumulation() {
+        use crate::tokenizer::{CharTokenizer, Tokenizer};
+        use crate::dataset::TextDataset;
+
+        let corpus = "abcabcabc".repeat(10);
+        let corpus = corpus.as_str();
+        let tokenizer = CharTokenizer::from_text(corpus);
+        let model = make_tiny_model(tokenizer.vocab_size());
+        let (train_ds, val_ds) = TextDataset::train_val_split(
+            corpus, &tokenizer, model.config.context_length
+        );
+        let cfg = TrainConfig2 {
+            max_steps: 10,
+            eval_interval: 10,
+            learning_rate: 1e-2,
+            grad_clip: 1.0,
+            accumulate_steps: 2,
+            label_smoothing: 0.0,
+        };
+        let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
+        assert!(loss.is_finite(), "training with grad accumulation should be finite");
     }
 }
