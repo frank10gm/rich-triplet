@@ -10,6 +10,8 @@ mod nn2;
 mod transformer2;
 mod train2;
 mod transformer3;
+#[cfg(feature = "metal")]
+mod metal_ops;
 
 use tokenizer::CharTokenizer;
 use tokenizer::Tokenizer;

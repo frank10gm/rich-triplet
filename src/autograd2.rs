@@ -124,8 +124,9 @@ impl Mat {
     ///
     /// Dispatch priority (highest first):
     ///   1. `--features blas`     → `cblas_sgemm` (4–8× vs pure Rust)
-    ///   2. `--features parallel` → multi-threaded pure Rust (≈N_CPU × speedup)
-    ///   3. default               → single-threaded pure Rust
+    ///   2. `--features metal`    → Apple Metal GPU compute shader (Apple Silicon)
+    ///   3. `--features parallel` → multi-threaded pure Rust (≈N_CPU × speedup)
+    ///   4. default               → single-threaded pure Rust
     ///
     /// The `parallel` feature is useful when BLAS is unavailable (e.g. no
     /// Apple Accelerate / OpenBLAS installed).  When both `blas` and `parallel`
@@ -139,12 +140,17 @@ impl Mat {
             return self.matmul_blas(b);
         }
 
-        #[cfg(all(feature = "parallel", not(feature = "blas")))]
+        #[cfg(all(feature = "metal", not(feature = "blas")))]
+        {
+            return crate::metal_ops::metal_matmul(self, b);
+        }
+
+        #[cfg(all(feature = "parallel", not(feature = "blas"), not(feature = "metal")))]
         {
             return self.matmul_parallel(b, 0);
         }
 
-        #[cfg(not(any(feature = "blas", feature = "parallel")))]
+        #[cfg(not(any(feature = "blas", feature = "metal", feature = "parallel")))]
         {
             let (m, k, n) = (self.rows, self.cols, b.cols);
             let mut out = Mat::zeros(m, n);
@@ -2626,7 +2632,9 @@ mod tests {
         let a = Mat::from_fn(m, k, |r, c| (r * k + c) as f32 * 0.01 - 0.5);
         let b = Mat::from_fn(k, n, |r, c| (r * n + c) as f32 * 0.02 - 0.3);
 
-        let seq = a.matmul(&b);
+        // Compare parallel vs single-thread directly (not via matmul() dispatch,
+        // which may route to Metal GPU with different fp rounding).
+        let seq = a.matmul_parallel(&b, 1);
         let par = a.matmul_parallel(&b, 4);
 
         assert_eq!((par.rows, par.cols), (seq.rows, seq.cols));
