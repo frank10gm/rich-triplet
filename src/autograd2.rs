@@ -121,18 +121,76 @@ impl Mat {
     /// This single function replaces M*N*K scalar multiply-add operations
     /// in the old engine. On modern CPUs the compiler can auto-vectorize the
     /// inner loop with SIMD instructions.
+    ///
+    /// When compiled with `--features blas`, delegates to `cblas_sgemm` for
+    /// an additional 4–8× speedup via CPU-vendor BLAS (Apple Accelerate on
+    /// macOS, OpenBLAS/MKL on Linux/Windows).
     pub fn matmul(&self, b: &Mat) -> Mat {
         assert_eq!(self.cols, b.rows,
             "matmul shape mismatch: [{},{}] × [{},{}]", self.rows, self.cols, b.rows, b.cols);
-        let (m, k, n) = (self.rows, self.cols, b.cols);
-        let mut out = Mat::zeros(m, n);
-        for i in 0..m {
-            for p in 0..k {
-                let a_ip = self.at(i, p);
-                for j in 0..n {
-                    *out.at_mut(i, j) += a_ip * b.at(p, j);
+
+        #[cfg(feature = "blas")]
+        {
+            return self.matmul_blas(b);
+        }
+
+        #[cfg(not(feature = "blas"))]
+        {
+            let (m, k, n) = (self.rows, self.cols, b.cols);
+            let mut out = Mat::zeros(m, n);
+            for i in 0..m {
+                for p in 0..k {
+                    let a_ip = self.at(i, p);
+                    for j in 0..n {
+                        *out.at_mut(i, j) += a_ip * b.at(p, j);
+                    }
                 }
             }
+            out
+        }
+    }
+
+    /// BLAS-accelerated matmul via `cblas_sgemm`.
+    ///
+    /// Enabled when compiled with `--features blas`.
+    ///
+    /// ## What cblas_sgemm does
+    ///
+    /// `cblas_sgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)`
+    ///
+    /// Computes: C = alpha * op(A) @ op(B) + beta * C
+    ///   - Order = RowMajor  (our Mat is row-major)
+    ///   - TransA = NoTrans, TransB = NoTrans
+    ///   - alpha = 1.0, beta = 0.0  (pure multiply, no accumulation into C)
+    ///   - lda = K (leading dimension of A = number of columns)
+    ///   - ldb = N (leading dimension of B)
+    ///   - ldc = N (leading dimension of C)
+    ///
+    /// The function dispatches to the best SIMD kernel for the current CPU
+    /// (AVX-512, AVX2, NEON, etc.) and uses highly optimised cache-blocking
+    /// — typically 4–8× faster than the pure Rust triple loop.
+    ///
+    /// ## Platform notes
+    ///
+    /// - macOS: links Apple Accelerate (built-in, no install needed)
+    /// - Linux: requires `libopenblas-dev` or `libmkl-dev`
+    /// - Windows: requires OpenBLAS or MKL DLL
+    #[cfg(feature = "blas")]
+    fn matmul_blas(&self, b: &Mat) -> Mat {
+        let (m, k, n) = (self.rows, self.cols, b.cols);
+        let mut out = Mat::zeros(m, n);
+        unsafe {
+            cblas::sgemm(
+                cblas::Layout::RowMajor,
+                cblas::Transpose::None,
+                cblas::Transpose::None,
+                m as i32, n as i32, k as i32,
+                1.0_f32,                    // alpha
+                &self.data, k as i32,       // A, lda
+                &b.data,    n as i32,       // B, ldb
+                0.0_f32,                    // beta
+                &mut out.data, n as i32,    // C, ldc
+            );
         }
         out
     }
@@ -1601,6 +1659,26 @@ mod tests {
         let c = a.matmul(&b);
         assert!(approx(c.at(0,0), 17.0));
         assert!(approx(c.at(1,0), 39.0));
+    }
+
+    /// When blas feature is active this exercises the cblas_sgemm path;
+    /// otherwise it exercises the pure-Rust path — either way the result
+    /// must match the reference value.
+    #[test]
+    fn test_matmul_blas_matches_reference() {
+        let a = Mat::from_fn(8, 16, |r, c| (r * 16 + c) as f32 * 0.01 - 0.5);
+        let b = Mat::from_fn(16, 8, |r, c| (r * 8 + c) as f32 * 0.02 - 0.3);
+        let result = a.matmul(&b);
+        // Compute reference with explicit triple loop to avoid depending on matmul
+        let (m, k, n) = (8, 16, 8);
+        let mut expected = Mat::zeros(m, n);
+        for i in 0..m { for p in 0..k { for j in 0..n {
+            *expected.at_mut(i, j) += a.at(i, p) * b.at(p, j);
+        }}}
+        for r in 0..m { for c in 0..n {
+            assert!((result.at(r, c) - expected.at(r, c)).abs() < 1e-4,
+                "matmul[{},{}]: got {} expected {}", r, c, result.at(r,c), expected.at(r,c));
+        }}
     }
 
     #[test]

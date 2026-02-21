@@ -1094,6 +1094,540 @@ mod tests {
     }
 }
 
+// =============================================================================
+// SentencePiece Unigram tokenizer
+// =============================================================================
+//
+// ## Background: why unigram, not BPE?
+//
+// GPT-2 / GPT-4 use BPE (byte-pair encoding): a deterministic, greedy merge
+// algorithm.  LLaMA, Gemma, Mistral, and most open-weight models use a
+// SentencePiece *unigram language model* tokenizer instead.
+//
+// The unigram model assigns a log-probability to every possible segmentation
+// of the input string, then uses the Viterbi algorithm to find the single best
+// (= maximum-probability) segmentation.  This gives more linguistically
+// motivated splits in many non-English languages.
+//
+// ## File format (.model)
+//
+// A SentencePiece .model file is a serialised protobuf (`ModelProto`).  To
+// avoid pulling in a protobuf crate we support two loading paths:
+//
+//   1. `from_vocab_text(text)` — loads a plain-text format:
+//         <piece>\t<score>
+//      one entry per line (score is log-prob, e.g. -5.3).
+//      Useful for testing and for models that export their vocab in text form.
+//
+//   2. `from_model_bytes(bytes)` — parses the raw protobuf binary used by
+//      HuggingFace SentencePiece models.  We implement just enough of the
+//      protobuf wire format to read `ModelProto.pieces[].{piece, score}`.
+//      No external dependency needed.
+//
+// ## Encoding algorithm — Viterbi forward pass
+//
+//   For input string s of length N (in bytes):
+//   best[i] = best log-prob to reach position i
+//   back[i] = (start, piece_id) that achieved best[i]
+//
+//   For each end position i (1..=N):
+//     For each piece p in the vocabulary:
+//       if s[i-len(p)..i] == p.text:
+//         score = best[i - len(p)] + p.log_prob
+//         if score > best[i]: update best[i], back[i]
+//
+// ## Decode
+//
+//   Concatenate pieces, replacing the leading ▁ (U+2581, LOWER ONE EIGHTH BLOCK)
+//   with a space.  The first ▁ at position 0 is dropped (SentencePiece adds it
+//   to mark a word boundary but the input did not start with a space).
+
+/// A single vocabulary entry in a SentencePiece unigram model.
+#[derive(Clone, Debug)]
+pub struct SentencePiece {
+    /// The piece text (may contain ▁ = U+2581 for word-initial position)
+    pub text: String,
+    /// Log-probability assigned by the unigram language model
+    pub log_prob: f32,
+}
+
+/// A SentencePiece unigram tokenizer.
+///
+/// Implements the same `Tokenizer` trait as `CharTokenizer` and
+/// `BpeTokenizer` so it can be used as a drop-in replacement.
+pub struct SentencePieceTokenizer {
+    /// Vocabulary table; index = token id
+    pub pieces: Vec<SentencePiece>,
+    /// `piece_text → token_id` for O(1) lookup
+    piece_to_id: HashMap<String, u32>,
+    /// Special token id for unknown bytes (id 0 by convention)
+    unk_id: u32,
+}
+
+impl SentencePieceTokenizer {
+    // -------------------------------------------------------------------------
+    // Constructors
+    // -------------------------------------------------------------------------
+
+    /// Load from a plain-text vocab file: one `<piece>\t<score>` per line.
+    ///
+    /// This matches the output of `spm_export_vocab --output_format=tsv`.
+    ///
+    /// ```text
+    /// <unk>   0
+    /// <s>     0
+    /// </s>    0
+    /// ▁the    -2.4
+    /// ▁of     -2.9
+    /// ```
+    pub fn from_vocab_text(text: &str) -> Result<Self, String> {
+        let mut pieces = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            // Split on last tab — piece text may itself contain tabs in theory
+            let tab = line.rfind('\t').ok_or_else(|| {
+                format!("line {}: expected tab-separated <piece>\\t<score>, got {:?}", lineno + 1, line)
+            })?;
+            let piece = line[..tab].to_string();
+            let score: f32 = line[tab+1..].trim().parse().map_err(|e| {
+                format!("line {}: cannot parse score {:?}: {}", lineno + 1, &line[tab+1..], e)
+            })?;
+            pieces.push(SentencePiece { text: piece, log_prob: score });
+        }
+        if pieces.is_empty() {
+            return Err("empty vocabulary".into());
+        }
+        Ok(Self::from_pieces(pieces))
+    }
+
+    /// Load from the raw bytes of a SentencePiece `.model` protobuf file.
+    ///
+    /// We parse just the fields we need from `ModelProto`:
+    ///   field 1 = trainer_spec (skip)
+    ///   field 2 = normalizer_spec (skip)
+    ///   field 3 = pieces[] → each has field 1=piece (string), field 2=score (float)
+    ///
+    /// No external crate required — we implement the wire-format subset here.
+    pub fn from_model_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let pieces = proto_read_pieces(bytes)?;
+        if pieces.is_empty() {
+            return Err("no pieces found in protobuf".into());
+        }
+        Ok(Self::from_pieces(pieces))
+    }
+
+    /// Load from a `.model` file on disk.
+    pub fn from_model_file(path: &str) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("cannot read {}: {}", path, e))?;
+        Self::from_model_bytes(&bytes)
+    }
+
+    fn from_pieces(pieces: Vec<SentencePiece>) -> Self {
+        let mut piece_to_id = HashMap::new();
+        for (i, p) in pieces.iter().enumerate() {
+            piece_to_id.insert(p.text.clone(), i as u32);
+        }
+        // Convention: <unk> = id 0 if it exists, otherwise 0
+        let unk_id = piece_to_id.get("<unk>").copied().unwrap_or(0);
+        SentencePieceTokenizer { pieces, piece_to_id, unk_id }
+    }
+
+    // -------------------------------------------------------------------------
+    // Encoding (Viterbi forward pass)
+    // -------------------------------------------------------------------------
+
+    fn encode_bytes(&self, s: &[u8]) -> Vec<u32> {
+        let n = s.len();
+        if n == 0 { return Vec::new(); }
+
+        const NEG_INF: f32 = f32::NEG_INFINITY;
+
+        // best[i] = best log-prob for the prefix s[0..i]
+        let mut best: Vec<f32> = vec![NEG_INF; n + 1];
+        // back[i] = (start_pos, piece_id) that achieved best[i]
+        let mut back: Vec<(usize, u32)> = vec![(0, self.unk_id); n + 1];
+        best[0] = 0.0;
+
+        for end in 1..=n {
+            // Try every vocabulary piece that ends at position `end`
+            for (id, piece) in self.pieces.iter().enumerate() {
+                let pb = piece.text.as_bytes();
+                let plen = pb.len();
+                if plen > end { continue; }
+                let start = end - plen;
+                if &s[start..end] != pb { continue; }
+                if best[start] == NEG_INF { continue; }
+                let score = best[start] + piece.log_prob;
+                if score > best[end] {
+                    best[end] = score;
+                    back[end] = (start, id as u32);
+                }
+            }
+            // Fallback: if no piece covers position `end`, emit unknown byte
+            if best[end] == NEG_INF {
+                best[end] = best[end - 1] + (-100.0); // heavy penalty
+                back[end] = (end - 1, self.unk_id);
+            }
+        }
+
+        // Traceback
+        let mut ids = Vec::new();
+        let mut pos = n;
+        while pos > 0 {
+            let (start, id) = back[pos];
+            ids.push(id);
+            pos = start;
+        }
+        ids.reverse();
+        ids
+    }
+}
+
+impl Tokenizer for SentencePieceTokenizer {
+    fn unk_id(&self) -> u32 { self.unk_id }
+
+    fn encode(&self, text: &str) -> Vec<u32> {
+        // Prepend ▁ (U+2581) to mark the start of the text, matching the
+        // convention used during SentencePiece training.
+        let mut s = String::with_capacity(text.len() + 3); // U+2581 is 3 UTF-8 bytes
+        s.push('\u{2581}');
+        s.push_str(text);
+        // Replace spaces with ▁ (SentencePiece maps space → ▁ during normalisation)
+        let normalised = s.replace(' ', "\u{2581}");
+        self.encode_bytes(normalised.as_bytes())
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut out = String::new();
+        for &id in ids {
+            let piece = if (id as usize) < self.pieces.len() {
+                &self.pieces[id as usize].text
+            } else {
+                "?"
+            };
+            // ▁ (U+2581) → space, but drop the very first ▁ we added in encode
+            out.push_str(piece);
+        }
+        // Replace ▁ with space, strip leading space introduced by normalisation
+        let decoded = out.replace('\u{2581}', " ");
+        decoded.trim_start_matches(' ').to_string()
+    }
+
+    fn vocab_size(&self) -> usize { self.pieces.len() }
+}
+
+// =============================================================================
+// Minimal protobuf parser — just enough for SentencePiece ModelProto
+// =============================================================================
+//
+// Protobuf wire format:
+//   Each field is a (tag, wire_type) varint followed by the value.
+//   tag = field_number << 3 | wire_type
+//   wire_type 0 = varint, 1 = 64-bit, 2 = length-delimited, 5 = 32-bit
+//
+// ModelProto structure (only fields we care about):
+//   field 3: repeated SentencePieceProto pieces = {
+//     field 1: bytes piece
+//     field 2: float score
+//     field 3: SentencePieceType type (enum, varint — we skip)
+//   }
+
+fn proto_read_pieces(bytes: &[u8]) -> Result<Vec<SentencePiece>, String> {
+    let mut cursor = 0usize;
+    let mut pieces = Vec::new();
+
+    while cursor < bytes.len() {
+        let (tag_wire, adv) = proto_varint(bytes, cursor)?;
+        cursor += adv;
+        let field_number = tag_wire >> 3;
+        let wire_type    = tag_wire & 0x7;
+
+        match wire_type {
+            0 => { // varint — skip
+                let (_, adv) = proto_varint(bytes, cursor)?;
+                cursor += adv;
+            }
+            1 => { // 64-bit — skip
+                cursor += 8;
+            }
+            2 => { // length-delimited
+                let (len, adv) = proto_varint(bytes, cursor)?;
+                cursor += adv;
+                let end = cursor + len as usize;
+                if field_number == 3 {
+                    // This is a SentencePieceProto — parse it
+                    let piece = proto_read_one_piece(&bytes[cursor..end])?;
+                    pieces.push(piece);
+                }
+                cursor = end;
+            }
+            5 => { // 32-bit — skip
+                cursor += 4;
+            }
+            _ => return Err(format!("unknown wire type {} at offset {}", wire_type, cursor)),
+        }
+    }
+    Ok(pieces)
+}
+
+fn proto_read_one_piece(bytes: &[u8]) -> Result<SentencePiece, String> {
+    let mut cursor = 0usize;
+    let mut text_opt: Option<String> = None;
+    let mut score_opt: Option<f32> = None;
+
+    while cursor < bytes.len() {
+        let (tag_wire, adv) = proto_varint(bytes, cursor)?;
+        cursor += adv;
+        let field_number = tag_wire >> 3;
+        let wire_type    = tag_wire & 0x7;
+
+        match wire_type {
+            0 => { let (_, adv) = proto_varint(bytes, cursor)?; cursor += adv; }
+            1 => { cursor += 8; }
+            2 => {
+                let (len, adv) = proto_varint(bytes, cursor)?;
+                cursor += adv;
+                let end = cursor + len as usize;
+                if field_number == 1 {
+                    text_opt = Some(String::from_utf8_lossy(&bytes[cursor..end]).into_owned());
+                }
+                cursor = end;
+            }
+            5 => {
+                // 32-bit little-endian float
+                if cursor + 4 > bytes.len() {
+                    return Err("truncated 32-bit field".into());
+                }
+                if field_number == 2 {
+                    let raw = [bytes[cursor], bytes[cursor+1], bytes[cursor+2], bytes[cursor+3]];
+                    score_opt = Some(f32::from_le_bytes(raw));
+                }
+                cursor += 4;
+            }
+            _ => return Err(format!("unknown wire type {} in SentencePieceProto", wire_type)),
+        }
+    }
+
+    Ok(SentencePiece {
+        text:     text_opt.unwrap_or_default(),
+        log_prob: score_opt.unwrap_or(0.0),
+    })
+}
+
+/// Read a protobuf varint from `bytes` starting at `offset`.
+/// Returns `(value, bytes_consumed)`.
+fn proto_varint(bytes: &[u8], offset: usize) -> Result<(u64, usize), String> {
+    let mut result = 0u64;
+    let mut shift  = 0u32;
+    let mut i      = offset;
+    loop {
+        if i >= bytes.len() {
+            return Err(format!("truncated varint at offset {}", i));
+        }
+        let b = bytes[i] as u64;
+        result |= (b & 0x7f) << shift;
+        i += 1;
+        if b & 0x80 == 0 { break; }
+        shift += 7;
+        if shift >= 64 {
+            return Err("varint too long".into());
+        }
+    }
+    Ok((result, i - offset))
+}
+
+// =============================================================================
+// SentencePiece tests
+// =============================================================================
+
+#[cfg(test)]
+mod sentencepiece_tests {
+    use super::*;
+
+    /// Build a tiny vocabulary suitable for unit-testing.
+    /// Uses simple ASCII pieces with uniform log-probs.
+    fn tiny_vocab() -> SentencePieceTokenizer {
+        // The ▁ prefix is U+2581 (3 UTF-8 bytes: 0xE2 0x96 0x81)
+        let sp = '\u{2581}';
+        let text = format!(
+            "<unk>\t0\n\
+             <s>\t0\n\
+             </s>\t0\n\
+             {sp}hello\t-1.0\n\
+             {sp}world\t-2.0\n\
+             {sp}hi\t-3.0\n\
+             {sp}h\t-4.0\n\
+             e\t-4.0\n\
+             l\t-4.0\n\
+             o\t-4.0\n\
+             w\t-4.0\n\
+             r\t-4.0\n\
+             d\t-4.0\n\
+             i\t-4.0\n"
+        );
+        SentencePieceTokenizer::from_vocab_text(&text).expect("tiny_vocab failed")
+    }
+
+    #[test]
+    fn test_vocab_size() {
+        let tok = tiny_vocab();
+        assert_eq!(tok.vocab_size(), 14);
+    }
+
+    #[test]
+    fn test_encode_hello_single_token() {
+        let tok = tiny_vocab();
+        // "hello" should encode as [▁hello] — one token
+        let ids = tok.encode("hello");
+        assert_eq!(ids.len(), 1,
+            "expected 1 token for 'hello', got {:?}", ids);
+    }
+
+    #[test]
+    fn test_decode_hello() {
+        let tok = tiny_vocab();
+        let ids = tok.encode("hello");
+        let back = tok.decode(&ids);
+        assert_eq!(back, "hello", "round-trip failed: {:?}", back);
+    }
+
+    #[test]
+    fn test_encode_two_words() {
+        // "hello world" → [▁hello, ▁world] — 2 tokens
+        let tok = tiny_vocab();
+        let ids = tok.encode("hello world");
+        assert_eq!(ids.len(), 2,
+            "expected 2 tokens for 'hello world', got {} tokens: {:?}", ids.len(), ids);
+    }
+
+    #[test]
+    fn test_decode_two_words() {
+        let tok = tiny_vocab();
+        let ids = tok.encode("hello world");
+        let back = tok.decode(&ids);
+        assert_eq!(back, "hello world");
+    }
+
+    #[test]
+    fn test_roundtrip_hi() {
+        let tok = tiny_vocab();
+        let ids = tok.encode("hi");
+        let back = tok.decode(&ids);
+        assert_eq!(back, "hi");
+    }
+
+    #[test]
+    fn test_from_vocab_text_error_on_missing_tab() {
+        let result = SentencePieceTokenizer::from_vocab_text("nospace\n");
+        assert!(result.is_err(), "expected error for line without tab");
+    }
+
+    #[test]
+    fn test_from_vocab_text_error_on_empty() {
+        let result = SentencePieceTokenizer::from_vocab_text("");
+        assert!(result.is_err(), "expected error for empty vocab");
+    }
+
+    #[test]
+    fn test_piece_to_id_lookup() {
+        let tok = tiny_vocab();
+        let sp = '\u{2581}';
+        let key = format!("{sp}hello");
+        let id = tok.piece_to_id.get(&key).copied().unwrap();
+        assert_eq!(id, 3, "▁hello should be id 3");
+    }
+
+    // --- Protobuf round-trip test ---
+    // Build a minimal ModelProto binary by hand and verify we parse it correctly.
+
+    fn encode_varint(v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut v = v;
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; }
+            out.push(b | 0x80);
+        }
+        out
+    }
+
+    fn encode_len_delimited(field: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = encode_varint((field << 3) | 2); // wire type 2
+        out.extend(encode_varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn encode_f32_field(field: u64, v: f32) -> Vec<u8> {
+        let mut out = encode_varint((field << 3) | 5); // wire type 5
+        out.extend_from_slice(&v.to_le_bytes());
+        out
+    }
+
+    fn make_model_proto(vocab: &[(&str, f32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (piece, score) in vocab {
+            // Build SentencePieceProto {field 1: piece, field 2: score}
+            let mut sp_proto = Vec::new();
+            sp_proto.extend(encode_len_delimited(1, piece.as_bytes()));
+            sp_proto.extend(encode_f32_field(2, *score));
+            // Wrap as field 3 (pieces) of ModelProto
+            out.extend(encode_len_delimited(3, &sp_proto));
+        }
+        out
+    }
+
+    #[test]
+    fn test_proto_parse_roundtrip() {
+        let sp = '\u{2581}';
+        let piece_hello = format!("{sp}hello");
+        let piece_world = format!("{sp}world");
+        let vocab: Vec<(&str, f32)> = vec![
+            ("<unk>", 0.0),
+            ("<s>",   0.0),
+            ("</s>",  0.0),
+            (&piece_hello, -1.0),
+            (&piece_world, -2.0),
+        ];
+        let bytes = make_model_proto(&vocab);
+        let tok = SentencePieceTokenizer::from_model_bytes(&bytes)
+            .expect("from_model_bytes failed");
+        assert_eq!(tok.vocab_size(), 5);
+        let sp_str = format!("{sp}hello");
+        let id = tok.piece_to_id.get(&sp_str).copied().unwrap();
+        assert_eq!(id, 3);
+        assert!((tok.pieces[id as usize].log_prob - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_proto_encode_decode() {
+        let sp = '\u{2581}';
+        let sp_hello = format!("{sp}hello");
+        let sp_world = format!("{sp}world");
+        let sp_h = format!("{sp}h");
+        let vocab: Vec<(&str, f32)> = vec![
+            ("<unk>", 0.0),
+            ("<s>",   0.0),
+            ("</s>",  0.0),
+            (&sp_hello, -1.0),
+            (&sp_world, -2.0),
+            (&sp_h, -4.0),
+            ("e",  -4.0),
+            ("l",  -4.0),
+            ("o",  -4.0),
+        ];
+        let bytes = make_model_proto(&vocab);
+        let tok = SentencePieceTokenizer::from_model_bytes(&bytes).unwrap();
+        let ids = tok.encode("hello world");
+        let back = tok.decode(&ids);
+        assert_eq!(back, "hello world",
+            "proto round-trip failed: {:?}", back);
+    }
+}
+
 // ---- Base64 encoder (for tests only) ----
 #[cfg(test)]
 fn base64_encode(data: &[u8]) -> String {

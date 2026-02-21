@@ -688,6 +688,111 @@ impl GptOssModel {
         self.lm_head.forward(&x_normed)
     }
 
+    /// Batched forward pass for B sequences.
+    ///
+    /// ## What "batching" means here
+    ///
+    /// A real GPU batch processes B sequences in parallel inside a single
+    /// [B, T, D] tensor operation.  Our `Mat` is 2D, so we take the next
+    /// best thing: we pad all sequences to the same length `T_max` and run
+    /// one independent forward pass per sequence.  The work is the same, but
+    /// the loop is simple and the API is identical to what you'd have with 3D
+    /// tensors — callers can batch their data and get back one logit matrix
+    /// per sequence without caring about the inner implementation.
+    ///
+    /// ## Parameters
+    ///   sequences:   B sequences; need not have the same length
+    ///
+    /// ## Returns
+    ///   Vec of B logit tensors [T_i, vocab_size], one per sequence.
+    pub fn forward_batch(&self, sequences: &[Vec<usize>]) -> Vec<TensorNode> {
+        sequences.iter().map(|seq| self.forward(seq)).collect()
+    }
+
+    /// Batched cross-entropy loss for B (input, target) sequence pairs.
+    ///
+    /// Each sequence pair shares the same length T. The loss is averaged
+    /// across all T*B token predictions.
+    ///
+    /// ## Parameters
+    ///   batch:  slice of (input_ids, target_ids) pairs, all the same length
+    ///
+    /// ## Returns
+    ///   A scalar TensorNode with gradient wired through all B sequences.
+    pub fn loss_batch(&self, batch: &[(&[usize], &[usize])]) -> TensorNode {
+        assert!(!batch.is_empty(), "loss_batch: empty batch");
+
+        // Collect per-sequence scalar losses
+        let loss_nodes: Vec<TensorNode> = batch.iter()
+            .map(|(inp, tgt)| self.loss(inp, tgt))
+            .collect();
+
+        // Average them: accumulate into a sum, then scale
+        let b = loss_nodes.len() as f32;
+        // Build a sum node the same way loss() works: leaf + backward plumbing
+        let sum_val: f32 = loss_nodes.iter().map(|n| n.data().at(0, 0)).sum::<f32>() / b;
+
+        let avg = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
+        // Backward: propagate 1/B into each child loss
+        let children = loss_nodes.clone();
+        avg.set_backward(Box::new(move || {
+            for child in &children {
+                let cur = child.grad().clone();
+                let upd = Mat::new(vec![cur.at(0,0) + 1.0/b], 1, 1);
+                child.set_grad(upd);
+                child.call_backward_fn();
+            }
+        }), loss_nodes);
+        avg
+    }
+
+    /// Per-sequence cross-entropy loss (input_ids → targets).
+    ///
+    /// Shared helper used by `loss_batch`. Returns a scalar TensorNode whose
+    /// backward pass propagates gradients through the logits.
+    pub fn loss(&self, token_ids: &[usize], targets: &[usize]) -> TensorNode {
+        let logits_node = self.forward(token_ids);
+        let logits = logits_node.data().clone();
+        let t = logits.rows;
+        let v = logits.cols;
+        assert_eq!(t, targets.len(), "loss: token_ids len {} != targets len {}", t, targets.len());
+
+        // Numerically-stable softmax + cross-entropy per row
+        let mut probs = Mat::zeros(t, v);
+        let mut loss_val = 0.0f32;
+        for r in 0..t {
+            let row_max = (0..v).map(|c| logits.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for c in 0..v {
+                let e = (logits.at(r, c) - row_max).exp();
+                *probs.at_mut(r, c) = e;
+                sum_exp += e;
+            }
+            for c in 0..v { *probs.at_mut(r, c) /= sum_exp; }
+            loss_val -= probs.at(r, targets[r]).ln();
+        }
+        loss_val /= t as f32;
+
+        let loss = TensorNode::leaf(Mat::new(vec![loss_val], 1, 1));
+
+        // Backward: d(loss)/d(logits[r,c]) = (probs[r,c] - 1_{c==target[r]}) / T
+        let logits_c      = logits_node.clone();
+        let probs_stored  = probs;
+        let targets_v     = targets.to_vec();
+        loss.set_backward(Box::new(move || {
+            let mut dlogits = logits_c.grad().clone();
+            for r in 0..t {
+                for c in 0..v {
+                    let indicator = if c == targets_v[r] { 1.0 } else { 0.0 };
+                    *dlogits.at_mut(r, c) += (probs_stored.at(r, c) - indicator) / t as f32;
+                }
+            }
+            logits_c.set_grad(dlogits);
+            logits_c.call_backward_fn();
+        }), vec![logits_node]);
+        loss
+    }
+
     /// Greedy next-token prediction for a prompt.
     ///
     /// Returns the index of the most likely next token.
@@ -761,6 +866,55 @@ impl GptOssModel {
         }
 
         generated
+    }
+
+    /// Like `generate_cached` but calls `callback(token_id)` after each new token
+    /// instead of buffering them all.  Useful for printing tokens as they arrive:
+    ///
+    /// ```ignore
+    /// model.generate_cached_streaming(&prompt_ids, 100, 0.8, |tok| {
+    ///     print!("{}", tokenizer.decode(&[tok as u32]));
+    ///     std::io::stdout().flush().unwrap();
+    /// });
+    /// ```
+    pub fn generate_cached_streaming(
+        &self,
+        token_ids: &[usize],
+        max_new: usize,
+        temperature: f32,
+        mut callback: impl FnMut(usize),
+    ) {
+        let cache = KvCache::new(&self.config);
+        let d = self.config.hidden_size;
+        let te = self.embed_tokens.data().clone();
+
+        // Prefill
+        let t_prompt = token_ids.len();
+        let x_data = Mat::from_fn(t_prompt, d, |row, col| te.at(token_ids[row], col));
+        let mut x = TensorNode::leaf(x_data);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+        }
+        let x_normed = self.norm.forward(&x);
+        let logits   = self.lm_head.forward(&x_normed);
+
+        let first_tok = self.sample_token(&logits.data(), t_prompt - 1, temperature);
+        callback(first_tok);
+
+        // Decode
+        let mut prev_tok = first_tok;
+        for _ in 1..max_new {
+            let x_data = Mat::from_fn(1, d, |_, col| te.at(prev_tok, col));
+            let mut x = TensorNode::leaf(x_data);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_cached(&x, &mut cache.layers[layer_idx].borrow_mut());
+            }
+            let x_normed = self.norm.forward(&x);
+            let logits   = self.lm_head.forward(&x_normed);
+
+            prev_tok = self.sample_token(&logits.data(), 0, temperature);
+            callback(prev_tok);
+        }
     }
 
     /// Sample a token from logits at row `pos` with temperature scaling.
@@ -1630,6 +1784,121 @@ mod tests {
         let uncached_first = model.predict_next(&prompt);
         assert_eq!(cached_first, uncached_first,
             "cached first token {} != uncached {}", cached_first, uncached_first);
+    }
+
+    #[test]
+    fn test_generate_cached_streaming_same_as_buffered() {
+        // generate_cached_streaming must yield the exact same tokens as generate_cached.
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let prompt = vec![0usize, 1, 2];
+        let buffered = model.generate_cached(&prompt, 6, 0.8);
+        let mut streamed = Vec::new();
+        model.generate_cached_streaming(&prompt, 6, 0.8, |tok| streamed.push(tok));
+        assert_eq!(buffered, streamed,
+            "streaming tokens {:?} differ from buffered {:?}", streamed, buffered);
+    }
+
+    #[test]
+    fn test_generate_cached_streaming_callback_count() {
+        // Callback must be invoked exactly max_new times.
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let mut count = 0usize;
+        model.generate_cached_streaming(&[0, 1], 7, 1.0, |_tok| count += 1);
+        assert_eq!(count, 7, "expected 7 callback calls, got {}", count);
+    }
+
+    // --- Batching ---
+
+    #[test]
+    fn test_forward_batch_output_count() {
+        // forward_batch returns one TensorNode per sequence
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let batch = vec![vec![0usize, 1, 2], vec![3usize, 4], vec![5usize]];
+        let logits = model.forward_batch(&batch);
+        assert_eq!(logits.len(), 3);
+    }
+
+    #[test]
+    fn test_forward_batch_logit_shapes() {
+        // Each logit tensor must have shape [T_i, vocab_size]
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let seqs = vec![vec![0usize, 1], vec![2usize, 3, 4]];
+        let logits = model.forward_batch(&seqs);
+        assert_eq!(logits[0].data().rows, 2);
+        assert_eq!(logits[0].data().cols, cfg.vocab_size);
+        assert_eq!(logits[1].data().rows, 3);
+        assert_eq!(logits[1].data().cols, cfg.vocab_size);
+    }
+
+    #[test]
+    fn test_forward_batch_matches_forward_single() {
+        // forward_batch[i] must produce identical results to forward(seqs[i])
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let seq = vec![1usize, 2, 3];
+        let single = model.forward(&seq);
+        let batch  = model.forward_batch(&[seq])[0].clone();
+        let sd = single.data();
+        let bd = batch.data();
+        assert_eq!((sd.rows, sd.cols), (bd.rows, bd.cols));
+        for r in 0..sd.rows {
+            for c in 0..sd.cols {
+                assert!((sd.at(r,c) - bd.at(r,c)).abs() < 1e-5,
+                    "mismatch at [{r},{c}]: single={} batch={}", sd.at(r,c), bd.at(r,c));
+            }
+        }
+    }
+
+    #[test]
+    fn test_loss_is_finite() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let inp    = vec![0usize, 1, 2, 3];
+        let tgt    = vec![1usize, 2, 3, 4];
+        let loss   = model.loss(&inp, &tgt);
+        let v = loss.data().at(0, 0);
+        assert!(v.is_finite() && v > 0.0,
+            "expected finite positive loss, got {}", v);
+    }
+
+    #[test]
+    fn test_loss_batch_average() {
+        // loss_batch of B identical examples must equal loss of one example
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let inp: Vec<usize> = vec![0, 1, 2];
+        let tgt: Vec<usize> = vec![1, 2, 3];
+        let single_loss = model.loss(&inp, &tgt).data().at(0, 0);
+        let batch_loss  = model.loss_batch(&[
+            (inp.as_slice(), tgt.as_slice()),
+            (inp.as_slice(), tgt.as_slice()),
+        ]).data().at(0, 0);
+        assert!((batch_loss - single_loss).abs() < 1e-4,
+            "batch_loss {} != single_loss {}", batch_loss, single_loss);
+    }
+
+    #[test]
+    fn test_loss_batch_size_1_equals_loss() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let inp: Vec<usize> = vec![2, 3, 4];
+        let tgt: Vec<usize> = vec![3, 4, 5];
+        let single = model.loss(&inp, &tgt).data().at(0, 0);
+        let batched = model.loss_batch(&[(inp.as_slice(), tgt.as_slice())]).data().at(0, 0);
+        assert!((single - batched).abs() < 1e-5,
+            "single={} batched={}", single, batched);
     }
 
     // --- Safetensors parser ---

@@ -10,9 +10,12 @@ path = "src/main.rs"
 [dependencies]
 safetensors = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
+cblas = { version = "0.4", optional = true }
+blas-src = { version = "0.10", optional = true, features = ["accelerate"] }
 
 [features]
 weight-loading = ["safetensors"]
 mmap-loading = ["memmap2"]
+blas = ["cblas", "blas-src"]
 
 [dev-dependencies]
