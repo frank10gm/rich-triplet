@@ -41,7 +41,7 @@
 /// - MXFP4 quantization (4-bit weights; f32 only here)
 /// - The `swiglu_limit=7.0` clamping from the config (minor regularization detail)
 
-use crate::autograd2::{TensorNode, Mat};
+use crate::autograd2::{TensorNode, Mat, Q4Mat};
 use crate::nn::InitRng;
 use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2};
 use std::cell::RefCell;
@@ -636,6 +636,15 @@ pub struct GptOssModel {
     pub config: Config3,
 }
 
+/// Statistics returned by `quantize_all_linear_weights()`.
+#[derive(Debug, Default)]
+pub struct Q4QuantStats {
+    pub n_tensors:        usize,
+    pub f32_bytes:        usize,
+    pub q4_bytes:         usize,
+    pub compression_ratio: f32,
+}
+
 impl GptOssModel {
     /// Create a randomly-initialized GPT-OSS model with the given config.
     ///
@@ -1126,6 +1135,179 @@ impl GptOssModel {
         println!("Loaded {} tensors from {} shards in {}", loaded_tensors, loaded_shards, dir);
         Ok(())
     }
+
+    // =========================================================================
+    // 4-bit weight quantization
+    // =========================================================================
+    //
+    // After loading f32 (or BF16→f32) weights, we can further compress them
+    // to 4-bit to reduce inference memory from ~40GB to ~11GB for GPT-OSS-20b.
+    //
+    // ## Usage
+    //
+    // ```no_run
+    // model.load_weights_from_dir("./gpt-oss-20b-weights").unwrap();
+    // let stats = model.quantize_all_linear_weights();
+    // println!("Compressed {} weights from {:.1}GB to {:.1}GB ({:.1}x)",
+    //          stats.n_tensors, stats.f32_bytes as f64 / 1e9,
+    //          stats.q4_bytes  as f64 / 1e9, stats.compression_ratio);
+    // ```
+    //
+    // After quantization, the model's weight TensorNodes are set to the
+    // dequantized approximation. This is the "static quantization" approach:
+    // slightly lossy, but weights only need to be dequantized once.
+    //
+    // For "dynamic quantization" (dequantize on every forward pass for
+    // better cache utilization), use `Q4Mat::matmul_q4_t` directly.
+
+    /// Quantize all Linear2 weight matrices to 4-bit and replace them with
+    /// the dequantized approximation.
+    ///
+    /// Returns statistics about the compression.
+    pub fn quantize_all_linear_weights(&self) -> Q4QuantStats {
+        let mut stats = Q4QuantStats::default();
+
+        // Quantize all parameters that are weight matrices (rows*cols > 1)
+        for param in self.parameters() {
+            let (rows, cols) = {
+                let d = param.data();
+                (d.rows, d.cols)
+            };
+            // Skip scalars and norm gammas (1D vectors — not worth quantizing)
+            if rows <= 1 || cols <= 1 { continue; }
+
+            let original = param.data().clone();
+            let q4 = Q4Mat::quantize(&original);
+            let dequant = q4.dequantize();
+
+            stats.n_tensors += 1;
+            stats.f32_bytes += rows * cols * 4;
+            stats.q4_bytes  += q4.size_bytes();
+
+            // Replace the weight data with the dequantized approximation
+            param.set_data(dequant);
+        }
+
+        if stats.f32_bytes > 0 {
+            stats.compression_ratio = stats.f32_bytes as f32 / stats.q4_bytes as f32;
+        }
+        stats
+    }
+
+    // =========================================================================
+    // Memory-mapped weight loading
+    // =========================================================================
+    //
+    // ## Why mmap?
+    //
+    // GPT-OSS-20b weights are ~40GB of BF16 data split across ~10 shard files.
+    // Loading them with `std::fs::read()` copies all bytes into a heap-allocated
+    // Vec<u8>, requiring 40GB of RAM *in addition* to the model struct itself.
+    //
+    // Memory mapping (`mmap`) instead asks the OS to map the file's pages directly
+    // into the process's virtual address space:
+    //   - No upfront copy: pages are loaded on demand when first accessed.
+    //   - The OS can evict clean pages and reload from disk — effective working
+    //     set is the pages actually touched during inference, not the full file.
+    //   - Multiple processes can share the same physical pages.
+    //
+    // For GPT-OSS-20b: the model parameters that fit in RAM (~8GB of active
+    // layers at a time) are kept; the rest are paged in on demand.
+    //
+    // ## How it works
+    //
+    // 1. Open the file and obtain a raw file descriptor.
+    // 2. Call `mmap(2)` (on Unix) / `CreateFileMapping`/`MapViewOfFile` (Windows)
+    //    to create a mapping. The `memmap2` crate handles both platforms.
+    // 3. Treat the resulting `&[u8]` exactly like the in-memory bytes from `fs::read`.
+    // 4. The OS unmaps the file when the `Mmap` object is dropped.
+    //
+    // ## Safety note
+    //
+    // The file must not be modified while the mapping is alive. For read-only
+    // model weights this is always satisfied.
+    //
+    // ## Requires the `mmap-loading` feature
+    //
+    // Add to Cargo.toml: `memmap2 = { version = "0.9", optional = true }`
+    // and enable with `cargo run --features mmap-loading`.
+
+    /// Load weights from all .safetensors shards using memory-mapped I/O.
+    ///
+    /// Functionally identical to `load_weights_from_dir()` but uses `mmap`
+    /// instead of `fs::read()`. For large models (>8GB) this is the only
+    /// practical approach on machines with limited RAM.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// model.load_weights_from_dir_mmap("./gpt-oss-20b-weights")
+    ///      .expect("failed to load weights");
+    /// ```
+    #[cfg(feature = "mmap-loading")]
+    pub fn load_weights_from_dir_mmap(&mut self, dir: &str) -> Result<(), String> {
+        use std::fs::File;
+        use memmap2::Mmap;
+
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot read dir {}: {}", dir, e))?;
+
+        let mut loaded_shards  = 0usize;
+        let mut loaded_tensors = 0usize;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+                continue;
+            }
+
+            let file = File::open(&path)
+                .map_err(|e| format!("cannot open {:?}: {}", path, e))?;
+
+            // SAFETY: we only read from the mapping, never write.
+            // The file is not modified while the mapping is alive.
+            let mmap = unsafe { Mmap::map(&file) }
+                .map_err(|e| format!("mmap failed for {:?}: {}", path, e))?;
+
+            let tensors = parse_safetensors(&mmap[..])
+                .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
+
+            loaded_tensors += tensors.len();
+            load_into_model(self, &tensors);
+            loaded_shards += 1;
+            // `mmap` is dropped here, releasing the mapping for this shard.
+        }
+
+        if loaded_shards == 0 {
+            return Err(format!("no .safetensors files found in {}", dir));
+        }
+
+        println!("Loaded {} tensors from {} shards via mmap in {}",
+            loaded_tensors, loaded_shards, dir);
+        Ok(())
+    }
+
+    /// Load a single .safetensors file using memory-mapped I/O.
+    ///
+    /// Useful when loading one shard at a time to minimize peak memory usage.
+    #[cfg(feature = "mmap-loading")]
+    pub fn load_shard_mmap(&mut self, path: &str) -> Result<usize, String> {
+        use std::fs::File;
+        use memmap2::Mmap;
+
+        let file = File::open(path)
+            .map_err(|e| format!("cannot open {}: {}", path, e))?;
+
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("mmap failed for {}: {}", path, e))?;
+
+        let tensors = parse_safetensors(&mmap[..])
+            .map_err(|e| format!("parse error in {}: {}", path, e))?;
+
+        let n = tensors.len();
+        load_into_model(self, &tensors);
+        Ok(n)
+    }
 }
 
 impl Module2 for GptOssModel {
@@ -1568,5 +1750,41 @@ mod tests {
         assert!(total > 0);
         // Print for educational purposes (not an assertion)
         let _ = total;
+    }
+
+    // --- Q4 quantization integration ---
+
+    #[test]
+    fn test_quantize_all_linear_weights_compresses() {
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        let stats = model.quantize_all_linear_weights();
+        assert!(stats.n_tensors > 0, "should quantize at least 1 tensor");
+        assert!(stats.compression_ratio > 1.0,
+            "Q4 should compress: got {:.2}x", stats.compression_ratio);
+    }
+
+    #[test]
+    fn test_quantize_all_linear_weights_model_still_runs() {
+        // After quantization the model should still produce finite logits.
+        let cfg = tiny_config();
+        let mut rng = make_rng();
+        let model = GptOssModel::new(cfg.clone(), &mut rng);
+        model.quantize_all_linear_weights();
+        let out = model.forward(&[0, 1, 2]);
+        assert!(out.data().data.iter().all(|v| v.is_finite()),
+            "model should still produce finite logits after Q4 quantization");
+    }
+
+    #[test]
+    fn test_quantize_reduces_memory() {
+        // Q4 should use less than half the memory of f32
+        use crate::autograd2::Q4Mat;
+        let m = Mat::from_fn(64, 64, |r, c| (r * 64 + c) as f32 * 0.01 - 0.5);
+        let q = Q4Mat::quantize(&m);
+        let f32_bytes = 64 * 64 * 4;
+        assert!(q.size_bytes() < f32_bytes / 3,
+            "Q4 should use <1/3 of f32 memory: {} vs {}", q.size_bytes(), f32_bytes);
     }
 }

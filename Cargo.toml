@@ -9,8 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 safetensors = { version = "0.4", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 [features]
 weight-loading = ["safetensors"]
+mmap-loading = ["memmap2"]
 
 [dev-dependencies]
