@@ -1,2 +1,7 @@
 .DS_Store
 thumbs.db
+
+
+# Added by cargo
+
+/target
