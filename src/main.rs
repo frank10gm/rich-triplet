@@ -251,17 +251,17 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
 
 fn run_gemma3(args: &CliArgs, prompt: &str) {
     use std::io::Write;
-    use tokenizer::SentencePieceTokenizer;
+    use tokenizer::HfBpeTokenizer;
     use transformer4::{Gemma3Model, Config4};
 
     let weights_dir = args.weights.as_deref().unwrap();
-    let tok_path = args.tokenizer_model.as_deref()
-        .expect("--tokenizer-model required with Gemma 3 (path to tokenizer.model)");
     let model_name = args.model.as_deref().unwrap_or("gemma3-1b");
 
-    eprintln!("[ Gemma3 ] Loading tokenizer from {}...", tok_path);
-    let tok = SentencePieceTokenizer::from_model_file(tok_path)
-        .expect("failed to load SentencePiece tokenizer");
+    // Try tokenizer.json (BPE) first, then fall back to tokenizer.model (SentencePiece)
+    let tok_json_path = format!("{}/tokenizer.json", weights_dir.trim_end_matches('/'));
+    eprintln!("[ Gemma3 ] Loading tokenizer from {}...", tok_json_path);
+    let tok = HfBpeTokenizer::from_json_file(&tok_json_path)
+        .expect("failed to load tokenizer.json");
     eprintln!("[ Gemma3 ] Vocab size: {}", tok.vocab_size());
 
     let config = match model_name {
@@ -283,12 +283,14 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         eprintln!("Error: prompt encodes to zero tokens");
         std::process::exit(1);
     }
+    eprintln!("[DBG] prompt token_ids: {:?}", token_ids);
 
     print!("{}", prompt);
     std::io::stdout().flush().ok();
 
     model.generate_cached_streaming(&token_ids, args.max_new, args.temperature, args.top_k, args.seed, |tok_id| {
         let text = tok.decode(&[tok_id as u32]);
+        eprintln!("[DBG] tok_id={} text={:?}", tok_id, text);
         print!("{}", text);
         std::io::stdout().flush().ok();
     });

@@ -1449,8 +1449,8 @@ fn proto_read_pieces(bytes: &[u8]) -> Result<Vec<SentencePiece>, String> {
                 let (len, adv) = proto_varint(bytes, cursor)?;
                 cursor += adv;
                 let end = cursor + len as usize;
-                if field_number == 3 {
-                    // This is a SentencePieceProto — parse it
+                if field_number == 1 {
+                    // SentencePiece ModelProto: field 1 = repeated SentencePieceProto pieces
                     let piece = proto_read_one_piece(&bytes[cursor..end])?;
                     pieces.push(piece);
                 }
@@ -1667,8 +1667,8 @@ mod sentencepiece_tests {
             let mut sp_proto = Vec::new();
             sp_proto.extend(encode_len_delimited(1, piece.as_bytes()));
             sp_proto.extend(encode_f32_field(2, *score));
-            // Wrap as field 3 (pieces) of ModelProto
-            out.extend(encode_len_delimited(3, &sp_proto));
+            // Wrap as field 1 (pieces) of ModelProto — standard SentencePiece format
+            out.extend(encode_len_delimited(1, &sp_proto));
         }
         out
     }
@@ -1737,4 +1737,352 @@ fn base64_encode(data: &[u8]) -> String {
         if chunk.len() > 2 { out.push(ALPHABET[(n & 63) as usize] as char); } else { out.push('='); }
     }
     out
+}
+
+// =============================================================================
+// HfBpeTokenizer — loads a HuggingFace tokenizer.json BPE tokenizer
+// =============================================================================
+//
+// Supports the Gemma 3 tokenizer format:
+//   - Normalizer:    replace ' ' with '▁' (U+2581)
+//   - Pre-tokenizer: split on ' ', prepending '▁' to each word
+//   - Model:         BPE with vocab (token→id) and ordered merge rules
+//
+// The tokenizer.json file is the canonical source; tokenizer.model is legacy.
+
+/// A BPE tokenizer loaded from a HuggingFace `tokenizer.json` file.
+pub struct HfBpeTokenizer {
+    /// vocab[id] = token string
+    id_to_token: Vec<String>,
+    /// token string → id  (for encoding)
+    token_to_id: HashMap<String, u32>,
+    /// merge_rank[pair] = priority (lower = applied first)
+    merge_rank: HashMap<(String, String), usize>,
+    unk_id: u32,
+}
+
+impl HfBpeTokenizer {
+    /// Load from the raw JSON bytes of a `tokenizer.json` file.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let s = std::str::from_utf8(bytes).map_err(|e| format!("utf8 error: {}", e))?;
+        Self::from_json_str(s)
+    }
+
+    /// Load from the path to a `tokenizer.json` file.
+    pub fn from_json_file(path: &str) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+        Self::from_json_bytes(&bytes)
+    }
+
+    fn from_json_str(s: &str) -> Result<Self, String> {
+        // Extract the "model" object
+        let model_start = s.find("\"model\"").ok_or("missing \"model\" key")?;
+        // Find the vocab object and merges array inside model
+        let vocab_map = Self::parse_vocab(s)?;
+        let merges = Self::parse_merges(s)?;
+
+        // Build id_to_token (sorted by id)
+        let vocab_size = vocab_map.len();
+        let mut id_to_token = vec![String::new(); vocab_size];
+        for (tok, &id) in &vocab_map {
+            if (id as usize) < vocab_size {
+                id_to_token[id as usize] = tok.clone();
+            }
+        }
+
+        // Build merge_rank
+        let mut merge_rank = HashMap::new();
+        for (rank, pair) in merges.iter().enumerate() {
+            merge_rank.insert(pair.clone(), rank);
+        }
+
+        let unk_id = vocab_map.get("<unk>").copied().unwrap_or(0);
+
+        Ok(HfBpeTokenizer { id_to_token, token_to_id: vocab_map, merge_rank, unk_id })
+    }
+
+    /// Parse the "model"."vocab" object: returns token→id map.
+    fn parse_vocab(s: &str) -> Result<HashMap<String, u32>, String> {
+        // Find "vocab": { ... }
+        let vocab_key = "\"vocab\"";
+        let vocab_start = s.find(vocab_key).ok_or("missing vocab key")?;
+        let brace = s[vocab_start..].find('{').ok_or("vocab not an object")? + vocab_start;
+        let content = Self::extract_brace_block(s, brace)?;
+
+        let mut map = HashMap::new();
+        // Parse "token": id pairs
+        let mut pos = 0;
+        let bytes = content.as_bytes();
+        while pos < bytes.len() {
+            // Skip whitespace and commas
+            while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\n'
+                || bytes[pos] == b'\r' || bytes[pos] == b'\t' || bytes[pos] == b',') {
+                pos += 1;
+            }
+            if pos >= bytes.len() || bytes[pos] == b'}' { break; }
+            if bytes[pos] != b'"' { pos += 1; continue; }
+            // Read key string
+            let (key, adv) = Self::parse_json_string(&content[pos..])?;
+            pos += adv;
+            // Skip whitespace and colon
+            while pos < bytes.len() && bytes[pos] != b':' { pos += 1; }
+            pos += 1; // skip colon
+            while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\n'
+                || bytes[pos] == b'\r' || bytes[pos] == b'\t') {
+                pos += 1;
+            }
+            // Read number
+            let num_start = pos;
+            while pos < bytes.len() && (bytes[pos].is_ascii_digit()) { pos += 1; }
+            if pos > num_start {
+                let id: u32 = content[num_start..pos].parse().unwrap_or(0);
+                map.insert(key, id);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Parse the "model"."merges" array: returns list of (left, right) pairs.
+    fn parse_merges(s: &str) -> Result<Vec<(String, String)>, String> {
+        // Find "merges": [ ... ]
+        let merges_key = "\"merges\"";
+        let merges_start = s.find(merges_key).ok_or("missing merges key")?;
+        let bracket = s[merges_start..].find('[').ok_or("merges not an array")? + merges_start;
+        let content = Self::extract_bracket_block(s, bracket)?;
+
+        let mut merges = Vec::new();
+        let bytes = content.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\n'
+                || bytes[pos] == b'\r' || bytes[pos] == b'\t' || bytes[pos] == b',') {
+                pos += 1;
+            }
+            if pos >= bytes.len() || bytes[pos] == b']' { break; }
+            if bytes[pos] == b'[' {
+                // Array format: ["left", "right"]
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'"' { pos += 1; }
+                let (left, adv) = Self::parse_json_string(&content[pos..])?;
+                pos += adv;
+                while pos < bytes.len() && bytes[pos] != b'"' { pos += 1; }
+                let (right, adv) = Self::parse_json_string(&content[pos..])?;
+                pos += adv;
+                while pos < bytes.len() && bytes[pos] != b']' { pos += 1; }
+                pos += 1;
+                merges.push((left, right));
+            } else if bytes[pos] == b'"' {
+                // String format: "left right"
+                let (pair_str, adv) = Self::parse_json_string(&content[pos..])?;
+                pos += adv;
+                // Split on first space
+                if let Some(sp) = pair_str.find(' ') {
+                    merges.push((pair_str[..sp].to_string(), pair_str[sp+1..].to_string()));
+                }
+            } else {
+                pos += 1;
+            }
+        }
+        Ok(merges)
+    }
+
+    /// Extract the content of a `{...}` block starting at `start` (index of `{`).
+    fn extract_brace_block(s: &str, start: usize) -> Result<String, String> {
+        let bytes = s.as_bytes();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            if escape { escape = false; continue; }
+            if b == b'\\' && in_string { escape = true; continue; }
+            if b == b'"' { in_string = !in_string; continue; }
+            if in_string { continue; }
+            if b == b'{' { depth += 1; }
+            if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(s[start + 1..start + i].to_string());
+                }
+            }
+        }
+        Err("unclosed brace block".into())
+    }
+
+    /// Extract the content of a `[...]` block starting at `start` (index of `[`).
+    fn extract_bracket_block(s: &str, start: usize) -> Result<String, String> {
+        let bytes = s.as_bytes();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            if escape { escape = false; continue; }
+            if b == b'\\' && in_string { escape = true; continue; }
+            if b == b'"' { in_string = !in_string; continue; }
+            if in_string { continue; }
+            if b == b'[' { depth += 1; }
+            if b == b']' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(s[start + 1..start + i].to_string());
+                }
+            }
+        }
+        Err("unclosed bracket block".into())
+    }
+
+    /// Parse a JSON string starting at `s[0] == '"'`. Returns (value, bytes_consumed).
+    fn parse_json_string(s: &str) -> Result<(String, usize), String> {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() || bytes[0] != b'"' {
+            return Err(format!("expected '\"', got {:?}", &s[..s.len().min(4)]));
+        }
+        let mut out = String::new();
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i >= bytes.len() { break; }
+                match bytes[i] {
+                    b'"'  => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/'  => out.push('/'),
+                    b'n'  => out.push('\n'),
+                    b'r'  => out.push('\r'),
+                    b't'  => out.push('\t'),
+                    b'u'  => {
+                        // \uXXXX
+                        if i + 4 < bytes.len() {
+                            let hex = &s[i+1..i+5];
+                            if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                                if let Some(c) = char::from_u32(cp) { out.push(c); }
+                            }
+                            i += 4;
+                        }
+                    }
+                    b => out.push(b as char),
+                }
+            } else if bytes[i] == b'"' {
+                i += 1;
+                break;
+            } else {
+                // Multi-byte UTF-8 passthrough
+                let ch_len = {
+                    let b0 = bytes[i];
+                    if b0 < 0x80 { 1 }
+                    else if b0 < 0xE0 { 2 }
+                    else if b0 < 0xF0 { 3 }
+                    else { 4 }
+                };
+                let end = (i + ch_len).min(bytes.len());
+                if let Ok(c) = std::str::from_utf8(&bytes[i..end]) {
+                    out.push_str(c);
+                }
+                i += ch_len;
+                continue;
+            }
+            i += 1;
+        }
+        Ok((out, i))
+    }
+
+    /// Encode a single pre-tokenized word (already has ▁ prefix) using BPE.
+    fn bpe_encode_word(&self, word: &str) -> Vec<u32> {
+        if word.is_empty() { return Vec::new(); }
+
+        // Initialize: each Unicode char is a symbol
+        let chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+        if chars.is_empty() { return Vec::new(); }
+
+        // Use index-based representation for fast merging
+        // symbols[i] = Some(token_str), None means merged away
+        let mut symbols: Vec<Option<String>> = chars.into_iter().map(Some).collect();
+
+        // Iteratively apply the highest-priority merge
+        loop {
+            let mut best_rank = usize::MAX;
+            let mut best_i = usize::MAX;
+            let mut best_j = usize::MAX;
+
+            // Find all adjacent (non-None) pairs
+            let indices: Vec<usize> = symbols.iter().enumerate()
+                .filter_map(|(i, s)| if s.is_some() { Some(i) } else { None })
+                .collect();
+
+            for w in indices.windows(2) {
+                let (i, j) = (w[0], w[1]);
+                let left  = symbols[i].as_ref().unwrap();
+                let right = symbols[j].as_ref().unwrap();
+                if let Some(&rank) = self.merge_rank.get(&(left.clone(), right.clone())) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_i = i;
+                        best_j = j;
+                    }
+                }
+            }
+
+            if best_rank == usize::MAX { break; } // no more merges possible
+
+            // Apply the best merge: concatenate symbols[best_i] and symbols[best_j]
+            let left  = symbols[best_i].take().unwrap();
+            let right = symbols[best_j].take().unwrap();
+            symbols[best_i] = Some(left + &right);
+            // symbols[best_j] remains None
+        }
+
+        // Collect the remaining (non-None) symbols and look up their IDs
+        symbols.into_iter().flatten().map(|tok| {
+            self.token_to_id.get(&tok).copied().unwrap_or(self.unk_id)
+        }).collect()
+    }
+}
+
+impl Tokenizer for HfBpeTokenizer {
+    fn unk_id(&self) -> u32 { self.unk_id }
+
+    fn encode(&self, text: &str) -> Vec<u32> {
+        if text.is_empty() { return Vec::new(); }
+
+        // Normalize: replace spaces with ▁
+        // Then split on ▁ boundaries but keep ▁ prepended to each word
+        let normalized = text.replace(' ', "\u{2581}");
+        // Prepend ▁ to the whole text (matching SentencePiece convention)
+        let full = format!("\u{2581}{}", normalized);
+
+        // Split into words at ▁ boundaries (keep ▁ as prefix of each word)
+        let mut words: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for ch in full.chars() {
+            if ch == '\u{2581}' && !current.is_empty() {
+                words.push(current.clone());
+                current = String::from('\u{2581}');
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() { words.push(current); }
+
+        let mut ids = Vec::new();
+        for word in &words {
+            ids.extend(self.bpe_encode_word(word));
+        }
+        ids
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut out = String::new();
+        for &id in ids {
+            let tok = if (id as usize) < self.id_to_token.len() {
+                &self.id_to_token[id as usize]
+            } else {
+                continue;
+            };
+            out.push_str(tok);
+        }
+        // Replace ▁ with space and strip leading space
+        let decoded = out.replace('\u{2581}', " ");
+        decoded.trim_start_matches(' ').to_string()
+    }
+
+    fn vocab_size(&self) -> usize { self.id_to_token.len() }
 }

@@ -1336,6 +1336,44 @@ impl TensorNode {
         out
     }
 
+    /// GELU with the PyTorch tanh approximation (used by Gemma 3):
+    ///   gelu_tanh(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    ///
+    /// This is the standard `gelu_pytorch_tanh` activation.
+    pub fn gelu_tanh(&self) -> TensorNode {
+        let x = self.data().clone();
+        const SQRT_2_OVER_PI: f32 = 0.7978845608028654; // sqrt(2/pi)
+        const COEFF: f32 = 0.044715;
+
+        let out_data = Mat::from_fn(x.rows, x.cols, |r, c| {
+            let xv = x.at(r, c);
+            let inner = SQRT_2_OVER_PI * (xv + COEFF * xv * xv * xv);
+            xv * 0.5 * (1.0 + inner.tanh())
+        });
+        let out = TensorNode::leaf(out_data);
+
+        let self_c = self.clone();
+        let out_c  = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout   = out_c.0.borrow().grad.clone();
+            let x_data = self_c.0.borrow().data.clone();
+            let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
+                let xv    = x_data.at(r, c);
+                let x3    = xv * xv * xv;
+                let inner = SQRT_2_OVER_PI * (xv + COEFF * x3);
+                let t     = inner.tanh();
+                let sech2 = 1.0 - t * t; // sech^2
+                let dg    = 0.5 * (1.0 + t)
+                          + xv * 0.5 * sech2 * SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * xv * xv);
+                dout.at(r, c) * dg
+            });
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone()];
+        out
+    }
+
     /// Row-wise softmax: each row of [T, V] is converted to a probability distribution.
     ///
     /// S[t, v] = exp(X[t,v] - max_v) / sum_v exp(X[t,v] - max_v)

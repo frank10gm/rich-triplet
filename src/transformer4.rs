@@ -259,7 +259,7 @@ impl Gemma3Mlp {
     }
 
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        let gate = self.gate_proj.forward(x).silu();
+        let gate = self.gate_proj.forward(x).gelu_tanh();
         let up   = self.up_proj.forward(x);
         let hidden = gate.mul_elem_node(&up);
         self.down_proj.forward(&hidden)
@@ -610,7 +610,8 @@ fn apply_tensor_inner(
     model: &mut Gemma3Model,
     t: &crate::transformer3::SafeTensor,
 ) -> Option<bool> {
-    let name = t.name.as_str();
+    // Strip optional "language_model." prefix (present in vision-language model checkpoints)
+    let name = t.name.strip_prefix("language_model.").unwrap_or(t.name.as_str());
 
     // Global tensors
     if name == "model.embed_tokens.weight" {
@@ -883,10 +884,44 @@ impl Gemma3Model {
             te.at(token_ids[row], col) * scale
         });
         let mut x = TensorNode::leaf(x_data);
+        {
+            let xd = x.data();
+            let vals: Vec<f32> = (0..5.min(xd.cols)).map(|c| xd.at(0, c)).collect();
+            eprintln!("[DBG] embed[tok0, 0..5]: {:?}", vals);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+            if i == 0 || i == 5 || i == 11 || i == 17 || i == 23 || i == 33 {
+                let xd = x.data();
+                let row = t_prompt - 1;
+                let rms: f32 = ((0..xd.cols).map(|c| xd.at(row, c).powi(2)).sum::<f32>() / xd.cols as f32).sqrt();
+                eprintln!("[DBG] after_layer{}[last_tok] RMS: {:.4}", i, rms);
+            }
         }
-        let logits_node = self.lm_head.forward(&self.norm.forward(&x));
+        let normed_final = self.norm.forward(&x);
+        {
+            let nd = normed_final.data();
+            let row = t_prompt - 1;
+            let norm_vals: Vec<f32> = (0..5.min(nd.cols)).map(|c| nd.at(row, c)).collect();
+            eprintln!("[DBG] final normed[last_tok, 0..5]: {:?}", norm_vals);
+            let rms: f32 = (0..nd.cols).map(|c| nd.at(row, c).powi(2)).sum::<f32>() / nd.cols as f32;
+            eprintln!("[DBG] final normed RMS: {:.4}", rms.sqrt());
+        }
+        let logits_node = self.lm_head.forward(&normed_final);
+        {
+            let ld = logits_node.data();
+            let row = t_prompt - 1;
+            let v = ld.cols;
+            let mut top: Vec<(usize, f32)> = (0..v).map(|c| (c, ld.at(row, c))).collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("[DBG] prefill top-5 logits: {:?}", &top[..5.min(top.len())]);
+            // Find ranks of specific tokens
+            for (tok_name, tok_id) in [("▁The(669)", 669usize), ("▁Rome(13706)", 13706), ("▁Italy(11702)", 11702), ("\n(107)", 107)] {
+                let rank = top.iter().position(|(id, _)| *id == tok_id).unwrap_or(999999);
+                let score = if tok_id < v { ld.at(row, tok_id) } else { f32::NAN };
+                eprintln!("[DBG] rank of {} = {} (score={:.3})", tok_name, rank, score);
+            }
+        }
         let first = sample_token(&logits_node.data(), t_prompt - 1, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);
@@ -1103,10 +1138,7 @@ fn gqa_attention_windowed(
 ) -> TensorNode {
     let t = q.data().rows;
     let group = n_q_heads / n_kv_heads;
-    let default_scale = 1.0 / (d_head as f32).sqrt();
-    let ratio = scale / default_scale;
-    let q_scaled = scale_tensor(q, ratio);
-    let q_data = q_scaled.data().clone();
+    let q_data = q.data().clone();
     let k_data = k.data().clone();
     let v_data = v.data().clone();
 
@@ -1118,9 +1150,9 @@ fn gqa_attention_windowed(
         let k_mat = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kv_head * d_head + c));
         let v_mat = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kv_head * d_head + c));
 
-        // Scores [T, T] with windowed causal mask
+        // Scores [T, T] with windowed causal mask, scaled by attn_scale
         let kt = k_mat.transpose();
-        let scores = q_mat.matmul(&kt); // [T, T], already scaled (q_scaled)
+        let scores = q_mat.matmul(&kt).scale(scale); // [T, T]
 
         // Apply windowed causal mask
         let mut masked = Mat::from_fn(t, t, |r, c| {
