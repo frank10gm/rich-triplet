@@ -245,18 +245,7 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
     };
     train2(&model, &tokenizer, &train_data, &val_data, &cfg);
 
-    // Encode prompt, clamp to context window
-    let mut token_ids = tokenizer.encode(prompt);
-    if token_ids.is_empty() {
-        // Use UNK if prompt has unknown chars — still generate something
-        token_ids = vec![tokenizer.unk_id()];
-    }
-    let max_ctx = context_length;
-    if token_ids.len() > max_ctx {
-        token_ids = token_ids[token_ids.len() - max_ctx..].to_vec();
-    }
-
-    // generate2 prints the prompt + continuation to stdout.
+    // generate2 encodes the prompt internally, prints prompt + continuation to stdout.
     generate2(&model, &tokenizer, prompt, args.max_new, args.temperature, args.top_k);
     println!();
 }

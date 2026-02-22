@@ -162,7 +162,7 @@ impl AttentionHead2 {
         let q = self.w_q.forward(x);
         let k = self.w_k.forward(x);
         let v = self.w_v.forward(x);
-        TensorNode::causal_attention(&q, &k, &v, self.d_head)
+        TensorNode::flash_attention(&q, &k, &v, self.d_head)
     }
 }
 
