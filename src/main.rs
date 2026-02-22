@@ -111,6 +111,8 @@ struct CliArgs {
     checkpoint: Option<String>,
     /// --pretokenize SRC DST : tokenize SRC text file → DST .bin file, then exit
     pretokenize: Option<(String, String)>,
+    /// --benchmark : run scalar-vs-tensor autograd benchmark
+    benchmark: bool,
 }
 
 impl CliArgs {
@@ -121,7 +123,7 @@ impl CliArgs {
             tokenizer_model: None, model: None,
             max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
             seed: 42, train_steps: 200, checkpoint: None,
-            pretokenize: None,
+            pretokenize: None, benchmark: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -144,6 +146,7 @@ impl CliArgs {
                     i += 1; let dst = if i < args.len() { args[i].clone() } else { String::new() };
                     a.pretokenize = Some((src, dst));
                 }
+                "--benchmark"    => { a.benchmark = true; }
                 "--help" | "-h"  => { print_help(); std::process::exit(0); }
                 other => { eprintln!("Unknown argument: {other}"); print_help(); std::process::exit(1); }
             }
@@ -157,7 +160,7 @@ fn print_help() {
     println!("rich-triplet — LLM from scratch in Rust");
     println!();
     println!("USAGE:");
-    println!("  rich-triplet                          Run autograd benchmark");
+    println!("  rich-triplet --benchmark              Run scalar-vs-tensor autograd benchmark");
     println!("  rich-triplet --prompt TEXT            Train on corpus, then generate");
     println!("  rich-triplet --prompt TEXT \\");
     println!("               --weights DIR \\");
@@ -183,6 +186,7 @@ fn print_help() {
     println!("  --seed S                 RNG seed                    [default: 42]");
     println!("  --train-steps N          Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");
+    println!("  --benchmark              Run scalar-vs-tensor autograd benchmark");
     println!("  --pretokenize S D        Tokenize text file S, write binary D.bin");
     println!("                           Uses char tokenizer built from S.");
     println!("                           For BPE: also pass --vocab and --merges.");
@@ -395,8 +399,21 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // Benchmark mode (default)
+    // Benchmark mode
     // -------------------------------------------------------------------------
+    if args.benchmark {
+        run_benchmark(args.train_steps);
+        return;
+    }
+
+    print_help();
+}
+
+// =============================================================================
+// Benchmark mode — scalar autograd vs tensor autodiff
+// =============================================================================
+
+fn run_benchmark(train_steps: usize) {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║        Rich Triplet — LLM from scratch in Rust              ║");
     println!("║        Scalar autograd  vs  Tensor autodiff benchmark       ║");
@@ -425,7 +442,6 @@ fn main() {
         n_heads: 2,
     };
 
-    let train_steps = args.train_steps;
     let eval_interval = (train_steps / 5).max(1);
 
     // =========================================================================
