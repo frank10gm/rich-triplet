@@ -532,6 +532,30 @@ impl Gemma3Model {
         }
         self.lm_head.quantize();
     }
+
+    /// Quantize all projection weights to INT4 and free the f32 copies.
+    ///
+    /// Use this instead of `quantize_for_inference()` when you only need
+    /// inference (no training).  Frees ~75% of weight RAM: f32 → INT4 is 8×
+    /// smaller, and the f32 copy is dropped so peak usage stays low.
+    pub fn quantize_inference_free_f32(&mut self) {
+        eprintln!("[ Gemma3 ] Quantizing weights to INT4 and freeing f32 copies...");
+        let n_layers = self.layers.len();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.self_attn.q_proj.quantize_and_free_f32();
+            layer.self_attn.k_proj.quantize_and_free_f32();
+            layer.self_attn.v_proj.quantize_and_free_f32();
+            layer.self_attn.o_proj.quantize_and_free_f32();
+            layer.mlp.gate_proj.quantize_and_free_f32();
+            layer.mlp.up_proj.quantize_and_free_f32();
+            layer.mlp.down_proj.quantize_and_free_f32();
+            if (i + 1) % 8 == 0 || i + 1 == n_layers {
+                eprintln!("[ Gemma3 ] Quantized {}/{} layers", i + 1, n_layers);
+            }
+        }
+        self.lm_head.quantize_and_free_f32();
+        eprintln!("[ Gemma3 ] Quantization done.");
+    }
 }
 
 // ============================================================================
@@ -743,7 +767,9 @@ impl Gemma3KvCache {
     pub fn new(config: &Config4) -> Self {
         let nkv = config.num_key_value_heads;
         let d   = config.head_dim;
-        let max = config.max_position_embeddings;
+        // Cap at 2048 tokens for typical generation — the full 32768 would
+        // pre-allocate ~7 GB for Gemma3-4b before any token is processed.
+        let max = config.max_position_embeddings.min(2048);
         let layers = (0..config.num_hidden_layers)
             .map(|_| RefCell::new(Gemma3LayerKvCache::new(nkv, d, max)))
             .collect();

@@ -159,6 +159,16 @@ impl Linear2 {
         self.q4_weight = Some(Q4Mat::quantize(&self.weight.data().clone()));
     }
 
+    /// Quantize to INT4 and free the f32 weight (inference-only).
+    ///
+    /// Replaces the f32 weight with a zero-sized placeholder to reclaim RAM.
+    /// Do NOT call this if you need backward passes (training).
+    pub fn quantize_and_free_f32(&mut self) {
+        self.q4_weight = Some(Q4Mat::quantize(&self.weight.data().clone()));
+        // Replace f32 weight with an empty mat to free ~4× memory.
+        self.weight.set_data(Mat::zeros(0, 0));
+    }
+
     /// input: [T, in_features]  →  output: [T, out_features]
     pub fn forward(&self, input: &TensorNode) -> TensorNode {
         self.fused_linear(input)
