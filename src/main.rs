@@ -11,6 +11,7 @@ mod nn2;
 mod transformer2;
 mod train2;
 mod transformer3;
+mod transformer4;
 #[cfg(feature = "metal")]
 mod metal_ops;
 
@@ -84,12 +85,16 @@ today yesterday tomorrow now always never often rarely
 struct CliArgs {
     /// --prompt TEXT     : text to complete (triggers generation mode)
     prompt:      Option<String>,
-    /// --weights DIR     : directory with .safetensors shards for GPT-OSS
+    /// --weights DIR     : directory with .safetensors shards (GPT-OSS or Gemma 3)
     weights:     Option<String>,
-    /// --vocab PATH      : BPE vocab.json (required with --weights)
+    /// --vocab PATH      : BPE vocab.json (required with --weights for GPT-OSS)
     vocab:       Option<String>,
-    /// --merges PATH     : BPE merges.txt (required with --weights)
+    /// --merges PATH     : BPE merges.txt (required with --weights for GPT-OSS)
     merges:      Option<String>,
+    /// --tokenizer-model PATH : SentencePiece .model file (required with --weights for Gemma 3)
+    tokenizer_model: Option<String>,
+    /// --model NAME      : which architecture to use (gpt-oss | gemma3-1b | gemma3-4b)
+    model:       Option<String>,
     /// --max-new N       : tokens to generate (default 200)
     max_new:     usize,
     /// --temp T          : sampling temperature (default 0.8)
@@ -113,6 +118,7 @@ impl CliArgs {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut a = CliArgs {
             prompt: None, weights: None, vocab: None, merges: None,
+            tokenizer_model: None, model: None,
             max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
             seed: 42, train_steps: 200, checkpoint: None,
             pretokenize: None,
@@ -123,7 +129,9 @@ impl CliArgs {
                 "--prompt"      => { i += 1; if i < args.len() { a.prompt      = Some(args[i].clone()); } }
                 "--weights"     => { i += 1; if i < args.len() { a.weights     = Some(args[i].clone()); } }
                 "--vocab"       => { i += 1; if i < args.len() { a.vocab       = Some(args[i].clone()); } }
-                "--merges"      => { i += 1; if i < args.len() { a.merges      = Some(args[i].clone()); } }
+                "--merges"           => { i += 1; if i < args.len() { a.merges           = Some(args[i].clone()); } }
+                "--tokenizer-model"  => { i += 1; if i < args.len() { a.tokenizer_model  = Some(args[i].clone()); } }
+                "--model"            => { i += 1; if i < args.len() { a.model            = Some(args[i].clone()); } }
                 "--max-new"     => { i += 1; if i < args.len() { a.max_new     = args[i].parse().unwrap_or(200); } }
                 "--temp"        => { i += 1; if i < args.len() { a.temperature = args[i].parse().unwrap_or(0.8); } }
                 "--top-k"       => { i += 1; if i < args.len() { a.top_k       = args[i].parse().unwrap_or(40); } }
@@ -155,23 +163,29 @@ fn print_help() {
     println!("               --weights DIR \\");
     println!("               --vocab vocab.json \\");
     println!("               --merges merges.txt      Load GPT-OSS weights, generate");
+    println!("  rich-triplet --prompt TEXT \\");
+    println!("               --weights DIR \\");
+    println!("               --tokenizer-model tokenizer.model \\");
+    println!("               --model gemma3-1b           Load Gemma 3 weights, generate");
     println!("  rich-triplet --pretokenize SRC DST    Tokenize SRC text file → DST .bin");
     println!();
     println!("OPTIONS:");
-    println!("  --prompt TEXT        Prompt text to complete");
-    println!("  --weights DIR        Directory with .safetensors shards (GPT-OSS)");
-    println!("  --vocab PATH         BPE vocab.json (required with --weights)");
-    println!("  --merges PATH        BPE merges.txt (required with --weights)");
-    println!("  --max-new N          Tokens to generate          [default: 200]");
-    println!("  --temp T             Sampling temperature        [default: 0.8]");
-    println!("  --top-k K            Top-K cutoff (0=disabled)   [default: 40]");
-    println!("  --top-p P            Nucleus probability         [default: 1.0]");
-    println!("  --seed S             RNG seed                    [default: 42]");
-    println!("  --train-steps N      Training steps (no-weights) [default: 200]");
-    println!("  --checkpoint PATH    Load saved .ckpt instead of training");
-    println!("  --pretokenize S D    Tokenize text file S, write binary D.bin");
-    println!("                       Uses char tokenizer built from S.");
-    println!("                       For BPE: also pass --vocab and --merges.");
+    println!("  --prompt TEXT            Prompt text to complete");
+    println!("  --weights DIR            Directory with .safetensors shards");
+    println!("  --vocab PATH             BPE vocab.json      (GPT-OSS)");
+    println!("  --merges PATH            BPE merges.txt      (GPT-OSS)");
+    println!("  --tokenizer-model PATH   SentencePiece .model (Gemma 3)");
+    println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b");
+    println!("  --max-new N              Tokens to generate          [default: 200]");
+    println!("  --temp T                 Sampling temperature        [default: 0.8]");
+    println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
+    println!("  --top-p P                Nucleus probability         [default: 1.0]");
+    println!("  --seed S                 RNG seed                    [default: 42]");
+    println!("  --train-steps N          Training steps (no-weights) [default: 200]");
+    println!("  --checkpoint PATH        Load saved .ckpt instead of training");
+    println!("  --pretokenize S D        Tokenize text file S, write binary D.bin");
+    println!("                           Uses char tokenizer built from S.");
+    println!("                           For BPE: also pass --vocab and --merges.");
 }
 
 // =============================================================================
@@ -220,6 +234,56 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
     std::io::stdout().flush().ok();
 
     model.generate_with_params_streaming(&token_ids, args.max_new, &params, |tok_id| {
+        let text = tok.decode(&[tok_id as u32]);
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+    });
+    println!();
+}
+
+// =============================================================================
+// Generation mode — Gemma 3 with loaded weights
+// =============================================================================
+
+fn run_gemma3(args: &CliArgs, prompt: &str) {
+    use std::io::Write;
+    use tokenizer::SentencePieceTokenizer;
+    use transformer4::{Gemma3Model, Config4};
+
+    let weights_dir = args.weights.as_deref().unwrap();
+    let tok_path = args.tokenizer_model.as_deref()
+        .expect("--tokenizer-model required with Gemma 3 (path to tokenizer.model)");
+    let model_name = args.model.as_deref().unwrap_or("gemma3-1b");
+
+    eprintln!("[ Gemma3 ] Loading tokenizer from {}...", tok_path);
+    let tok = SentencePieceTokenizer::from_model_file(tok_path)
+        .expect("failed to load SentencePiece tokenizer");
+    eprintln!("[ Gemma3 ] Vocab size: {}", tok.vocab_size());
+
+    let config = match model_name {
+        "gemma3-4b" => Config4::gemma3_4b(),
+        _           => Config4::gemma3_1b(),  // default
+    };
+    eprintln!("[ Gemma3 ] Building {} model ({} layers, hidden={})...",
+        model_name, config.num_hidden_layers, config.hidden_size);
+
+    let mut rng = InitRng::new(0);
+    let mut model = Gemma3Model::new(config, &mut rng);
+
+    eprintln!("[ Gemma3 ] Loading weights from {}...", weights_dir);
+    model.load_weights_from_dir(weights_dir)
+        .expect("failed to load weights");
+
+    let token_ids: Vec<usize> = tok.encode(prompt).iter().map(|&id| id as usize).collect();
+    if token_ids.is_empty() {
+        eprintln!("Error: prompt encodes to zero tokens");
+        std::process::exit(1);
+    }
+
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+
+    model.generate_streaming(&token_ids, args.max_new, args.temperature, args.top_k, args.seed, |tok_id| {
         let text = tok.decode(&[tok_id as u32]);
         print!("{}", text);
         std::io::stdout().flush().ok();
@@ -318,7 +382,11 @@ fn main() {
     // Generation mode
     // -------------------------------------------------------------------------
     if let Some(ref prompt) = args.prompt.clone() {
-        if args.weights.is_some() {
+        let is_gemma3 = args.tokenizer_model.is_some()
+            || args.model.as_deref().map_or(false, |m| m.starts_with("gemma3"));
+        if is_gemma3 {
+            run_gemma3(&args, prompt);
+        } else if args.weights.is_some() {
             run_gpt_oss(&args, prompt);
         } else {
             run_gpt2_generate(&args, prompt);

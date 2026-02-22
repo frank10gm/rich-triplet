@@ -131,6 +131,22 @@ impl Linear2 {
         }
     }
 
+    /// Create a Linear layer without bias (bias is fixed at zero, not a parameter).
+    ///
+    /// Used by architectures like Gemma 3 that have no bias in projection layers.
+    pub fn new_no_bias(in_features: usize, out_features: usize, rng: &mut InitRng) -> Self {
+        let w_data = Mat::new(rng.normal_vec(out_features * in_features, 0.02),
+                              out_features, in_features);
+        let b_data = Mat::zeros(1, out_features);
+        Linear2 {
+            weight: TensorNode::leaf(w_data),
+            bias:   TensorNode::leaf(b_data),
+            in_features,
+            out_features,
+            q4_weight: None,
+        }
+    }
+
     /// Quantize the weight matrix to 4-bit and store it.
     ///
     /// After calling this, `forward()` uses the INT4 path (`matmul_q4_t`)
@@ -299,6 +315,7 @@ impl Module2 for Mlp2 {
 pub struct RmsNorm2 {
     pub gamma: TensorNode,  // [1, d_model]  — initialized to ones
     pub d_model: usize,
+    pub eps: f32,
 }
 
 impl RmsNorm2 {
@@ -306,12 +323,21 @@ impl RmsNorm2 {
         RmsNorm2 {
             gamma: TensorNode::leaf(Mat::ones(1, d_model)),
             d_model,
+            eps: 1e-5,
+        }
+    }
+
+    pub fn new_with_eps(d_model: usize, eps: f32) -> Self {
+        RmsNorm2 {
+            gamma: TensorNode::leaf(Mat::ones(1, d_model)),
+            d_model,
+            eps,
         }
     }
 
     /// x: [T, d_model]  →  normalized: [T, d_model]
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        x.rms_norm(&self.gamma, 1e-5)
+        x.rms_norm(&self.gamma, self.eps)
     }
 }
 
