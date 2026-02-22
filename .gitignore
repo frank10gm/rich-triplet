@@ -5,3 +5,4 @@ thumbs.db
 # Added by cargo
 
 /target
+/models
