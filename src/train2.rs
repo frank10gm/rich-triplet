@@ -27,7 +27,7 @@
 ///
 /// On a typical CPU (no GPU), expect 50-200x speedup for our nano model.
 
-use crate::autograd2::{TensorNode, Mat};
+use crate::autograd2::{TensorNode, Mat, save_checkpoint};
 use crate::nn2::Module2;
 
 // =============================================================================
@@ -225,6 +225,10 @@ pub struct TrainConfig2 {
     /// Typical: 0.1.  Replaces the one-hot target with:
     ///   y_smooth[v] = (1 - ε) * one_hot[v] + ε / vocab_size
     pub label_smoothing: f32,
+    /// If Some(path), save a binary checkpoint after training completes.
+    /// The file is written by `save_checkpoint` and can be reloaded with
+    /// `load_checkpoint`.  None = don't save (default).
+    pub checkpoint_path: Option<String>,
 }
 
 impl Default for TrainConfig2 {
@@ -236,6 +240,7 @@ impl Default for TrainConfig2 {
             grad_clip: 1.0,
             accumulate_steps: 1,
             label_smoothing: 0.0,
+            checkpoint_path: None,
         }
     }
 }
@@ -377,6 +382,23 @@ pub fn train2(
     }
 
     println!("{:-<65}", "");
+
+    // ---- 11. Checkpoint save ----
+    if let Some(ref path) = cfg.checkpoint_path {
+        let params_final = model.parameters();
+        let named: Vec<(String, &TensorNode)> = params_final.iter()
+            .enumerate()
+            .map(|(i, p)| (format!("param_{}", i), p))
+            .collect();
+        let named_refs: Vec<(&str, &TensorNode)> = named.iter()
+            .map(|(n, p)| (n.as_str(), *p))
+            .collect();
+        match save_checkpoint(path, &named_refs) {
+            Ok(()) => println!("[checkpoint] Saved {} tensors to {}", named_refs.len(), path),
+            Err(e) => eprintln!("[checkpoint] Failed to save {}: {}", path, e),
+        }
+    }
+
     last_loss
 }
 
@@ -762,6 +784,7 @@ mod tests {
             grad_clip: 1.0,
             accumulate_steps: 1,
             label_smoothing: 0.0,
+            checkpoint_path: None,
         };
 
         train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
@@ -800,6 +823,7 @@ mod tests {
             grad_clip: 1.0,
             accumulate_steps: 1,
             label_smoothing: 0.1,
+            checkpoint_path: None,
         };
         let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite() && loss > 0.0,
@@ -825,6 +849,7 @@ mod tests {
             grad_clip: 1.0,
             accumulate_steps: 2,
             label_smoothing: 0.0,
+            checkpoint_path: None,
         };
         let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite(), "training with grad accumulation should be finite");

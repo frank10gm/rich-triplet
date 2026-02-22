@@ -1679,6 +1679,33 @@ impl TensorNode {
         out
     }
 
+    /// Element-wise clamp to [min_val, max_val].
+    ///
+    /// Used in SwiGLU with `swiglu_limit=7.0` (GPT-OSS config): clamps the gate
+    /// pre-activation before SiLU to prevent saturation in early training.
+    ///
+    /// Backward: gradient passes through where input was in range, zero otherwise.
+    pub fn clamp(&self, min_val: f32, max_val: f32) -> TensorNode {
+        let x = self.data().clone();
+        let out_data = Mat::from_fn(x.rows, x.cols, |r, c| x.at(r, c).clamp(min_val, max_val));
+        let out = TensorNode::leaf(out_data);
+
+        let self_c = self.clone();
+        let out_c  = out.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout   = out_c.0.borrow().grad.clone();
+            let x_data = self_c.0.borrow().data.clone();
+            let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
+                let v = x_data.at(r, c);
+                if v > min_val && v < max_val { dout.at(r, c) } else { 0.0 }
+            });
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone()];
+        out
+    }
+
     /// Element-wise multiplication of two same-shape TensorNodes.
     ///
     /// Used in SwiGLU: hidden = SiLU(gate) * up

@@ -1,12 +1,12 @@
 # Rich Triplet — LLM from scratch in Rust
 
-A complete GPT-style language model built from first principles in Rust, **with no ML dependencies**. Every component — matrix math, automatic differentiation, attention, AdamW optimizer — is written from scratch as a learning exercise.
+A complete GPT-style language model built from first principles in Rust, **with no ML dependencies**. Every component — matrix math, automatic differentiation, attention, AdamW optimizer — is written from scratch.
 
 ---
 
 ## What this project is
 
-An **educational implementation**, not a production tool. The goal is to understand *why* deep learning frameworks like PyTorch work the way they do, by building all the same pieces by hand:
+A full LLM stack in Rust, covering two complete transformer implementations (GPT-2 and GPT-OSS), a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, and a CLI for inference. Every component is built from scratch:
 
 | File | What you understand after writing it |
 |---|---|
@@ -59,7 +59,20 @@ Replace the `CORPUS` constant in `src/main.rs` with your own text, then run:
 cargo run --release -- --prompt "your prompt here" --train-steps 2000
 ```
 
-This trains on `CORPUS`, then generates a completion for the prompt. The model uses a character tokenizer, so any UTF-8 text works with no preprocessing.
+This trains on `CORPUS`, then generates a completion for the prompt. The model uses a character tokenizer so any UTF-8 text works with no preprocessing.
+
+To save the trained weights for later use:
+
+```rust
+let cfg = TrainConfig2 {
+    max_steps: 2000,
+    checkpoint_path: Some("model.ckpt".to_string()),
+    ..TrainConfig2::default()
+};
+train2(&model, &tokenizer, &train_data, &val_data, &cfg);
+```
+
+Reload with `load_checkpoint("model.ckpt")` — returns a `Vec<(String, Mat)>` that can be applied back to any model with matching parameter count.
 
 You can also tune the model size directly in `src/main.rs`:
 
@@ -73,7 +86,7 @@ let config = Config {
 };
 ```
 
-At `d_model=256, n_layers=6` you have ~10M parameters — still trainable on CPU overnight, and capable of producing coherent sentences.
+At `d_model=256, n_layers=6` you have ~10M parameters — trainable on CPU overnight.
 
 ---
 
@@ -273,3 +286,5 @@ w -= lr · 0.1 · w             (weight decay)
 - Zero ML dependencies
 - 203× measured speedup from tensor autodiff
 - Flash Attention: O(T) memory vs O(T²) for standard attention
+- SwiGLU clamp (configurable per model, 7.0 for GPT-OSS)
+- Checkpoint save/load for trained weights

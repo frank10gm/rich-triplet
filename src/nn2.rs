@@ -277,6 +277,9 @@ pub struct SwiGluMlp2 {
     pub gate_proj: Linear2,   // d_model → intermediate_size
     pub up_proj:   Linear2,   // d_model → intermediate_size
     pub down_proj: Linear2,   // intermediate_size → d_model
+    /// Clamp the gate pre-activation to [-clamp, clamp] before SiLU.
+    /// GPT-OSS uses 7.0; set to f32::INFINITY to disable (default).
+    pub swiglu_clamp: f32,
 }
 
 impl SwiGluMlp2 {
@@ -285,15 +288,28 @@ impl SwiGluMlp2 {
             gate_proj: Linear2::new(d_model, intermediate_size, rng),
             up_proj:   Linear2::new(d_model, intermediate_size, rng),
             down_proj: Linear2::new(intermediate_size, d_model, rng),
+            swiglu_clamp: f32::INFINITY,
         }
+    }
+
+    pub fn new_with_clamp(d_model: usize, intermediate_size: usize, clamp: f32, rng: &mut InitRng) -> Self {
+        let mut mlp = Self::new(d_model, intermediate_size, rng);
+        mlp.swiglu_clamp = clamp;
+        mlp
     }
 
     /// x: [T, d_model]  →  output: [T, d_model]
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        let gate   = self.gate_proj.forward(x).silu();   // SiLU(x @ W_gate)
-        let up     = self.up_proj.forward(x);             // x @ W_up
-        let hidden = gate.mul_elem_node(&up);             // element-wise product
-        self.down_proj.forward(&hidden)                   // hidden @ W_down
+        let gate_pre = self.gate_proj.forward(x);
+        // Apply clamp before SiLU when swiglu_clamp is finite (GPT-OSS uses 7.0).
+        let gate = if self.swiglu_clamp.is_finite() {
+            gate_pre.clamp(-self.swiglu_clamp, self.swiglu_clamp).silu()
+        } else {
+            gate_pre.silu()
+        };
+        let up     = self.up_proj.forward(x);
+        let hidden = gate.mul_elem_node(&up);
+        self.down_proj.forward(&hidden)
     }
 }
 

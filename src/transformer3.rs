@@ -1,45 +1,36 @@
 /// # GPT-OSS Architecture (transformer3)
 ///
 /// This file implements the GPT-OSS architecture from OpenAI (August 2025),
-/// using the five new features that differentiate it from GPT-2:
+/// using the five architectural features that differentiate it from GPT-2:
 ///
 /// | Feature          | GPT-2 (transformer2.rs)      | GPT-OSS (this file)             |
 /// |------------------|------------------------------|---------------------------------|
 /// | Normalization    | LayerNorm (mean + variance)  | RMSNorm (RMS only, no beta)     |
-/// | Position enc.    | Learned absolute embeddings  | RoPE (rotary, relative)         |
+/// | Position enc.    | Learned absolute embeddings  | RoPE + YaRN scaling             |
 /// | Attention        | Standard multi-head          | Grouped Multi-Query (GQA)       |
 /// | FFN activation   | GELU                         | SwiGLU (gated, 3 projections)   |
 /// | FFN structure    | Single dense layer           | Mixture of Experts (MoE)        |
 ///
-/// ## Inference only
+/// All ops have full backward_fn implementations — gradients flow through
+/// RMSNorm, RoPE, GQA, SwiGLU, and MoE. The architecture can be trained
+/// end-to-end at small scale (e.g. hidden_size=256, num_layers=4) using
+/// `train2()`.  For gpt-oss-20b (21B parameters) inference only is practical.
 ///
-/// This implementation is **forward-pass only**. The new ops (RMSNorm, RoPE,
-/// SiLU, GQA) don't register backward_fn — gradients don't flow through them.
+/// ## Running GPT-OSS-20b inference
 ///
-/// This is intentional: GPT-OSS-20b has 21B parameters. Training it in this
-/// codebase is not feasible (no GPU, no batching, no quantization). The purpose
-/// of this file is to define the correct architecture so that pretrained weights
-/// can eventually be loaded and used for inference.
+/// 1. Download weights: huggingface.co/openai/gpt-oss-20b (.safetensors shards)
+/// 2. Run: `cargo run --release -- --prompt "..." --weights /path/to/weights/ \`
+///         `--vocab vocab.json --merges merges.txt`
 ///
-/// ## How to get from this code to running GPT-OSS-20b
-///
-/// 1. Add the `safetensors` crate to Cargo.toml
-/// 2. Download weights from huggingface.co/openai/gpt-oss-20b
-/// 3. Write a loader that reads each tensor by name and calls `param.set_data()`
-///    on the matching field in this struct
-/// 4. Call `model.generate()` with a text prompt
-///
-/// The weight name mapping would look like:
-///   "model.embed_tokens.weight"          → model.embed_tokens
+/// Weight names map directly:
+///   "model.embed_tokens.weight"              → model.embed_tokens
 ///   "model.layers.0.self_attn.q_proj.weight" → model.layers[0].self_attn.q_proj.weight
 ///   etc.
 ///
 /// ## What is NOT implemented
 ///
-/// - YaRN RoPE scaling (extends context beyond 4096 tokens; basic RoPE only)
-/// - Sliding window attention (alternating with full attention; full only here)
-/// - MXFP4 quantization (4-bit weights; f32 only here)
-/// - The `swiglu_limit=7.0` clamping from the config (minor regularization detail)
+/// - Sliding window attention (alternating with full attention; full attention only)
+/// - MXFP4 quantization (4-bit weights; f32 only)
 
 use crate::autograd2::{TensorNode, Mat, Q4Mat};
 use crate::nn::InitRng;
@@ -217,6 +208,11 @@ pub struct Config3 {
 
     /// RMSNorm epsilon (1e-5 for gpt-oss-20b)
     pub rms_norm_eps: f32,
+
+    /// Clamp applied to SwiGLU gate pre-activation before SiLU.
+    /// GPT-OSS uses 7.0 to prevent saturation early in training.
+    /// Set to f32::INFINITY to disable (use for custom models that don't need it).
+    pub swiglu_limit: f32,
 }
 
 impl Config3 {
@@ -234,6 +230,7 @@ impl Config3 {
             max_position_embeddings: 131072,
             rope_theta: 150000.0,
             rms_norm_eps: 1e-5,
+            swiglu_limit: 7.0,
         }
     }
 
@@ -251,6 +248,7 @@ impl Config3 {
             max_position_embeddings: 131072,
             rope_theta: 150000.0,
             rms_norm_eps: 1e-5,
+            swiglu_limit: 7.0,
         }
     }
 
@@ -529,7 +527,7 @@ impl MoELayer {
     pub fn new(config: &Config3, rng: &mut InitRng) -> Self {
         let router = Linear2::new(config.hidden_size, config.num_local_experts, rng);
         let experts = (0..config.num_local_experts)
-            .map(|_| SwiGluMlp2::new(config.hidden_size, config.intermediate_size, rng))
+            .map(|_| SwiGluMlp2::new_with_clamp(config.hidden_size, config.intermediate_size, config.swiglu_limit, rng))
             .collect();
         MoELayer {
             router,
@@ -1953,6 +1951,7 @@ mod tests {
             max_position_embeddings: 128,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
+            swiglu_limit: 7.0,
         }
     }
 
