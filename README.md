@@ -61,18 +61,29 @@ cargo run --release -- --prompt "your prompt here" --train-steps 2000
 
 This trains on `CORPUS`, then generates a completion for the prompt. The model uses a character tokenizer so any UTF-8 text works with no preprocessing.
 
-To save the trained weights for later use:
+To save the trained weights and resume later:
 
 ```rust
 let cfg = TrainConfig2 {
     max_steps: 2000,
     checkpoint_path: Some("model.ckpt".to_string()),
+    early_stopping_patience: 5,   // stop if val loss doesn't improve for 5 evals
     ..TrainConfig2::default()
 };
 train2(&model, &tokenizer, &train_data, &val_data, &cfg);
 ```
 
-Reload with `load_checkpoint("model.ckpt")` — returns a `Vec<(String, Mat)>` that can be applied back to any model with matching parameter count.
+Resume from the checkpoint without retraining:
+
+```bash
+cargo run --release -- --prompt "your prompt" --checkpoint model.ckpt
+```
+
+Or from code:
+
+```rust
+restore_checkpoint("model.ckpt", &model.parameters()).unwrap();
+```
 
 You can also tune the model size directly in `src/main.rs`:
 
@@ -121,6 +132,7 @@ The model streams tokens to stdout as they are generated. The weight loader supp
 | `--top-p P` | 1.0 | Nucleus probability (1.0 = disabled) |
 | `--seed S` | 42 | RNG seed |
 | `--train-steps N` | 200 | Training steps (no-weights mode) |
+| `--checkpoint PATH` | — | Load saved `.ckpt` instead of training |
 
 ---
 
@@ -287,4 +299,6 @@ w -= lr · 0.1 · w             (weight decay)
 - 203× measured speedup from tensor autodiff
 - Flash Attention: O(T) memory vs O(T²) for standard attention
 - SwiGLU clamp (configurable per model, 7.0 for GPT-OSS)
-- Checkpoint save/load for trained weights
+- Checkpoint save/load + resume via `--checkpoint`
+- Early stopping on validation loss (`early_stopping_patience`)
+- O(T) generation via KV cache (both GPT-2 and GPT-OSS)

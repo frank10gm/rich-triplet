@@ -1056,6 +1056,39 @@ pub fn load_checkpoint(path: &str) -> Result<Vec<(String, Mat)>, String> {
     Ok(tensors)
 }
 
+/// Restore model parameters from a checkpoint file.
+///
+/// Loads the checkpoint at `path` and applies each tensor to the matching
+/// parameter in `params` by position (index order must match the order used
+/// when saving).  Shape mismatches are reported as errors.
+///
+/// ## Example
+/// ```ignore
+/// let params = model.parameters();
+/// restore_checkpoint("model.ckpt", &params)?;
+/// ```
+pub fn restore_checkpoint(path: &str, params: &[TensorNode]) -> Result<(), String> {
+    let tensors = load_checkpoint(path)?;
+    if tensors.len() != params.len() {
+        return Err(format!(
+            "restore_checkpoint: checkpoint has {} tensors but model has {} parameters",
+            tensors.len(), params.len()
+        ));
+    }
+    for (i, ((name, mat), param)) in tensors.iter().zip(params.iter()).enumerate() {
+        let p_data = param.data();
+        if mat.rows != p_data.rows || mat.cols != p_data.cols {
+            return Err(format!(
+                "restore_checkpoint: tensor {} ('{}') shape [{},{}] does not match parameter shape [{},{}]",
+                i, name, mat.rows, mat.cols, p_data.rows, p_data.cols
+            ));
+        }
+        drop(p_data);
+        param.set_data(mat.clone());
+    }
+    Ok(())
+}
+
 // =============================================================================
 // TensorNode — one node in the computation graph, holding a full matrix
 // =============================================================================

@@ -675,6 +675,86 @@ impl Gpt2 {
         }
         generated
     }
+
+    /// Autoregressive generation with KV cache and streaming callback — O(T) per step.
+    ///
+    /// Like `generate_cached` but supports top-k sampling and calls `callback`
+    /// for each generated token, allowing streaming output.
+    ///
+    /// - `temperature <= 0` → greedy argmax
+    /// - `top_k == 0`       → full-vocabulary sampling
+    pub fn generate_cached_streaming<F>(
+        &self,
+        token_ids: &[usize],
+        max_new: usize,
+        temperature: f32,
+        top_k: usize,
+        mut callback: F,
+    ) where F: FnMut(usize) {
+        let cache = Gpt2KvCache::new(&self.config);
+
+        // Prefill: run full prompt through the cache
+        let t_prompt = token_ids.len();
+        let mut x = self.embed.forward(token_ids);
+        for (bi, block) in self.blocks.iter().enumerate() {
+            x = block_forward_cached(block, &x, &mut cache.blocks[bi].borrow_mut());
+        }
+        let first_logits = self.lm_head.forward(&self.ln_final.forward(&x));
+        let mut prev_tok = gpt2_sample_token_topk(&first_logits.data(), t_prompt - 1, temperature, top_k);
+        callback(prev_tok);
+
+        // Decode: one token at a time using the cache
+        for _ in 1..max_new {
+            let x = self.embed.forward(&[prev_tok]);
+            let mut x2 = x;
+            for (bi, block) in self.blocks.iter().enumerate() {
+                x2 = block_forward_cached(block, &x2, &mut cache.blocks[bi].borrow_mut());
+            }
+            let logits = self.lm_head.forward(&self.ln_final.forward(&x2));
+            prev_tok = gpt2_sample_token_topk(&logits.data(), 0, temperature, top_k);
+            callback(prev_tok);
+        }
+    }
+}  // end impl Gpt2
+
+/// Temperature + top-k sampler for Gpt2 generation.
+fn gpt2_sample_token_topk(logits: &Mat, pos: usize, temperature: f32, top_k: usize) -> usize {
+    let v = logits.cols;
+    if temperature <= 0.0 {
+        return (0..v).max_by(|&a, &b|
+            logits.at(pos, a).partial_cmp(&logits.at(pos, b)).unwrap()
+        ).unwrap();
+    }
+    let row_max = (0..v).map(|c| logits.at(pos, c)).fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = (0..v)
+        .map(|c| ((logits.at(pos, c) - row_max) / temperature).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for p in &mut probs { *p /= sum; }
+
+    // Top-k filter
+    let k = if top_k == 0 { v } else { top_k.min(v) };
+    let mut sorted = probs.clone();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let threshold = sorted[k - 1];
+    let mut filtered: Vec<f32> = probs.iter().map(|&p| if p >= threshold { p } else { 0.0 }).collect();
+    let fsum: f32 = filtered.iter().sum();
+    if fsum > 0.0 { for p in &mut filtered { *p /= fsum; } }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(54321);
+    let seed = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rand_val = {
+        let s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 33) as f32 / (u32::MAX as f32)
+    };
+    let mut cumsum = 0.0f32;
+    for (i, &p) in filtered.iter().enumerate() {
+        cumsum += p;
+        if rand_val <= cumsum { return i; }
+    }
+    filtered.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i).unwrap_or(0)
 }
 
 /// Simple temperature sampler for Gpt2 generation (greedy or argmax).

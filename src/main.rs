@@ -18,7 +18,8 @@ use dataset::TextDataset;
 use transformer::{Config, Gpt};
 use train::{TrainConfig, train, generate};
 use transformer2::Gpt2;
-use train2::{TrainConfig2, train2, generate2};
+use train2::{TrainConfig2, train2};
+use autograd2::restore_checkpoint;
 use transformer3::{GptOssModel, Config3, SamplingParams};
 use nn::InitRng;
 
@@ -100,6 +101,8 @@ struct CliArgs {
     seed:        u64,
     /// --train-steps N   : steps for on-the-fly training (default 200)
     train_steps: usize,
+    /// --checkpoint PATH : load a previously saved .ckpt before generating (skips training)
+    checkpoint: Option<String>,
 }
 
 impl CliArgs {
@@ -108,7 +111,7 @@ impl CliArgs {
         let mut a = CliArgs {
             prompt: None, weights: None, vocab: None, merges: None,
             max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
-            seed: 42, train_steps: 200,
+            seed: 42, train_steps: 200, checkpoint: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -122,8 +125,9 @@ impl CliArgs {
                 "--top-k"       => { i += 1; if i < args.len() { a.top_k       = args[i].parse().unwrap_or(40); } }
                 "--top-p"       => { i += 1; if i < args.len() { a.top_p       = args[i].parse().unwrap_or(1.0); } }
                 "--seed"        => { i += 1; if i < args.len() { a.seed        = args[i].parse().unwrap_or(42); } }
-                "--train-steps" => { i += 1; if i < args.len() { a.train_steps = args[i].parse().unwrap_or(200); } }
-                "--help" | "-h" => { print_help(); std::process::exit(0); }
+                "--train-steps"  => { i += 1; if i < args.len() { a.train_steps = args[i].parse().unwrap_or(200); } }
+                "--checkpoint"   => { i += 1; if i < args.len() { a.checkpoint  = Some(args[i].clone()); } }
+                "--help" | "-h"  => { print_help(); std::process::exit(0); }
                 other => { eprintln!("Unknown argument: {other}"); print_help(); std::process::exit(1); }
             }
             i += 1;
@@ -154,6 +158,7 @@ fn print_help() {
     println!("  --top-p P            Nucleus probability         [default: 1.0]");
     println!("  --seed S             RNG seed                    [default: 42]");
     println!("  --train-steps N      Training steps (no-weights) [default: 200]");
+    println!("  --checkpoint PATH    Load saved .ckpt instead of training");
 }
 
 // =============================================================================
@@ -231,22 +236,35 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
         n_heads: 4,
     };
 
-    eprintln!("[ Train ] vocab={} context={} steps={}", vocab_size, context_length, args.train_steps);
-
     let mut rng = InitRng::new(42);
     let model = Gpt2::new(model_config, &mut rng);
 
-    let cfg = TrainConfig2 {
-        max_steps:     args.train_steps,
-        eval_interval: args.train_steps / 5,
-        learning_rate: 3e-3,
-        grad_clip:     1.0,
-        ..TrainConfig2::default()
-    };
-    train2(&model, &tokenizer, &train_data, &val_data, &cfg);
+    if let Some(ref ckpt_path) = args.checkpoint {
+        eprintln!("[ Load ] Restoring from checkpoint: {}", ckpt_path);
+        use nn2::Module2;
+        restore_checkpoint(ckpt_path, &model.parameters())
+            .expect("failed to restore checkpoint");
+    } else {
+        eprintln!("[ Train ] vocab={} context={} steps={}", vocab_size, context_length, args.train_steps);
+        let cfg = TrainConfig2 {
+            max_steps:     args.train_steps,
+            eval_interval: args.train_steps / 5,
+            learning_rate: 3e-3,
+            grad_clip:     1.0,
+            ..TrainConfig2::default()
+        };
+        train2(&model, &tokenizer, &train_data, &val_data, &cfg);
+    }
 
-    // generate2 encodes the prompt internally, prints prompt + continuation to stdout.
-    generate2(&model, &tokenizer, prompt, args.max_new, args.temperature, args.top_k);
+    // Stream tokens using the KV cache (O(T) per step instead of O(T²)).
+    let token_ids: Vec<usize> = tokenizer.encode(prompt).iter().map(|&x| x as usize).collect();
+    let token_ids = if token_ids.is_empty() { vec![0usize] } else { token_ids };
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+    model.generate_cached_streaming(&token_ids, args.max_new, args.temperature, args.top_k, |tok_id| {
+        print!("{}", tokenizer.decode(&[tok_id as u32]));
+        std::io::stdout().flush().ok();
+    });
     println!();
 }
 
@@ -364,8 +382,16 @@ fn main() {
     let t_tensor = t_tensor_start.elapsed();
 
     println!("\n[ Generation — tensor model ]");
-    generate2(&tensor_model, &tokenizer, "Il ", 80, 0.8, 5);
-    generate2(&tensor_model, &tokenizer, "The ", 80, 0.8, 5);
+    for prompt_str in &["Il ", "The "] {
+        use std::io::Write;
+        let ids: Vec<usize> = tokenizer.encode(prompt_str).iter().map(|&x| x as usize).collect();
+        print!("{}", prompt_str);
+        tensor_model.generate_cached_streaming(&ids, 80, 0.8, 5, |tok_id| {
+            print!("{}", tokenizer.decode(&[tok_id as u32]));
+            std::io::stdout().flush().ok();
+        });
+        println!();
+    }
 
     // =========================================================================
     // Benchmark summary

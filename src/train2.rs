@@ -229,6 +229,9 @@ pub struct TrainConfig2 {
     /// The file is written by `save_checkpoint` and can be reloaded with
     /// `load_checkpoint`.  None = don't save (default).
     pub checkpoint_path: Option<String>,
+    /// Stop training early if val loss does not improve for this many eval
+    /// intervals.  0 = disabled (default).  Typical value: 5.
+    pub early_stopping_patience: usize,
 }
 
 impl Default for TrainConfig2 {
@@ -241,6 +244,7 @@ impl Default for TrainConfig2 {
             accumulate_steps: 1,
             label_smoothing: 0.0,
             checkpoint_path: None,
+            early_stopping_patience: 0,
         }
     }
 }
@@ -302,6 +306,8 @@ pub fn train2(
     let mut last_loss = f32::INFINITY;
     let mut last_acc = 0.0f32;
     let accum = cfg.accumulate_steps.max(1);
+    let mut best_val_loss = f32::INFINITY;
+    let mut patience_counter = 0usize;
 
     for step in 0..cfg.max_steps {
         // ---- 1. Update learning rate ----
@@ -378,6 +384,20 @@ pub fn train2(
                 display_step, display_total,
                 optimizer.lr, last_loss, val_loss, last_acc, grad_norm
             );
+
+            // Early stopping
+            if cfg.early_stopping_patience > 0 {
+                if val_loss < best_val_loss {
+                    best_val_loss = val_loss;
+                    patience_counter = 0;
+                } else {
+                    patience_counter += 1;
+                    if patience_counter >= cfg.early_stopping_patience {
+                        println!("[early stop] val loss has not improved for {} evals, stopping.", patience_counter);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -785,6 +805,7 @@ mod tests {
             accumulate_steps: 1,
             label_smoothing: 0.0,
             checkpoint_path: None,
+            early_stopping_patience: 0,
         };
 
         train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
@@ -824,6 +845,7 @@ mod tests {
             accumulate_steps: 1,
             label_smoothing: 0.1,
             checkpoint_path: None,
+            early_stopping_patience: 0,
         };
         let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite() && loss > 0.0,
@@ -850,6 +872,7 @@ mod tests {
             accumulate_steps: 2,
             label_smoothing: 0.0,
             checkpoint_path: None,
+            early_stopping_patience: 0,
         };
         let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite(), "training with grad accumulation should be finite");
