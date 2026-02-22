@@ -6,50 +6,18 @@ A complete GPT-style language model built from first principles in Rust, **with 
 
 ## What this project is
 
-This is an **educational implementation**, not a production tool. The goal was to understand *why* deep learning frameworks like PyTorch work the way they do, by building all the same pieces by hand:
+An **educational implementation**, not a production tool. The goal is to understand *why* deep learning frameworks like PyTorch work the way they do, by building all the same pieces by hand:
 
-| Layer | What you understand after writing it |
+| File | What you understand after writing it |
 |---|---|
 | `tensor.rs` | Row-major storage, matmul, softmax |
 | `autograd.rs` | The chain rule as a computation graph, Rc/RefCell ownership |
 | `autograd2.rs` | Why PyTorch is fast: matrix VJPs instead of scalar VJPs |
-| `nn.rs` / `nn2.rs` | Linear layers, GELU, LayerNorm from first principles |
-| `transformer.rs` / `transformer2.rs` | Q/K/V attention, causal masking, residual connections |
+| `nn.rs` / `nn2.rs` | Linear layers, GELU, RMSNorm, SwiGLU from first principles |
+| `transformer.rs` / `transformer2.rs` | Q/K/V attention, causal masking, Flash Attention |
+| `transformer3.rs` | GPT-OSS: RoPE, GQA, Mixture of Experts |
 | `train.rs` / `train2.rs` | AdamW, gradient clipping, autoregressive generation |
-
-The project contains **two full implementations** of the same model:
-- `*scalar*` — one node per weight element (~29,000 nodes for a nano model)
-- `*tensor*` — one node per weight matrix (~50 nodes for the same model)
-
-Running both side by side demonstrates the **203x speedup** that tensor-level autodiff gives you — the exact same insight that motivates why PyTorch, JAX, and every modern framework operate on tensors, not scalars.
-
----
-
-## Can my model actually generate text?
-
-**Yes — and no.** Here is the honest answer:
-
-### What it CAN do
-
-- Train on any UTF-8 text file and generate new text that follows its style
-- Learn character-level patterns, word boundaries, punctuation
-- Show measurable loss reduction (from ~4.0 at random init to ~2.5–3.0 after training)
-- Generate text that "looks like" the training data at the character level
-
-### What it CANNOT do (and why)
-
-The nano model we run has **29,494 parameters**. For comparison:
-
-| Model | Parameters | What it can do |
-|---|---|---|
-| This model (nano) | 29K | Learn character patterns in a small corpus |
-| GPT-2 small | 117M | Coherent paragraphs, follows instructions loosely |
-| GPT-2 XL | 1.5B | Strong text generation, knowledge |
-| GPT-4 | ~1T (estimated) | Reasoning, code, multilingual |
-
-A 29K parameter model trained on a ~2,000 character corpus for 200 steps will produce text that *looks statistically like* the training data but is not coherent prose. This is expected and intentional — the point was to watch the loss go down, not to write a novel.
-
-**The gap between "loss decreasing" and "useful text" is mostly just scale**: more parameters, more data, more training steps. The architecture and math are identical.
+| `metal_ops.rs` | Tiled GPU kernels in Metal Shading Language |
 
 ---
 
@@ -59,7 +27,7 @@ A 29K parameter model trained on a ~2,000 character corpus for 200 steps will pr
 cargo run --release
 ```
 
-This runs both the scalar and tensor models for 200 training steps on the built-in bilingual corpus, then prints a timing comparison. Expected output:
+Trains both the scalar and tensor models for 200 steps on the built-in bilingual corpus, prints a timing comparison:
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -69,7 +37,9 @@ This runs both the scalar and tensor models for 200 training steps on the built-
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
-Both models reach the same loss values — they are mathematically identical. Only the graph representation differs.
+Both models reach the same loss values — mathematically identical, different graph representation.
+
+---
 
 ## Running tests
 
@@ -77,97 +47,110 @@ Both models reach the same loss values — they are mathematically identical. On
 cargo test
 ```
 
-119 tests covering every component: matrix ops, gradient correctness (verified numerically with finite differences), attention shapes, loss values, training convergence.
+271 tests covering every component: matrix ops, gradient correctness (verified numerically with finite differences), attention shapes, Flash Attention correctness, Flash Attention gradients, GPT-OSS architecture shapes, sampling strategies.
 
 ---
 
 ## Training on your own text
 
-Open `src/main.rs` and replace the `CORPUS` constant with your own text:
+Replace the `CORPUS` constant in `src/main.rs` with your own text, then run:
 
-```rust
-const CORPUS: &str = "
-    Your text here. The more text, the better the model learns.
-    A few thousand characters is the minimum to see anything interesting.
-    A few hundred thousand characters starts to produce coherent patterns.
-";
+```bash
+cargo run --release -- --prompt "your prompt here" --train-steps 2000
 ```
 
-You can also adjust the model size in the config:
+This trains on `CORPUS`, then generates a completion for the prompt. The model uses a character tokenizer, so any UTF-8 text works with no preprocessing.
+
+You can also tune the model size directly in `src/main.rs`:
 
 ```rust
 let config = Config {
     vocab_size: tokenizer.vocab_size(),
-    context_length: 64,    // how many characters the model sees at once
+    context_length: 64,    // tokens the model sees at once
     d_model: 128,          // embedding dimension (higher = more capacity)
-    n_layers: 4,           // number of transformer blocks
-    n_heads: 4,            // number of attention heads (must divide d_model)
+    n_layers: 4,           // transformer blocks
+    n_heads: 4,            // attention heads (must divide d_model)
 };
 ```
 
-And the training duration:
-
-```rust
-let train_cfg = TrainConfig2 {
-    max_steps: 2000,       // more steps = better training
-    eval_interval: 100,
-    learning_rate: 3e-4,
-    grad_clip: 1.0,
-};
-```
-
-**Warning**: the tensor model (`train2`) is fast enough for hundreds of thousands of steps on CPU. The scalar model (`train`) is for demonstration only — it is ~200x slower.
+At `d_model=256, n_layers=6` you have ~10M parameters — still trainable on CPU overnight, and capable of producing coherent sentences.
 
 ---
 
-## What Path C means — using this as understanding
+## Running GPT-OSS inference
 
-Path C was described as: *use what you built as understanding, then connect to a real framework.*
+If you have pretrained GPT-OSS weights (`.safetensors` shards) and a BPE tokenizer:
 
-Concretely, now that you have written every layer by hand, you could:
-
-### Option 1 — Use Candle (Hugging Face's Rust ML framework)
-
-[Candle](https://github.com/huggingface/candle) is Rust-native, GPU-capable, and has the same conceptual structure as what you built. You can load real GPT-2 weights and run inference:
-
-```toml
-# Cargo.toml
-[dependencies]
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
+```bash
+cargo run --release -- \
+  --prompt "The sky above the port" \
+  --weights /path/to/weights/ \
+  --vocab  /path/to/vocab.json \
+  --merges /path/to/merges.txt \
+  --max-new 200 \
+  --temp 0.8 \
+  --top-k 40
 ```
+
+The model streams tokens to stdout as they are generated. The weight loader supports F32, BF16, and F16 shards with full GPT-OSS tensor name mapping.
+
+### All CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--prompt TEXT` | — | Text to complete (required for generation) |
+| `--weights DIR` | — | Directory with `.safetensors` shards (GPT-OSS) |
+| `--vocab PATH` | — | `vocab.json` (required with `--weights`) |
+| `--merges PATH` | — | `merges.txt` (required with `--weights`) |
+| `--max-new N` | 200 | Tokens to generate |
+| `--temp T` | 0.8 | Sampling temperature |
+| `--top-k K` | 40 | Top-K cutoff (0 = disabled) |
+| `--top-p P` | 1.0 | Nucleus probability (1.0 = disabled) |
+| `--seed S` | 42 | RNG seed |
+| `--train-steps N` | 200 | Training steps (no-weights mode) |
+
+---
+
+## Apple Metal GPU acceleration
+
+On Apple Silicon, matrix multiplications are dispatched to the GPU automatically:
+
+```bash
+cargo run --release --features metal
+```
+
+The Metal backend uses a tiled kernel with `threadgroup` shared memory (16×16 tiles), giving 3–5× speedup over the scalar CPU path for large matrices. Matrices below 32,768 elements fall back to CPU to avoid dispatch overhead.
+
+```bash
+cargo test --features metal    # 276 tests (5 additional Metal-specific tests)
+```
+
+---
+
+## Training a custom model with the GPT-OSS architecture
+
+The GPT-OSS building blocks (RMSNorm, RoPE, SwiGLU, GQA, MoE) all have full backward passes — gradients flow through all of them. You can train a small custom model using them:
 
 ```rust
-// Load GPT-2 from HuggingFace Hub and run inference
-// Every layer in Candle maps 1:1 to what you built:
-//   candle_nn::Linear    ↔   your Linear2
-//   candle_nn::LayerNorm ↔   your LayerNorm2
-//   causal_attention     ↔   your causal_attention()
+// src/transformer3.rs — use a tiny config instead of gpt_oss_20b()
+let config = Config3 {
+    vocab_size: tokenizer.vocab_size(),
+    hidden_size: 256,
+    num_hidden_layers: 4,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,   // GQA: 4 Q heads share each KV head
+    intermediate_size: 512,
+    num_local_experts: 4,
+    experts_per_token: 2,
+    max_position_embeddings: 512,
+    rope_theta: 10000.0,
+    rms_norm_eps: 1e-5,
+    swiglu_limit: 7.0,
+};
+let mut rng = InitRng::new(42);
+let model = GptOssModel::new(config, &mut rng);
+// then pass to train2() as usual
 ```
-
-Because you built those layers yourself, reading Candle's source code is straightforward — no magic.
-
-### Option 2 — Scale up this model
-
-The current architecture is correct GPT. You can scale it by:
-
-1. Increasing `d_model` to 256 or 512
-2. Increasing `n_layers` to 6–12
-3. Training on a large text file (Project Gutenberg, Wikipedia dump, etc.)
-4. Training for 10,000–100,000 steps
-
-At `d_model=256, n_layers=6`, you have ~10M parameters — still trainable on CPU overnight, and capable of producing coherent sentences in a single language.
-
-### Option 3 — Load pretrained GPT-2 weights into this model
-
-The `transformer2.rs` architecture is structurally compatible with GPT-2 small (same layer order, same weight shapes). You could:
-
-1. Download GPT-2 weights (available from HuggingFace)
-2. Write a weight loader that maps HuggingFace tensor names to your `TensorNode` leaves
-3. Use your own `generate2()` function for inference
-
-This would give you a working ~117M parameter model running in your own code.
 
 ---
 
@@ -175,24 +158,24 @@ This would give you a working ~117M parameter model running in your own code.
 
 ```
 src/
-├── tensor.rs        Phase 1 — Basic tensor math (Tensor struct, matmul, softmax)
+├── tensor.rs        Phase 1 — Basic tensor math (Mat struct, matmul, softmax)
 ├── tokenizer.rs     Phase 1 — Character tokenizer + BPE tokenizer
 ├── dataset.rs       Phase 1 — Sliding window dataset, train/val split
 │
 ├── autograd.rs      Phase 2 — Scalar automatic differentiation (Value nodes)
 ├── nn.rs            Phase 2 — Scalar neural network layers
 ├── transformer.rs   Phase 3 — Scalar GPT model (slow, educational)
-├── train.rs         Phase 4+5 — Scalar AdamW + generation
+├── train.rs         Phase 4 — Scalar AdamW + generation
 │
-├── autograd2.rs     Path A — Tensor-level autodiff (Mat + TensorNode)
-├── nn2.rs           Path A — Tensor-level layers (Linear2, LayerNorm2, Mlp2)
-├── transformer2.rs  Path A — Tensor-level GPT (Gpt2)
-├── train2.rs        Path A — Tensor-level AdamW + generation
+├── autograd2.rs     Tensor autodiff — Mat-level VJPs, Flash Attention, RoPE, GQA
+├── nn2.rs           Tensor layers — Linear2, LayerNorm2, RmsNorm2, SwiGluMlp2
+├── transformer2.rs  GPT-2 architecture (trains end-to-end)
+├── train2.rs        Tensor AdamW + streaming generation
+├── transformer3.rs  GPT-OSS architecture (RoPE, GQA, MoE)
 │
-└── main.rs          Benchmark: scalar vs tensor, 200 steps each
+├── metal_ops.rs     Apple Metal GPU backend (tiled matmul kernel)
+└── main.rs          CLI entry point + benchmark
 ```
-
-The scalar (`Phase 2–5`) and tensor (`Path A`) stacks are independent. Each has its own tests. The scalar stack exists purely to demonstrate what the tensor stack optimizes.
 
 ---
 
@@ -201,8 +184,8 @@ The scalar (`Phase 2–5`) and tensor (`Path A`) stacks are independent. Each ha
 ### Automatic differentiation
 
 ```
-Forward:  loss = f(weights)      — build computation graph
-Backward: ∂loss/∂weights         — walk graph in reverse, apply chain rule
+Forward:  loss = f(weights)   — build computation graph
+Backward: ∂loss/∂weights      — walk graph in reverse, apply chain rule
 ```
 
 The scalar engine (`autograd.rs`) creates one node per number. The tensor engine (`autograd2.rs`) creates one node per matrix operation. Both use the same topological sort + reverse traversal algorithm.
@@ -210,12 +193,26 @@ The scalar engine (`autograd.rs`) creates one node per number. The tensor engine
 ### Matrix VJPs (why the tensor engine is fast)
 
 ```
-Scalar:  ∂(a·b)/∂a = b                   (one scalar op)
+Scalar:  ∂(a·b)/∂a = b                   (one scalar multiply)
 Tensor:  ∂(A@B)/∂A = ∂L/∂C @ B.T        (one matmul)
          ∂(A@B)/∂B = A.T @ ∂L/∂C        (one matmul)
 ```
 
-A matmul node's backward replaces `rows × cols × inner_dim` scalar multiply-adds with two matrix multiplications that the CPU can vectorize.
+A matmul node's backward replaces `rows × cols × inner_dim` scalar ops with two matrix multiplications the CPU can vectorize.
+
+### Flash Attention (Dao et al. 2022)
+
+Standard attention materializes a `T×T` score matrix. Flash Attention never does — it tiles Q in blocks of 64 and accumulates the output with an online softmax, using only O(T) memory:
+
+```
+For each tile of Q (size BLOCK_R):
+  For each tile of K,V (size BLOCK_C):
+    Compute scores for this tile
+    Update running max m and normalizer l (online softmax)
+    Accumulate weighted V into output
+```
+
+The backward pass recomputes softmax weights from the stored `(l, m)` vectors rather than storing the full attention matrix.
 
 ### Causal self-attention
 
@@ -224,12 +221,39 @@ Q = x @ W_Q    [T, d_head]
 K = x @ W_K    [T, d_head]
 V = x @ W_V    [T, d_head]
 scores = Q @ K.T / sqrt(d_head)    [T, T]
-scores[t, s] = -inf  for s > t     (can't look at future tokens)
+scores[t, s] = -inf  for s > t     (causal mask)
 weights = softmax(scores)           [T, T]
 output = weights @ V                [T, d_head]
 ```
 
-Each token "attends" to all past tokens. The causal mask enforces that the model can only predict the *next* token, not copy future tokens.
+### RoPE (Rotary Position Embeddings)
+
+Instead of adding learned position vectors, RoPE rotates Q and K by an angle that depends on position. Two adjacent dimensions form a rotation pair:
+
+```
+For each pair (x_{2i}, x_{2i+1}) at position t:
+  angle = t / theta^(2i / d_head)
+  x'_{2i}   = x_{2i}   * cos(angle) - x_{2i+1} * sin(angle)
+  x'_{2i+1} = x_{2i+1} * cos(angle) + x_{2i}   * sin(angle)
+```
+
+This makes attention scores depend only on the *relative* distance between tokens, which generalizes better to long contexts.
+
+### Grouped Multi-Query Attention (GQA)
+
+Instead of one K and V head per Q head, GQA uses fewer KV heads shared across groups of Q heads. With `n_q_heads=64` and `n_kv_heads=8`, each KV head is shared by 8 Q heads — 8× less KV cache memory at inference time.
+
+### Mixture of Experts (MoE)
+
+Instead of one dense FFN per layer, MoE has N expert FFNs and a router that picks the top-K for each token:
+
+```
+router_logits = x @ W_router          [T, num_experts]
+weights = softmax(top_k(router_logits))
+output = sum_k(weight_k * expert_k(x))
+```
+
+GPT-OSS uses 32 experts, 4 active per token — 8× more total parameters, same compute per token.
 
 ### AdamW
 
@@ -237,16 +261,15 @@ Each token "attends" to all past tokens. The causal mask enforces that the model
 m = 0.9·m + 0.1·grad          (smooth gradient direction)
 v = 0.999·v + 0.001·grad²     (track gradient magnitude)
 w -= lr · (m/(1-0.9ᵗ)) / (√(v/(1-0.999ᵗ)) + 1e-8)
-w -= lr · 0.1 · w             (weight decay: pull toward zero)
+w -= lr · 0.1 · w             (weight decay)
 ```
-
-The adaptive learning rate (dividing by √v) means parameters with large/noisy gradients get smaller effective updates — stable training without manual tuning.
 
 ---
 
 ## Stats
 
-- ~7,000 lines of Rust
-- 119 tests (all passing)
+- ~15,000 lines of Rust
+- 271 tests (276 with `--features metal`)
 - Zero ML dependencies
-- 203x measured speedup from tensor autodiff
+- 203× measured speedup from tensor autodiff
+- Flash Attention: O(T) memory vs O(T²) for standard attention
