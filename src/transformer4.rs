@@ -259,7 +259,7 @@ impl Gemma3Mlp {
     }
 
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        let gate = self.gate_proj.forward(x).gelu_tanh();
+        let gate = self.gate_proj.forward(x).silu();
         let up   = self.up_proj.forward(x);
         let hidden = gate.mul_elem_node(&up);
         self.down_proj.forward(&hidden)
