@@ -43,6 +43,22 @@ pub trait Module2 {
 }
 
 // =============================================================================
+// Trait: Trainable — anything train2() can optimise
+// =============================================================================
+
+/// A model that can be trained with `train2()`.
+///
+/// Both `Gpt2` (transformer2) and `GptOssModel` (transformer3) implement
+/// this trait, so the same training loop works for both architectures.
+pub trait Trainable: Module2 {
+    /// Compute logits: token_ids → [T, vocab_size]
+    fn forward_tokens(&self, token_ids: &[usize]) -> TensorNode;
+
+    /// Compute cross-entropy loss: scalar TensorNode with backward wired.
+    fn loss_tokens(&self, token_ids: &[usize], targets: &[usize]) -> TensorNode;
+}
+
+// =============================================================================
 // Linear layer
 // =============================================================================
 //

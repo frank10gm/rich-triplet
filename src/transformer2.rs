@@ -27,7 +27,7 @@
 
 use crate::autograd2::{TensorNode, Mat};
 use crate::nn::InitRng;
-use crate::nn2::{Linear2, LayerNorm2, Mlp2, Module2};
+use crate::nn2::{Linear2, LayerNorm2, Mlp2, Module2, Trainable};
 use std::cell::RefCell;
 
 // =============================================================================
@@ -426,6 +426,11 @@ impl Module2 for Gpt2 {
         p.extend(self.lm_head.parameters());
         p
     }
+}
+
+impl Trainable for Gpt2 {
+    fn forward_tokens(&self, token_ids: &[usize]) -> TensorNode { self.forward(token_ids) }
+    fn loss_tokens(&self, token_ids: &[usize], targets: &[usize]) -> TensorNode { self.loss(token_ids, targets) }
 }
 
 impl Gpt2 {

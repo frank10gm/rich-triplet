@@ -37,7 +37,7 @@
 
 use crate::autograd2::{TensorNode, Mat, Q4Mat};
 use crate::nn::InitRng;
-use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2};
+use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2, Trainable};
 use std::cell::RefCell;
 
 // =============================================================================
@@ -2039,6 +2039,11 @@ impl Module2 for GptOssModel {
         p.extend(self.lm_head.parameters());
         p
     }
+}
+
+impl Trainable for GptOssModel {
+    fn forward_tokens(&self, token_ids: &[usize]) -> TensorNode { self.forward(token_ids) }
+    fn loss_tokens(&self, token_ids: &[usize], targets: &[usize]) -> TensorNode { self.loss(token_ids, targets) }
 }
 
 impl GptOssModel {

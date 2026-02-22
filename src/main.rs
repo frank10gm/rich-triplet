@@ -103,6 +103,8 @@ struct CliArgs {
     train_steps: usize,
     /// --checkpoint PATH : load a previously saved .ckpt before generating (skips training)
     checkpoint: Option<String>,
+    /// --pretokenize SRC DST : tokenize SRC text file → DST .bin file, then exit
+    pretokenize: Option<(String, String)>,
 }
 
 impl CliArgs {
@@ -112,6 +114,7 @@ impl CliArgs {
             prompt: None, weights: None, vocab: None, merges: None,
             max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
             seed: 42, train_steps: 200, checkpoint: None,
+            pretokenize: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -127,6 +130,11 @@ impl CliArgs {
                 "--seed"        => { i += 1; if i < args.len() { a.seed        = args[i].parse().unwrap_or(42); } }
                 "--train-steps"  => { i += 1; if i < args.len() { a.train_steps = args[i].parse().unwrap_or(200); } }
                 "--checkpoint"   => { i += 1; if i < args.len() { a.checkpoint  = Some(args[i].clone()); } }
+                "--pretokenize"  => {
+                    i += 1; let src = if i < args.len() { args[i].clone() } else { String::new() };
+                    i += 1; let dst = if i < args.len() { args[i].clone() } else { String::new() };
+                    a.pretokenize = Some((src, dst));
+                }
                 "--help" | "-h"  => { print_help(); std::process::exit(0); }
                 other => { eprintln!("Unknown argument: {other}"); print_help(); std::process::exit(1); }
             }
@@ -146,6 +154,7 @@ fn print_help() {
     println!("               --weights DIR \\");
     println!("               --vocab vocab.json \\");
     println!("               --merges merges.txt      Load GPT-OSS weights, generate");
+    println!("  rich-triplet --pretokenize SRC DST    Tokenize SRC text file → DST .bin");
     println!();
     println!("OPTIONS:");
     println!("  --prompt TEXT        Prompt text to complete");
@@ -159,6 +168,9 @@ fn print_help() {
     println!("  --seed S             RNG seed                    [default: 42]");
     println!("  --train-steps N      Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH    Load saved .ckpt instead of training");
+    println!("  --pretokenize S D    Tokenize text file S, write binary D.bin");
+    println!("                       Uses char tokenizer built from S.");
+    println!("                       For BPE: also pass --vocab and --merges.");
 }
 
 // =============================================================================
@@ -253,7 +265,7 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
             grad_clip:     1.0,
             ..TrainConfig2::default()
         };
-        train2(&model, &tokenizer, &train_data, &val_data, &cfg);
+        train2(&model, &train_data, &val_data, &cfg);
     }
 
     // Stream tokens using the KV cache (O(T) per step instead of O(T²)).
@@ -270,6 +282,36 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
 
 fn main() {
     let args = CliArgs::parse();
+
+    // -------------------------------------------------------------------------
+    // Pretokenize mode: tokenize a text file → binary .bin corpus
+    // -------------------------------------------------------------------------
+    if let Some((ref src, ref dst)) = args.pretokenize {
+        use dataset::TokenizedDataset;
+        eprintln!("[pretokenize] Reading: {}", src);
+        eprintln!("[pretokenize] Output:  {}", dst);
+
+        let n_tokens = if args.vocab.is_some() && args.merges.is_some() {
+            // BPE tokenizer
+            let tok = BpeTokenizer::from_files(
+                args.vocab.as_deref().unwrap(),
+                args.merges.as_deref().unwrap(),
+            ).expect("failed to load BPE tokenizer");
+            TokenizedDataset::write_bin_from_file(dst, src, &tok)
+                .expect("pretokenize failed")
+        } else {
+            // Char tokenizer — read full file to build vocab, then re-tokenize line-by-line
+            let text = std::fs::read_to_string(src)
+                .expect("cannot read source file");
+            let tok = CharTokenizer::from_text(&text);
+            eprintln!("[pretokenize] Char vocab size: {}", tok.vocab_size());
+            TokenizedDataset::write_bin(dst, &text, &tok)
+                .expect("pretokenize failed")
+        };
+
+        eprintln!("[pretokenize] Done: {} tokens → {}", n_tokens, dst);
+        return;
+    }
 
     // -------------------------------------------------------------------------
     // Generation mode
@@ -378,7 +420,7 @@ fn main() {
     };
 
     let t_tensor_start = std::time::Instant::now();
-    train2(&tensor_model, &tokenizer, &train_data, &val_data, &tensor_cfg);
+    train2(&tensor_model, &train_data, &val_data, &tensor_cfg);
     let t_tensor = t_tensor_start.elapsed();
 
     println!("\n[ Generation — tensor model ]");

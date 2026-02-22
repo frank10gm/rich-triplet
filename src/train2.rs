@@ -28,7 +28,7 @@
 /// On a typical CPU (no GPU), expect 50-200x speedup for our nano model.
 
 use crate::autograd2::{TensorNode, Mat, save_checkpoint};
-use crate::nn2::Module2;
+use crate::nn2::{Module2, Trainable};
 
 // =============================================================================
 // AdamW2 — same algorithm as AdamW, but over TensorNode parameters
@@ -253,9 +253,7 @@ impl Default for TrainConfig2 {
 // Training loop
 // =============================================================================
 
-use crate::transformer2::Gpt2;
-use crate::tokenizer::CharTokenizer;
-use crate::dataset::TextDataset;
+use crate::dataset::DataSource;
 
 /// Compute token-level accuracy: fraction of positions where argmax(logits) == target.
 ///
@@ -275,14 +273,14 @@ pub fn token_accuracy(logits: &Mat, targets: &[usize]) -> f32 {
     correct as f32 / t as f32
 }
 
-/// Run the full training loop on a Gpt2 model.
+/// Run the full training loop on any model that implements `Trainable`.
 ///
+/// Works with `Gpt2` (transformer2) and `GptOssModel` (transformer3).
 /// Returns the final training loss.
-pub fn train2(
-    model: &Gpt2,
-    _tokenizer: &CharTokenizer,
-    train_data: &TextDataset,
-    val_data: &TextDataset,
+pub fn train2<T: Trainable, D: DataSource>(
+    model: &T,
+    train_data: &D,
+    val_data: &D,
     cfg: &TrainConfig2,
 ) -> f32 {
     let params = model.parameters();
@@ -319,13 +317,11 @@ pub fn train2(
         }
 
         // ---- 3. Sample one training example ----
-        let (inp_t, tgt_t) = train_data.random_batch(1, step as u64 + 1);
-        let token_ids:  Vec<usize> = inp_t.data.iter().map(|&x| x as usize).collect();
-        let target_ids: Vec<usize> = tgt_t.data.iter().map(|&x| x as usize).collect();
+        let (token_ids, target_ids) = train_data.sample(step as u64 + 1);
 
         // ---- 4. Forward + loss ----
         // Build loss TensorNode (needed for backward)
-        let loss = model.loss(&token_ids, &target_ids);
+        let loss = model.loss_tokens(&token_ids, &target_ids);
 
         // ---- 5. NaN/Inf guard — skip step if loss is not finite ----
         let loss_val = loss.data().at(0, 0);
@@ -336,7 +332,7 @@ pub fn train2(
 
         // Compute metrics (logits already computed inside model.loss — re-run forward for metrics)
         {
-            let logits_node = model.forward(&token_ids);
+            let logits_node = model.forward_tokens(&token_ids);
             let logits = logits_node.data();
             last_loss = cross_entropy_smoothed(&logits, &target_ids, cfg.label_smoothing);
             last_acc  = token_accuracy(&logits, &target_ids);
@@ -459,14 +455,12 @@ fn cross_entropy_smoothed(logits: &Mat, targets: &[usize], smoothing: f32) -> f3
     total / t as f32
 }
 
-fn estimate_loss2(model: &Gpt2, data: &TextDataset, n_samples: usize) -> f32 {
+fn estimate_loss2<T: Trainable, D: DataSource>(model: &T, data: &D, n_samples: usize) -> f32 {
     let mut total = 0.0f32;
     for i in 0..n_samples {
-        let (inp_t, tgt_t) = data.random_batch(1, i as u64 + 9999);
-        let token_ids:  Vec<usize> = inp_t.data.iter().map(|&x| x as usize).collect();
-        let target_ids: Vec<usize> = tgt_t.data.iter().map(|&x| x as usize).collect();
+        let (token_ids, target_ids) = data.sample(i as u64 + 9999);
         for p in model.parameters() { p.zero_grad(); }
-        let loss = model.loss(&token_ids, &target_ids);
+        let loss = model.loss_tokens(&token_ids, &target_ids);
         total += loss.data().at(0, 0);
     }
     total / n_samples as f32
@@ -751,7 +745,7 @@ mod tests {
             early_stopping_patience: 0,
         };
 
-        train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
+        train2(&model, &train_ds, &val_ds, &cfg);
 
         let final_loss = {
             let ids: Vec<usize> = tokenizer.encode("abcabc").iter().map(|&x| x as usize).collect();
@@ -790,7 +784,7 @@ mod tests {
             checkpoint_path: None,
             early_stopping_patience: 0,
         };
-        let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
+        let loss = train2(&model, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite() && loss > 0.0,
             "training with label smoothing should produce finite loss, got {}", loss);
     }
@@ -817,7 +811,7 @@ mod tests {
             checkpoint_path: None,
             early_stopping_patience: 0,
         };
-        let loss = train2(&model, &tokenizer, &train_ds, &val_ds, &cfg);
+        let loss = train2(&model, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite(), "training with grad accumulation should be finite");
     }
 }
