@@ -358,7 +358,10 @@ pub struct Gemma3Model {
 
 impl Gemma3Model {
     pub fn new(cfg: Config4, rng: &mut InitRng) -> Self {
-        let embed = TensorNode::leaf(Mat::zeros(cfg.vocab_size, cfg.hidden_size));
+        let embed = TensorNode::leaf(Mat::new(
+            rng.normal_vec(cfg.vocab_size * cfg.hidden_size, 0.02),
+            cfg.vocab_size, cfg.hidden_size,
+        ));
         let layers: Vec<Gemma3Block> = (0..cfg.num_hidden_layers)
             .map(|i| Gemma3Block::new(&cfg, i, rng))
             .collect();
@@ -366,7 +369,14 @@ impl Gemma3Model {
         // lm_head is weight-tied to embed_tokens in Gemma 3: they share the same
         // underlying data.  We represent this by cloning the TensorNode (which
         // shares the Arc-backed storage).
-        let lm_head = Linear2::new_no_bias(cfg.hidden_size, cfg.vocab_size, rng);
+        let b_data = Mat::zeros(1, cfg.vocab_size);
+        let lm_head = Linear2 {
+            weight: embed.clone(),
+            bias: TensorNode::leaf(b_data),
+            in_features: cfg.hidden_size,
+            out_features: cfg.vocab_size,
+            q4_weight: None,
+        };
 
         Gemma3Model { embed_tokens: embed, layers, norm, lm_head, config: cfg }
     }
