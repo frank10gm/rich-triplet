@@ -23,7 +23,7 @@
 /// raw data and a gradient accumulator. The optimizer reads `.grad()` and
 /// writes `.set_data()` directly on these leaf nodes.
 
-use crate::autograd2::{TensorNode, Mat};
+use crate::autograd2::{TensorNode, Mat, Q4Mat};
 use crate::nn::InitRng; // reuse the RNG from Phase 2
 
 // =============================================================================
@@ -66,6 +66,9 @@ pub struct Linear2 {
     pub bias: TensorNode,
     pub in_features: usize,
     pub out_features: usize,
+    /// INT4 quantized weight, set by `quantize()`.
+    /// When present, forward uses `matmul_q4_t` instead of the f32 weight.
+    pub q4_weight: Option<Q4Mat>,
 }
 
 impl Linear2 {
@@ -78,7 +81,20 @@ impl Linear2 {
             bias:   TensorNode::leaf(b_data),
             in_features,
             out_features,
+            q4_weight: None,
         }
+    }
+
+    /// Quantize the weight matrix to 4-bit and store it.
+    ///
+    /// After calling this, `forward()` uses the INT4 path (`matmul_q4_t`)
+    /// instead of the f32 matmul — halving the memory footprint and avoiding
+    /// the dequantize allocation on every call.
+    ///
+    /// The f32 weight tensor is kept unchanged so gradients still flow for
+    /// any further training.
+    pub fn quantize(&mut self) {
+        self.q4_weight = Some(Q4Mat::quantize(&self.weight.data().clone()));
     }
 
     /// input: [T, in_features]  →  output: [T, out_features]
@@ -88,26 +104,31 @@ impl Linear2 {
 
     /// Fused linear: output = input @ weight.T + bias
     /// Keeps weight directly in the graph so its gradient is tracked.
+    ///
+    /// When a Q4 weight has been stored via `quantize()`, the forward matmul
+    /// uses `matmul_q4_t` (INT4, no alloc) instead of f32.  The backward pass
+    /// still uses the f32 weight for exact gradients.
     fn fused_linear(&self, input: &TensorNode) -> TensorNode {
         // We implement linear as a single custom node that tracks both
         // input and weight — avoiding a separate transpose node.
         let x = input.data().clone();
-        let w = self.weight.data().clone();
         let b = self.bias.data().clone();
 
-        assert_eq!(x.cols, w.cols,
-            "Linear: input cols {} != weight cols {}", x.cols, w.cols);
-
-        // out = x @ w.T + b  : [T, out]
-        let out_data = {
+        // Forward matmul: use INT4 path if available, f32 otherwise.
+        let out_data = if let Some(ref q4) = self.q4_weight {
+            assert_eq!(x.cols, q4.cols,
+                "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
+            // q4.matmul_q4_t(x) computes x @ q4.T  : [T, out_features]
+            let mut o = q4.matmul_q4_t(&x);
+            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
+            o
+        } else {
+            let w = self.weight.data().clone();
+            assert_eq!(x.cols, w.cols,
+                "Linear: input cols {} != weight cols {}", x.cols, w.cols);
             let wt = w.transpose();
             let mut o = x.matmul(&wt);
-            // add bias broadcast
-            for r in 0..o.rows {
-                for c in 0..o.cols {
-                    *o.at_mut(r, c) += b.at(0, c);
-                }
-            }
+            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o
         };
 

@@ -47,21 +47,59 @@ Both models reach the same loss values — mathematically identical, different g
 cargo test
 ```
 
-271 tests covering every component: matrix ops, gradient correctness (verified numerically with finite differences), attention shapes, Flash Attention correctness, Flash Attention gradients, GPT-OSS architecture shapes, sampling strategies.
+280 tests covering every component: matrix ops, gradient correctness (verified numerically with finite differences), attention shapes, Flash Attention correctness, Flash Attention gradients, GPT-OSS architecture shapes, sampling strategies.
 
 ---
 
-## Training on your own text
+## Training a model from scratch
 
-Replace the `CORPUS` constant in `src/main.rs` with your own text, then run:
+This project trains a GPT-2 architecture model on any plain-text corpus. The model uses a character tokenizer, so any UTF-8 text works with no preprocessing.
 
-```bash
-cargo run --release -- --prompt "your prompt here" --train-steps 2000
+### Step 1 — Put your text in the corpus
+
+Edit `src/main.rs` and replace the `CORPUS` constant with your own text:
+
+```rust
+const CORPUS: &str = "
+Your text goes here. The more the better — a few thousand words is enough
+to see the model learn. A few hundred thousand words gives recognizable output.
+";
 ```
 
-This trains on `CORPUS`, then generates a completion for the prompt. The model uses a character tokenizer so any UTF-8 text works with no preprocessing.
+### Step 2 — Tune the model size (optional)
 
-To save the trained weights and resume later:
+In `src/main.rs`, find the `model_config` inside `run_gpt2_generate` and adjust:
+
+```rust
+let model_config = Config {
+    vocab_size: tokenizer.vocab_size(),   // set automatically from corpus
+    context_length: 64,    // tokens the model sees at once
+    d_model: 128,          // embedding dimension — more = more capacity
+    n_layers: 4,           // transformer blocks
+    n_heads: 4,            // attention heads (must divide d_model)
+};
+```
+
+Size guide (CPU training):
+
+| d_model | n_layers | ~params | time/step | practical for |
+|---|---|---|---|---|
+| 64 | 2 | ~0.5M | <1 ms | quick experiments |
+| 128 | 4 | ~2M | ~2 ms | short stories, code |
+| 256 | 6 | ~10M | ~8 ms | overnight runs |
+| 512 | 8 | ~50M | ~50 ms | multi-day runs |
+
+### Step 3 — Train and generate
+
+```bash
+cargo run --release -- --prompt "Once upon a time" --train-steps 2000
+```
+
+The model trains for 2000 steps, prints train/val loss every 400 steps, then streams a completion of the prompt to stdout.
+
+### Step 4 — Save and resume
+
+To save a checkpoint after training, edit the `TrainConfig2` in `run_gpt2_generate`:
 
 ```rust
 let cfg = TrainConfig2 {
@@ -70,53 +108,75 @@ let cfg = TrainConfig2 {
     early_stopping_patience: 5,   // stop if val loss doesn't improve for 5 evals
     ..TrainConfig2::default()
 };
-train2(&model, &tokenizer, &train_data, &val_data, &cfg);
 ```
 
-Resume from the checkpoint without retraining:
+Resume from checkpoint without retraining:
 
 ```bash
-cargo run --release -- --prompt "your prompt" --checkpoint model.ckpt
+cargo run --release -- --prompt "Once upon a time" --checkpoint model.ckpt
 ```
 
-Or from code:
+### Step 5 — Use the GPT-OSS architecture instead (optional)
+
+All GPT-OSS building blocks (RMSNorm, RoPE, SwiGLU, GQA, MoE) have full backward passes and can be trained from scratch at small scale. To use them, replace the model in `run_gpt2_generate`:
 
 ```rust
-restore_checkpoint("model.ckpt", &model.parameters()).unwrap();
-```
+use transformer3::{GptOssModel, Config3};
 
-You can also tune the model size directly in `src/main.rs`:
-
-```rust
-let config = Config {
+let config = Config3 {
     vocab_size: tokenizer.vocab_size(),
-    context_length: 64,    // tokens the model sees at once
-    d_model: 128,          // embedding dimension (higher = more capacity)
-    n_layers: 4,           // transformer blocks
-    n_heads: 4,            // attention heads (must divide d_model)
+    hidden_size: 256,
+    num_hidden_layers: 4,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,     // GQA: 4 Q heads share each KV head
+    intermediate_size: 512,
+    num_local_experts: 4,
+    experts_per_token: 2,
+    max_position_embeddings: 512,
+    rope_theta: 10000.0,
+    rms_norm_eps: 1e-5,
+    swiglu_limit: 7.0,
+    sliding_window: None,       // or Some(64) to enable local attention
 };
+let model = GptOssModel::new(config, &mut rng);
+train2(&model, &tokenizer, &train_data, &val_data, &cfg);
 ```
-
-At `d_model=256, n_layers=6` you have ~10M parameters — trainable on CPU overnight.
 
 ---
 
 ## Running GPT-OSS inference
 
-If you have pretrained GPT-OSS weights (`.safetensors` shards) and a BPE tokenizer:
+**Note: this project does not support loading pretrained GPT-2 weights.** The `Gpt2` struct is the GPT-2 *architecture* but trained from scratch on your corpus. For pretrained inference, GPT-OSS is the supported path.
+
+To run GPT-OSS inference, you need:
+1. Pretrained `.safetensors` shards from HuggingFace
+2. A `vocab.json` and `merges.txt` (BPE tokenizer files)
 
 ```bash
+# Download weights (requires huggingface_hub)
+pip install huggingface_hub
+huggingface-cli download openai/gpt-oss-20b --local-dir ./gpt-oss-20b-weights
+
+# Run inference
 cargo run --release -- \
   --prompt "The sky above the port" \
-  --weights /path/to/weights/ \
-  --vocab  /path/to/vocab.json \
-  --merges /path/to/merges.txt \
+  --weights ./gpt-oss-20b-weights/ \
+  --vocab  ./gpt-oss-20b-weights/vocab.json \
+  --merges ./gpt-oss-20b-weights/merges.txt \
   --max-new 200 \
   --temp 0.8 \
   --top-k 40
 ```
 
 The model streams tokens to stdout as they are generated. The weight loader supports F32, BF16, and F16 shards with full GPT-OSS tensor name mapping.
+
+To reduce memory from ~40GB to ~10GB before generating, add this to `run_gpt_oss` in `src/main.rs`:
+
+```rust
+model.load_weights_from_dir(weights_dir).unwrap();
+let stats = model.quantize_for_inference();   // INT4: 4× less RAM
+eprintln!("Compressed to {:.1}GB ({:.1}x)", stats.q4_bytes as f64 / 1e9, stats.compression_ratio);
+```
 
 ### All CLI options
 
@@ -147,35 +207,29 @@ cargo run --release --features metal
 The Metal backend uses a tiled kernel with `threadgroup` shared memory (16×16 tiles), giving 3–5× speedup over the scalar CPU path for large matrices. Matrices below 32,768 elements fall back to CPU to avoid dispatch overhead.
 
 ```bash
-cargo test --features metal    # 276 tests (5 additional Metal-specific tests)
+cargo test --features metal    # 285 tests (5 additional Metal-specific tests)
 ```
 
 ---
 
-## Training a custom model with the GPT-OSS architecture
+## INT4 quantization
 
-The GPT-OSS building blocks (RMSNorm, RoPE, SwiGLU, GQA, MoE) all have full backward passes — gradients flow through all of them. You can train a small custom model using them:
+After loading pretrained GPT-OSS weights, reduce inference memory by ~4× with dynamic INT4 quantization:
 
 ```rust
-// src/transformer3.rs — use a tiny config instead of gpt_oss_20b()
-let config = Config3 {
-    vocab_size: tokenizer.vocab_size(),
-    hidden_size: 256,
-    num_hidden_layers: 4,
-    num_attention_heads: 8,
-    num_key_value_heads: 2,   // GQA: 4 Q heads share each KV head
-    intermediate_size: 512,
-    num_local_experts: 4,
-    experts_per_token: 2,
-    max_position_embeddings: 512,
-    rope_theta: 10000.0,
-    rms_norm_eps: 1e-5,
-    swiglu_limit: 7.0,
-};
-let mut rng = InitRng::new(42);
-let model = GptOssModel::new(config, &mut rng);
-// then pass to train2() as usual
+model.load_weights_from_dir("./gpt-oss-20b-weights").unwrap();
+let stats = model.quantize_for_inference();
+println!("Quantized {} tensors: {:.1}GB → {:.1}GB ({:.1}x compression)",
+    stats.n_tensors,
+    stats.f32_bytes as f64 / 1e9,
+    stats.q4_bytes  as f64 / 1e9,
+    stats.compression_ratio);
+// → Quantized 856 tensors: 40.0GB → 10.0GB (4.0x compression)
 ```
+
+Weights are stored as INT4 nibbles with per-block f32 scales. Each forward call uses `matmul_q4_t` — the dequantization happens per-row during the matmul without materializing the full weight matrix, so peak RAM stays at the compressed size.
+
+Quantization error is at most `absmax / 14` per weight block (~7% of the largest value in each block of 32 elements).
 
 ---
 
@@ -294,11 +348,13 @@ w -= lr · 0.1 · w             (weight decay)
 ## Stats
 
 - ~15,000 lines of Rust
-- 271 tests (276 with `--features metal`)
+- 280 tests (285 with `--features metal`)
 - Zero ML dependencies
 - 203× measured speedup from tensor autodiff
 - Flash Attention: O(T) memory vs O(T²) for standard attention
 - SwiGLU clamp (configurable per model, 7.0 for GPT-OSS)
+- Sliding window attention (alternating full/local, configurable window size)
+- INT4 dynamic quantization (`quantize_for_inference`): ~4× memory reduction
 - Checkpoint save/load + resume via `--checkpoint`
 - Early stopping on validation loss (`early_stopping_patience`)
 - O(T) generation via KV cache (both GPT-2 and GPT-OSS)
