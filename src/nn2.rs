@@ -56,6 +56,36 @@ pub trait Trainable: Module2 {
 
     /// Compute cross-entropy loss: scalar TensorNode with backward wired.
     fn loss_tokens(&self, token_ids: &[usize], targets: &[usize]) -> TensorNode;
+
+    /// Compute mean cross-entropy loss over a batch of B sequences.
+    ///
+    /// Runs `loss_tokens` for each sequence, averages the scalar loss values,
+    /// then calls `backward()` on each individual loss scaled by 1/B so that
+    /// gradients accumulate into the shared parameters correctly.
+    ///
+    /// Returns a plain scalar `TensorNode` (leaf) holding the mean loss value.
+    /// Callers must NOT call `.backward()` on the returned node — backward has
+    /// already been triggered internally.
+    fn loss_batch_tokens(&self, batch: &[(&[usize], &[usize])]) -> TensorNode {
+        let b = batch.len();
+        assert!(b > 0, "loss_batch_tokens: empty batch");
+
+        // Forward + backward for each sequence, accumulating grads / B.
+        let mut total_loss = 0.0f32;
+        for (inp, tgt) in batch {
+            let loss_node = self.loss_tokens(inp, tgt);
+            let val = loss_node.data().at(0, 0);
+            total_loss += val;
+
+            // Scale the upstream gradient by 1/B so the accumulated gradient
+            // across all B sequences equals the mean-batch gradient.
+            let upstream = Mat::new(vec![1.0 / b as f32], 1, 1);
+            loss_node.set_grad(upstream);
+            loss_node.backward();
+        }
+
+        TensorNode::leaf(Mat::new(vec![total_loss / b as f32], 1, 1))
+    }
 }
 
 // =============================================================================

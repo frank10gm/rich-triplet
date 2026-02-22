@@ -1,6 +1,7 @@
 mod tensor;
 mod tokenizer;
 mod dataset;
+mod ndarray;
 mod autograd;
 mod nn;
 mod transformer;

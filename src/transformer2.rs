@@ -204,44 +204,63 @@ impl MultiHeadAttention2 {
     }
 
     /// x: [T, d_model]  →  output: [T, d_model]
+    ///
+    /// Uses `batched_gqa_attention` so all heads run as a single batched matmul
+    /// instead of a sequential per-head loop.
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        let t   = x.data().rows;
-        let d   = self.d_model;
-        let dh  = d / self.heads.len();
+        let t  = x.data().rows;
+        let d  = self.d_model;
+        let dh = d / self.heads.len();
+        let n  = self.heads.len();
 
-        // Collect each head's output: [T, d_head]
-        let head_outs: Vec<TensorNode> = self.heads.iter().map(|h| h.forward(x)).collect();
+        // Project each head's Q, K, V: each [T, d_head]
+        // Then concatenate into [T, n_heads*d_head] for the batched call.
+        let qs: Vec<TensorNode> = self.heads.iter().map(|h| h.w_q.forward(x)).collect();
+        let ks: Vec<TensorNode> = self.heads.iter().map(|h| h.w_k.forward(x)).collect();
+        let vs: Vec<TensorNode> = self.heads.iter().map(|h| h.w_v.forward(x)).collect();
 
-        // Concatenate along feature dim: → [T, d_model]
-        // We do this as a custom fused node so the backward scatters back correctly.
-        let concat_data = Mat::from_fn(t, d, |row, col| {
-            let h = col / dh;
-            let c = col % dh;
-            head_outs[h].data().at(row, c)
+        // Fused concat Q: [T, n*d_head]
+        let q_concat = Self::concat_heads(&qs, t, n, dh);
+        let k_concat = Self::concat_heads(&ks, t, n, dh);
+        let v_concat = Self::concat_heads(&vs, t, n, dh);
+
+        // Single batched GQA call (n_q == n_kv == n_heads, group_size=1)
+        let attn_out = TensorNode::batched_gqa_attention(
+            &q_concat, &k_concat, &v_concat,
+            n, n, dh,
+        );
+
+        // Final projection [T, d_model] → [T, d_model]
+        self.w_o.forward(&attn_out)
+    }
+
+    /// Concatenate a list of [T, d_head] TensorNodes into [T, n*d_head].
+    ///
+    /// Registers a backward that scatters the gradient back to each head's node.
+    fn concat_heads(heads: &[TensorNode], t: usize, n: usize, dh: usize) -> TensorNode {
+        let concat_data = Mat::from_fn(t, n * dh, |row, col| {
+            heads[col / dh].data().at(row, col % dh)
         });
         let concat = TensorNode::leaf(concat_data);
-        let head_outs_c: Vec<TensorNode> = head_outs.clone();
+        let heads_c: Vec<TensorNode> = heads.to_vec();
         let concat_c = concat.clone();
 
         concat.set_backward(
             Box::new(move || {
-                let dconcat = concat_c.grad().clone(); // [T, d_model]
-                for (h, head_out) in head_outs_c.iter().enumerate() {
-                    // Scatter columns [h*dh .. (h+1)*dh] back to head_out.grad
-                    let mut dh_grad = head_out.grad().clone();
+                let dconcat = concat_c.grad().clone();
+                for (h, head) in heads_c.iter().enumerate() {
+                    let mut dh_grad = head.grad().clone();
                     for row in 0..t {
                         for c in 0..dh {
                             *dh_grad.at_mut(row, c) += dconcat.at(row, h * dh + c);
                         }
                     }
-                    head_out.set_grad(dh_grad);
+                    head.set_grad(dh_grad);
                 }
             }),
-            head_outs,
+            heads.to_vec(),
         );
-
-        // Final projection [T, d_model] → [T, d_model]
-        self.w_o.forward(&concat)
+        concat
     }
 }
 

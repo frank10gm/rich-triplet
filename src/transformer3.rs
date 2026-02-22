@@ -345,7 +345,7 @@ impl GptOssAttention {
         let attn_out = if self.sliding_window.is_some() {
             self.gqa_attention_windowed(&q_rope, &k_rope, &v)
         } else {
-            TensorNode::gqa_attention(
+            TensorNode::batched_gqa_attention(
                 &q_rope, &k_rope, &v,
                 self.n_q_heads, self.n_kv_heads, d_head,
             )

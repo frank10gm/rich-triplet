@@ -60,6 +60,16 @@ use crate::tokenizer::Tokenizer;
 pub trait DataSource {
     fn sample(&self, rng_seed: u64) -> (Vec<usize>, Vec<usize>);
     fn len(&self) -> usize;
+
+    /// Sample `batch_size` independent (input, target) pairs with different seeds.
+    ///
+    /// Each sequence gets a distinct seed derived from `rng_seed` so the B
+    /// sequences in a batch cover different positions in the corpus.
+    fn sample_batch(&self, rng_seed: u64, batch_size: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+        (0..batch_size)
+            .map(|i| self.sample(rng_seed.wrapping_add(i as u64 * 7919)))
+            .collect()
+    }
 }
 
 // =============================================================================

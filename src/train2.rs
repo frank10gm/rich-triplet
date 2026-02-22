@@ -221,6 +221,16 @@ pub struct TrainConfig2 {
     /// step.  Effective batch size = batch_size * accumulate_steps.
     /// Set to 1 to disable (default).
     pub accumulate_steps: usize,
+    /// Number of independent sequences per training step.
+    ///
+    /// Each step samples `batch_size` sequences, runs forward+backward on each
+    /// (via `loss_batch_tokens`), and averages the gradients before the optimizer
+    /// step.  Larger batches → smoother gradients → more stable training.
+    ///
+    /// Typical values: 1 (default, same as before), 4–8 for personal models.
+    /// Memory cost is linear in batch_size (no GPU parallelism — sequences are
+    /// processed one at a time, gradients accumulated).
+    pub batch_size: usize,
     /// Label-smoothing ε.  0.0 = standard cross-entropy (default).
     /// Typical: 0.1.  Replaces the one-hot target with:
     ///   y_smooth[v] = (1 - ε) * one_hot[v] + ε / vocab_size
@@ -242,6 +252,7 @@ impl Default for TrainConfig2 {
             learning_rate: 3e-4,
             grad_clip: 1.0,
             accumulate_steps: 1,
+            batch_size: 1,
             label_smoothing: 0.0,
             checkpoint_path: None,
             early_stopping_patience: 0,
@@ -295,9 +306,10 @@ pub fn train2<T: Trainable, D: DataSource>(
         total_steps: cfg.max_steps,
     };
 
+    let batch_size = cfg.batch_size.max(1);
     println!(
-        "\n[tensor] Training: {} parameters (in {} tensors), {} steps (accumulate={})",
-        n_params, params.len(), cfg.max_steps, cfg.accumulate_steps
+        "\n[tensor] Training: {} parameters (in {} tensors), {} steps (batch={}, accumulate={})",
+        n_params, params.len(), cfg.max_steps, batch_size, cfg.accumulate_steps
     );
     println!("{:-<65}", "");
 
@@ -316,30 +328,35 @@ pub fn train2<T: Trainable, D: DataSource>(
             for p in model.parameters() { p.zero_grad(); }
         }
 
-        // ---- 3. Sample one training example ----
-        let (token_ids, target_ids) = train_data.sample(step as u64 + 1);
+        // ---- 3. Sample a batch of training examples ----
+        let batch_raw = train_data.sample_batch(step as u64 + 1, batch_size);
+        // Keep (token_ids, target_ids) for the first sequence for metrics
+        let (first_tokens, first_targets) = &batch_raw[0];
 
-        // ---- 4. Forward + loss ----
-        // Build loss TensorNode (needed for backward)
-        let loss = model.loss_tokens(&token_ids, &target_ids);
+        // ---- 4. Forward + loss (batch) ----
+        // loss_batch_tokens runs forward+backward for each sequence internally,
+        // scaling each upstream gradient by 1/B.  Returns mean loss as a leaf.
+        let batch_refs: Vec<(&[usize], &[usize])> = batch_raw.iter()
+            .map(|(inp, tgt)| (inp.as_slice(), tgt.as_slice()))
+            .collect();
+        let loss = model.loss_batch_tokens(&batch_refs);
 
         // ---- 5. NaN/Inf guard — skip step if loss is not finite ----
         let loss_val = loss.data().at(0, 0);
         if !loss_val.is_finite() {
-            eprintln!("[warn] step {}: non-finite loss ({:.4}), skipping backward", step, loss_val);
+            eprintln!("[warn] step {}: non-finite loss ({:.4}), skipping", step, loss_val);
             continue;
         }
 
-        // Compute metrics (logits already computed inside model.loss — re-run forward for metrics)
+        // Compute metrics on the first sequence of the batch
         {
-            let logits_node = model.forward_tokens(&token_ids);
+            let logits_node = model.forward_tokens(first_tokens);
             let logits = logits_node.data();
-            last_loss = cross_entropy_smoothed(&logits, &target_ids, cfg.label_smoothing);
-            last_acc  = token_accuracy(&logits, &target_ids);
+            last_loss = cross_entropy_smoothed(&logits, first_targets, cfg.label_smoothing);
+            last_acc  = token_accuracy(&logits, first_targets);
         }
 
-        // ---- 6. Backward — accumulate gradients ----
-        loss.backward();
+        // ---- 6. (Backward already done inside loss_batch_tokens) ----
 
         // Only update weights at the end of each accumulation window
         let is_update_step = (step + 1) % accum == 0 || step == cfg.max_steps - 1;
@@ -462,6 +479,7 @@ fn estimate_loss2<T: Trainable, D: DataSource>(model: &T, data: &D, n_samples: u
         for p in model.parameters() { p.zero_grad(); }
         let loss = model.loss_tokens(&token_ids, &target_ids);
         total += loss.data().at(0, 0);
+        for p in model.parameters() { p.zero_grad(); }
     }
     total / n_samples as f32
 }
@@ -740,6 +758,7 @@ mod tests {
             learning_rate: 1e-2,
             grad_clip: 1.0,
             accumulate_steps: 1,
+            batch_size: 1,
             label_smoothing: 0.0,
             checkpoint_path: None,
             early_stopping_patience: 0,
@@ -780,6 +799,7 @@ mod tests {
             learning_rate: 1e-2,
             grad_clip: 1.0,
             accumulate_steps: 1,
+            batch_size: 1,
             label_smoothing: 0.1,
             checkpoint_path: None,
             early_stopping_patience: 0,
@@ -807,11 +827,93 @@ mod tests {
             learning_rate: 1e-2,
             grad_clip: 1.0,
             accumulate_steps: 2,
+            batch_size: 1,
             label_smoothing: 0.0,
             checkpoint_path: None,
             early_stopping_patience: 0,
         };
         let loss = train2(&model, &train_ds, &val_ds, &cfg);
         assert!(loss.is_finite(), "training with grad accumulation should be finite");
+    }
+
+    // --- Batch training ---
+
+    #[test]
+    fn test_sample_batch_returns_b_sequences() {
+        use crate::tokenizer::CharTokenizer;
+        use crate::dataset::{TextDataset, DataSource};
+
+        let text = "abcdefghijklmnopqrstuvwxyz".repeat(5);
+        let tok = CharTokenizer::from_text(&text);
+        let ds = TextDataset::from_text(&text, &tok, 4);
+        let batch = ds.sample_batch(42, 3);
+        assert_eq!(batch.len(), 3);
+        for (inp, tgt) in &batch {
+            assert_eq!(inp.len(), 4);
+            assert_eq!(tgt.len(), 4);
+        }
+    }
+
+    #[test]
+    fn test_sample_batch_sequences_differ() {
+        use crate::tokenizer::CharTokenizer;
+        use crate::dataset::{TextDataset, DataSource};
+
+        let text = "abcdefghijklmnopqrstuvwxyz".repeat(5);
+        let tok = CharTokenizer::from_text(&text);
+        let ds = TextDataset::from_text(&text, &tok, 4);
+        let batch = ds.sample_batch(42, 3);
+        // The three sequences should not all be identical
+        let all_same = batch.windows(2).all(|w| w[0].0 == w[1].0);
+        assert!(!all_same, "batch sequences should differ");
+    }
+
+    #[test]
+    fn test_loss_batch_tokens_finite() {
+        use crate::tokenizer::{CharTokenizer, Tokenizer};
+        use crate::dataset::{TextDataset, DataSource};
+
+        let corpus = "abcabcabc".repeat(20);
+        let tok = CharTokenizer::from_text(&corpus);
+        let model = make_tiny_model(tok.vocab_size());
+        let ds = TextDataset::from_text(&corpus, &tok, model.config.context_length);
+
+        let batch_raw = ds.sample_batch(7, 3);
+        let batch_refs: Vec<(&[usize], &[usize])> = batch_raw.iter()
+            .map(|(i, t)| (i.as_slice(), t.as_slice()))
+            .collect();
+
+        for p in model.parameters() { p.zero_grad(); }
+        let loss = model.loss_batch_tokens(&batch_refs);
+        assert!(loss.data().at(0, 0).is_finite(), "batch loss should be finite");
+        assert!(loss.data().at(0, 0) > 0.0, "batch loss should be positive");
+    }
+
+    #[test]
+    fn test_training_with_batch_size_4() {
+        use crate::tokenizer::{CharTokenizer, Tokenizer};
+        use crate::dataset::TextDataset;
+
+        let corpus = "abcabcabc".repeat(20);
+        let corpus = corpus.as_str();
+        let tokenizer = CharTokenizer::from_text(corpus);
+        let model = make_tiny_model(tokenizer.vocab_size());
+        let (train_ds, val_ds) = TextDataset::train_val_split(
+            corpus, &tokenizer, model.config.context_length
+        );
+        let cfg = TrainConfig2 {
+            max_steps: 20,
+            eval_interval: 20,
+            learning_rate: 1e-2,
+            grad_clip: 1.0,
+            accumulate_steps: 1,
+            batch_size: 4,
+            label_smoothing: 0.0,
+            checkpoint_path: None,
+            early_stopping_patience: 0,
+        };
+        let loss = train2(&model, &train_ds, &val_ds, &cfg);
+        assert!(loss.is_finite() && loss > 0.0,
+            "batch training should produce finite loss, got {}", loss);
     }
 }

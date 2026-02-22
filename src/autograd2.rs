@@ -69,6 +69,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::collections::HashSet;
+use crate::ndarray::NDArray;
 
 // =============================================================================
 // The Tensor type — re-exported from tensor.rs but with grad operations added
@@ -2096,6 +2097,175 @@ impl TensorNode {
         out
     }
 
+    /// Batched GQA attention — same semantics as `gqa_attention` but uses
+    /// `NDArray::bmm` for the score and output matmuls instead of a per-head loop.
+    ///
+    /// ## Forward
+    ///
+    /// 1. Reshape Q `[T, n_q*D]` → `[n_q, T, D]`
+    ///    Reshape K/V `[T, n_kv*D]` → `[n_kv, T, D]`
+    /// 2. Expand K/V heads by the group factor: `[n_q, T, D]`
+    /// 3. scores `[n_q, T, T]` = Q `[n_q, T, D]` @ K.permute(0,2,1) `[n_q, D, T]` * scale
+    /// 4. Apply causal mask (upper-triangular = -inf)
+    /// 5. Softmax over last axis
+    /// 6. out `[n_q, T, D]` = weights `[n_q, T, T]` @ V `[n_q, T, D]`
+    /// 7. Reshape back to `[T, n_q*D]`
+    ///
+    /// ## Backward
+    ///
+    /// Same math as `gqa_attention` backward but expressed with batched matmuls:
+    ///   dV   = W.T @ dOut         (per head)
+    ///   dW   = dOut @ V.T         (per head)
+    ///   dS   = W * (dW - diag(W @ dW.T) broadcast) * scale  (softmax VJP, causal)
+    ///   dQ   = dS @ K             (per head)
+    ///   dK  += dS.T @ Q           (per head, accumulated over q-heads in same kv group)
+    pub fn batched_gqa_attention(
+        q: &TensorNode,
+        k: &TensorNode,
+        v: &TensorNode,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+    ) -> TensorNode {
+        let q_data = q.data().clone();
+        let k_data = k.data().clone();
+        let v_data = v.data().clone();
+        let t = q_data.rows;
+        let scale = 1.0_f32 / (d_head as f32).sqrt();
+        let group_size = n_q_heads / n_kv_heads;
+
+        assert_eq!(q_data.cols, n_q_heads  * d_head);
+        assert_eq!(k_data.cols, n_kv_heads * d_head);
+        assert_eq!(v_data.cols, n_kv_heads * d_head);
+
+        // ---- reshape: [T, H*D] → [H, T, D] ----
+        // NDArray uses row-major; we have data laid out as T rows of H*D.
+        // reshape [T, H*D] → [T, H, D] then permute [1,0,2] → [H, T, D].
+        let q_nd = NDArray::from_mat(&q_data)
+            .reshape(&[t, n_q_heads,  d_head])
+            .permute(&[1, 0, 2]);        // [n_q,  T, D]
+        let k_nd = NDArray::from_mat(&k_data)
+            .reshape(&[t, n_kv_heads, d_head])
+            .permute(&[1, 0, 2]);        // [n_kv, T, D]
+        let v_nd = NDArray::from_mat(&v_data)
+            .reshape(&[t, n_kv_heads, d_head])
+            .permute(&[1, 0, 2]);        // [n_kv, T, D]
+
+        // ---- expand KV heads to match Q heads ----
+        // Each KV head serves `group_size` Q heads.
+        // Build [n_q, T, D] by repeating each KV head `group_size` times.
+        let k_exp = NDArray::from_fn(&[n_q_heads, t, d_head], |idx| {
+            let kvh = idx[0] / group_size;
+            k_nd.at(&[kvh, idx[1], idx[2]])
+        });
+        let v_exp = NDArray::from_fn(&[n_q_heads, t, d_head], |idx| {
+            let kvh = idx[0] / group_size;
+            v_nd.at(&[kvh, idx[1], idx[2]])
+        });
+
+        // ---- scores: [n_q, T, T] = Q [n_q,T,D] @ K^T [n_q,D,T] * scale ----
+        let k_t = k_exp.permute(&[0, 2, 1]);  // [n_q, D, T]
+        let mut scores = q_nd.bmm(&k_t).scale(scale);  // [n_q, T, T]
+
+        // ---- causal mask: scores[h, i, j] = -1e9 for j > i ----
+        for h in 0..n_q_heads {
+            for i in 0..t {
+                for j in (i + 1)..t {
+                    *scores.at_mut(&[h, i, j]) = -1e9;
+                }
+            }
+        }
+
+        // ---- softmax over last axis ----
+        let weights = scores.softmax(2);  // [n_q, T, T]
+
+        // ---- output: [n_q, T, D] = weights @ V ----
+        let out_nd = weights.bmm(&v_exp);  // [n_q, T, D]
+
+        // ---- reshape back: [n_q, T, D] → [T, n_q, D] → [T, n_q*D] ----
+        let out_mat = out_nd
+            .permute(&[1, 0, 2])          // [T, n_q, D]
+            .reshape(&[t, n_q_heads * d_head])
+            .into_mat();
+
+        let out = TensorNode::leaf(out_mat);
+        let q_c   = q.clone();
+        let k_c   = k.clone();
+        let v_c   = v.clone();
+        let out_c = out.clone();
+
+        // Store attention weights for backward (one [T,T] per q-head)
+        // We extract them from the NDArray into Vec<Mat> for the closure.
+        let all_weights: Vec<Mat> = (0..n_q_heads).map(|h| {
+            Mat::from_fn(t, t, |r, c| weights.at(&[h, r, c]))
+        }).collect();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout   = out_c.0.borrow().grad.clone();  // [T, n_q*D]
+            let q_data = q_c.0.borrow().data.clone();
+            let k_data = k_c.0.borrow().data.clone();
+            let v_data = v_c.0.borrow().data.clone();
+
+            let mut dq_data = Mat::zeros(t, n_q_heads  * d_head);
+            let mut dk_data = Mat::zeros(t, n_kv_heads * d_head);
+            let mut dv_data = Mat::zeros(t, n_kv_heads * d_head);
+
+            for qh in 0..n_q_heads {
+                let kvh = qh / group_size;
+                let w = &all_weights[qh];
+
+                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh  * d_head + c));
+                let q_h    = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
+                let k_h    = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+                let v_h    = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+
+                // dV += W.T @ dOut_h
+                let dv_h = w.transpose().matmul(&dout_h);
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dv_data.at_mut(r, kvh * d_head + c) += dv_h.at(r, c);
+                    }
+                }
+
+                // dW = dOut_h @ V_h.T
+                let dw = dout_h.matmul(&v_h.transpose());
+
+                // Softmax backward (causal)
+                let mut dscores = Mat::zeros(t, t);
+                for r in 0..t {
+                    let dot: f32 = (0..=r).map(|c| dw.at(r, c) * w.at(r, c)).sum();
+                    for c in 0..=r {
+                        *dscores.at_mut(r, c) = w.at(r, c) * (dw.at(r, c) - dot);
+                    }
+                }
+                let dscores = dscores.scale(scale);
+
+                // dQ_h += dScores @ K_h
+                let dq_h = dscores.matmul(&k_h);
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dq_data.at_mut(r, qh * d_head + c) += dq_h.at(r, c);
+                    }
+                }
+
+                // dK_kvh += dScores.T @ Q_h
+                let dk_h = dscores.transpose().matmul(&q_h);
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dk_data.at_mut(r, kvh * d_head + c) += dk_h.at(r, c);
+                    }
+                }
+            }
+
+            q_c.0.borrow_mut().grad.add_assign(&dq_data);
+            k_c.0.borrow_mut().grad.add_assign(&dk_data);
+            v_c.0.borrow_mut().grad.add_assign(&dv_data);
+        }));
+
+        out.0.borrow_mut().prev = vec![q.clone(), k.clone(), v.clone()];
+        out
+    }
+
     /// Flash Attention — causal self-attention with O(T) memory instead of O(T²).
     ///
     /// ## Motivation
@@ -3524,5 +3694,173 @@ mod tests {
         save_checkpoint(path, &[("model.layers.0.attn.q_proj.weight", &node)]).unwrap();
         let loaded = load_checkpoint(path).unwrap();
         assert_eq!(loaded[0].0, "model.layers.0.attn.q_proj.weight");
+    }
+
+    // =========================================================================
+    // batched_gqa_attention — correctness vs gqa_attention
+    // =========================================================================
+
+    #[test]
+    fn test_batched_gqa_output_matches_gqa() {
+        // batched_gqa_attention must produce identical forward output to gqa_attention.
+        let t = 5; let n_q = 4; let n_kv = 2; let dh = 8;
+        let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.01 + 0.1);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.02 + 0.05);
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.015 + 0.03);
+
+        let q1 = TensorNode::leaf(q_data.clone());
+        let k1 = TensorNode::leaf(k_data.clone());
+        let v1 = TensorNode::leaf(v_data.clone());
+        let out_ref = TensorNode::gqa_attention(&q1, &k1, &v1, n_q, n_kv, dh);
+
+        let q2 = TensorNode::leaf(q_data);
+        let k2 = TensorNode::leaf(k_data);
+        let v2 = TensorNode::leaf(v_data);
+        let out_bat = TensorNode::batched_gqa_attention(&q2, &k2, &v2, n_q, n_kv, dh);
+
+        let ref_d = out_ref.data().clone();
+        let bat_d = out_bat.data().clone();
+        assert_eq!((ref_d.rows, ref_d.cols), (bat_d.rows, bat_d.cols));
+        for r in 0..t { for c in 0..(n_q * dh) {
+            assert!((ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
+                "output mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
+                ref_d.at(r, c), bat_d.at(r, c));
+        }}
+    }
+
+    #[test]
+    fn test_batched_gqa_mha_output_matches_gqa() {
+        // n_q == n_kv (standard MHA case): must still match.
+        let t = 4; let n = 3; let dh = 6;
+        let q_data = Mat::from_fn(t, n * dh, |r, c| (r + c) as f32 * 0.03 + 0.02);
+        let k_data = q_data.clone();
+        let v_data = Mat::from_fn(t, n * dh, |r, c| ((r * (n * dh) + c) as f32 + 1.0) * 0.02);
+
+        let out_ref = TensorNode::gqa_attention(
+            &TensorNode::leaf(q_data.clone()),
+            &TensorNode::leaf(k_data.clone()),
+            &TensorNode::leaf(v_data.clone()),
+            n, n, dh,
+        );
+        let out_bat = TensorNode::batched_gqa_attention(
+            &TensorNode::leaf(q_data.clone()),
+            &TensorNode::leaf(k_data.clone()),
+            &TensorNode::leaf(v_data.clone()),
+            n, n, dh,
+        );
+
+        let ref_d = out_ref.data().clone();
+        let bat_d = out_bat.data().clone();
+        for r in 0..t { for c in 0..(n * dh) {
+            assert!((ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
+                "MHA mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
+                ref_d.at(r, c), bat_d.at(r, c));
+        }}
+    }
+
+    #[test]
+    fn test_batched_gqa_output_shape() {
+        let t = 6; let n_q = 4; let n_kv = 2; let dh = 8;
+        let q = TensorNode::leaf(Mat::zeros(t, n_q * dh));
+        let k = TensorNode::leaf(Mat::zeros(t, n_kv * dh));
+        let v = TensorNode::leaf(Mat::zeros(t, n_kv * dh));
+        let out = TensorNode::batched_gqa_attention(&q, &k, &v, n_q, n_kv, dh);
+        let d = out.data();
+        assert_eq!((d.rows, d.cols), (t, n_q * dh));
+    }
+
+    #[test]
+    fn test_batched_gqa_causal_first_token() {
+        // Token 0 can only attend to itself — output[0] must equal V[0..dh] exactly
+        // (softmax over a single position → weight=1.0).
+        let t = 4; let n_q = 2; let n_kv = 2; let dh = 4;
+        let q = TensorNode::leaf(Mat::ones(t, n_q * dh));
+        let k = TensorNode::leaf(Mat::ones(t, n_kv * dh));
+        let v = TensorNode::leaf(Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c + 1) as f32));
+        let out = TensorNode::batched_gqa_attention(&q, &k, &v, n_q, n_kv, dh);
+        let d = out.data();
+        // For each query head h, token 0 must match v[0, h*dh .. (h+1)*dh]
+        for h in 0..n_q {
+            let kvh = h; // group_size=1 for n_q==n_kv
+            for c in 0..dh {
+                let expected = v.data().at(0, kvh * dh + c);
+                let got = d.at(0, h * dh + c);
+                assert!((got - expected).abs() < 1e-4,
+                    "head {h}, col {c}: expected {expected:.4} got {got:.4}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_batched_gqa_grad_v() {
+        // Gradient check for dV: batched vs numerical.
+        let t = 3; let n_q = 2; let n_kv = 1; let dh = 4;
+        let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+
+        let num = numerical_grad(&|v| {
+            let qn = TensorNode::leaf(q_data.clone());
+            let kn = TensorNode::leaf(k_data.clone());
+            let vn = TensorNode::leaf(v.clone());
+            TensorNode::batched_gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh)
+                .data().data.iter().sum::<f32>()
+        }, &v_data);
+
+        let q = TensorNode::leaf(q_data);
+        let k = TensorNode::leaf(k_data);
+        let v = TensorNode::leaf(v_data);
+        let out = TensorNode::batched_gqa_attention(&q, &k, &v, n_q, n_kv, dh);
+        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        out.0.borrow_mut().grad = Mat::ones(r, c);
+        call_backward(&out);
+
+        let vg = v.grad().clone();
+        for row in 0..t { for col in 0..(n_kv * dh) {
+            assert!(approx(vg.at(row, col), num.at(row, col)),
+                "batched dV[{row},{col}]: analytical={:.4} numerical={:.4}",
+                vg.at(row, col), num.at(row, col));
+        }}
+    }
+
+    #[test]
+    fn test_batched_gqa_grad_matches_gqa_grad() {
+        // Gradient of batched_gqa must match gradient of gqa_attention exactly.
+        let t = 3; let n_q = 4; let n_kv = 2; let dh = 4;
+        let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+
+        // Reference: gqa_attention
+        let q1 = TensorNode::leaf(q_data.clone());
+        let k1 = TensorNode::leaf(k_data.clone());
+        let v1 = TensorNode::leaf(v_data.clone());
+        let out1 = TensorNode::gqa_attention(&q1, &k1, &v1, n_q, n_kv, dh);
+        let (r, c) = { let d = out1.data(); (d.rows, d.cols) };
+        out1.0.borrow_mut().grad = Mat::ones(r, c);
+        call_backward(&out1);
+
+        // Batched: batched_gqa_attention
+        let q2 = TensorNode::leaf(q_data);
+        let k2 = TensorNode::leaf(k_data);
+        let v2 = TensorNode::leaf(v_data);
+        let out2 = TensorNode::batched_gqa_attention(&q2, &k2, &v2, n_q, n_kv, dh);
+        out2.0.borrow_mut().grad = Mat::ones(r, c);
+        call_backward(&out2);
+
+        let dq1 = q1.grad().clone(); let dq2 = q2.grad().clone();
+        let dk1 = k1.grad().clone(); let dk2 = k2.grad().clone();
+        let dv1 = v1.grad().clone(); let dv2 = v2.grad().clone();
+
+        for row in 0..t { for col in 0..(n_q * dh) {
+            assert!(approx(dq1.at(row, col), dq2.at(row, col)),
+                "dQ mismatch [{row},{col}]: ref={:.4} bat={:.4}", dq1.at(row,col), dq2.at(row,col));
+        }}
+        for row in 0..t { for col in 0..(n_kv * dh) {
+            assert!(approx(dk1.at(row, col), dk2.at(row, col)),
+                "dK mismatch [{row},{col}]: ref={:.4} bat={:.4}", dk1.at(row,col), dk2.at(row,col));
+            assert!(approx(dv1.at(row, col), dv2.at(row, col)),
+                "dV mismatch [{row},{col}]: ref={:.4} bat={:.4}", dv1.at(row,col), dv2.at(row,col));
+        }}
     }
 }

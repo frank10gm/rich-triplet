@@ -1,6 +1,9 @@
 /// # Metal GPU matrix multiplication
 ///
-/// Provides `metal_matmul(a, b) -> Mat` accelerated via Apple Metal compute shaders.
+/// Provides two GPU-accelerated entry points:
+/// * `metal_matmul(a, b) -> Mat`  — single `C = A @ B`
+/// * `metal_matmul_batched(pairs) -> Vec<Mat>` — B independent `C_i = A_i @ B_i`
+///   in one GPU dispatch (batch parallelism along the Z grid axis).
 ///
 /// ## Feature gate
 ///
@@ -12,11 +15,11 @@
 ///
 /// * One `MetalContext` is initialised lazily per thread via a `std::cell::OnceCell`.
 ///   Calling `MTLCreateSystemDefaultDevice` is expensive (~1 ms); we pay it once.
-/// * All Metal objects (device, queue, pipeline) live inside `MetalContext` for the
+/// * All Metal objects (device, queue, pipelines) live inside `MetalContext` for the
 ///   lifetime of the thread.
 /// * Buffers are created fresh on every call with `MTLResourceStorageModeShared`
 ///   (Apple Silicon unified memory — no explicit synchronisation needed).
-/// * The MSL kernel is compiled from source at first use, also cached in the context.
+/// * The MSL kernels are compiled from source at first use, cached in the context.
 ///
 /// ## MSL kernel (`matmul_tiled`)
 ///
@@ -24,26 +27,11 @@
 /// global memory reads. Each tile of A and B is loaded once into fast threadgroup
 /// memory and reused by all 16 threads in the row/column.
 ///
-/// ```metal
-/// #define TS 16
-/// kernel void matmul_tiled(...)
-/// {
-///     threadgroup float As[TS][TS], Bs[TS][TS];
-///     float acc = 0;
-///     for each tile t {
-///         As[ty][tx] = A[row][t*TS+tx];   // load tile from global → shared
-///         Bs[ty][tx] = B[t*TS+ty][col];
-///         threadgroup_barrier(mem_flags::mem_threadgroup);
-///         for k in 0..TS { acc += As[ty][k] * Bs[k][tx]; }
-///         threadgroup_barrier(mem_flags::mem_threadgroup);
-///     }
-///     C[row][col] = acc;
-/// }
-/// ```
+/// ## MSL kernel (`matmul_tiled_batched`)
 ///
-/// This is 3–5× faster than the naive global-memory kernel for large matrices
-/// (e.g. 512×512) because each element of A/B is loaded from device memory
-/// once per K/TS tiles, not once per output element.
+/// Same tiled algorithm but the grid has a Z dimension equal to the batch size B.
+/// Each threadgroup in slice `tgid.z = b` reads from `A[b*M*K..]` and writes to
+/// `C[b*M*N..]`. All B matmuls run concurrently on the GPU.
 ///
 /// ## CPU threshold
 ///
@@ -94,6 +82,7 @@ using namespace metal;
 
 #define TS 16u
 
+// Single matrix multiply: C[M,N] = A[M,K] @ B[K,N]
 kernel void matmul_tiled(
     device const float* A  [[ buffer(0) ]],
     device const float* B  [[ buffer(1) ]],
@@ -104,11 +93,9 @@ kernel void matmul_tiled(
     uint2 tgid [[ threadgroup_position_in_grid ]],
     uint2 tid  [[ thread_position_in_threadgroup ]])
 {
-    // Global output coordinates for this thread
     uint row = tgid.y * TS + tid.y;
     uint col = tgid.x * TS + tid.x;
 
-    // Shared tiles (one per threadgroup — all threads contribute)
     threadgroup float As[TS][TS];
     threadgroup float Bs[TS][TS];
 
@@ -116,17 +103,14 @@ kernel void matmul_tiled(
     uint n_tiles = (K + TS - 1u) / TS;
 
     for (uint t = 0u; t < n_tiles; t++) {
-        // Load tile of A: row from global A, column index t*TS+tid.x
         uint a_col = t * TS + tid.x;
         As[tid.y][tid.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
 
-        // Load tile of B: row index t*TS+tid.y, column from global B
         uint b_row = t * TS + tid.y;
         Bs[tid.y][tid.x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Accumulate partial dot product from this tile
         for (uint k = 0u; k < TS; k++)
             acc += As[tid.y][k] * Bs[k][tid.x];
 
@@ -136,15 +120,68 @@ kernel void matmul_tiled(
     if (row < M && col < N)
         C[row * N + col] = acc;
 }
+
+// Batched matrix multiply: C[b,M,N] = A[b,M,K] @ B[b,K,N]
+//
+// All B pairs have the same M, K, N.  The matrices are packed contiguously:
+//   A_flat[b * M*K  ..  (b+1) * M*K  - 1]
+//   B_flat[b * K*N  ..  (b+1) * K*N  - 1]
+//   C_flat[b * M*N  ..  (b+1) * M*N  - 1]
+//
+// The grid Z dimension equals the batch size B; tgid.z selects the slice.
+kernel void matmul_tiled_batched(
+    device const float* A  [[ buffer(0) ]],
+    device const float* B  [[ buffer(1) ]],
+    device       float* C  [[ buffer(2) ]],
+    constant     uint&  M  [[ buffer(3) ]],
+    constant     uint&  K  [[ buffer(4) ]],
+    constant     uint&  N  [[ buffer(5) ]],
+    uint3 tgid [[ threadgroup_position_in_grid ]],
+    uint3 tid  [[ thread_position_in_threadgroup ]])
+{
+    uint b   = tgid.z;
+    uint row = tgid.y * TS + tid.y;
+    uint col = tgid.x * TS + tid.x;
+
+    // Offset into the packed batch buffers for slice b
+    device const float* Ab = A + b * M * K;
+    device const float* Bb = B + b * K * N;
+    device       float* Cb = C + b * M * N;
+
+    threadgroup float As[TS][TS];
+    threadgroup float Bs[TS][TS];
+
+    float acc = 0.0f;
+    uint n_tiles = (K + TS - 1u) / TS;
+
+    for (uint t = 0u; t < n_tiles; t++) {
+        uint a_col = t * TS + tid.x;
+        As[tid.y][tid.x] = (row < M && a_col < K) ? Ab[row * K + a_col] : 0.0f;
+
+        uint b_row = t * TS + tid.y;
+        Bs[tid.y][tid.x] = (b_row < K && col < N) ? Bb[b_row * N + col] : 0.0f;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0u; k < TS; k++)
+            acc += As[tid.y][k] * Bs[k][tid.x];
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N)
+        Cb[row * N + col] = acc;
+}
 "#;
 
     // -------------------------------------------------------------------------
     // Cached Metal objects — one per thread
     // -------------------------------------------------------------------------
     pub struct MetalContext {
-        pub device:   Retained<ProtocolObject<dyn MTLDevice>>,
-        pub queue:    Retained<ProtocolObject<dyn MTLCommandQueue>>,
-        pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pub device:            Retained<ProtocolObject<dyn MTLDevice>>,
+        pub queue:             Retained<ProtocolObject<dyn MTLCommandQueue>>,
+        pub pipeline:          Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pub pipeline_batched:  Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     thread_local! {
@@ -159,22 +196,26 @@ kernel void matmul_tiled(
             .newCommandQueue()
             .expect("Metal: could not create command queue");
 
-        // Compile the MSL kernel from source.
+        // Compile both kernels from the same source string.
         let source = NSString::from_str(MATMUL_MSL);
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .expect("Metal: MSL compilation failed");
 
-        let fn_name = NSString::from_str("matmul_tiled");
-        let func: Retained<ProtocolObject<dyn MTLFunction>> = library
-            .newFunctionWithName(&fn_name)
-            .expect("Metal: function 'matmul_tiled' not found");
+        let make_pipeline = |name: &str| {
+            let fn_name = NSString::from_str(name);
+            let func: Retained<ProtocolObject<dyn MTLFunction>> = library
+                .newFunctionWithName(&fn_name)
+                .unwrap_or_else(|| panic!("Metal: function '{}' not found", name));
+            device
+                .newComputePipelineStateWithFunction_error(&func)
+                .unwrap_or_else(|_| panic!("Metal: could not create pipeline for '{}'", name))
+        };
 
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&func)
-            .expect("Metal: could not create compute pipeline");
+        let pipeline         = make_pipeline("matmul_tiled");
+        let pipeline_batched = make_pipeline("matmul_tiled_batched");
 
-        MetalContext { device, queue, pipeline }
+        MetalContext { device, queue, pipeline, pipeline_batched }
     }
 
     // -------------------------------------------------------------------------
@@ -307,6 +348,105 @@ kernel void matmul_tiled(
     }
 
     // -------------------------------------------------------------------------
+    // Batched entry point
+    // -------------------------------------------------------------------------
+
+    /// GPU-accelerated batched `C_i = A_i @ B_i` for i in 0..B.
+    ///
+    /// All pairs must have the same shape: A[M,K], B[K,N].
+    /// The B matmuls are dispatched in a single Metal call with the batch
+    /// dimension mapped to the Z axis of the compute grid, so all B slices
+    /// run concurrently on the GPU.
+    ///
+    /// Falls back to B sequential `metal_matmul` calls if any of the
+    /// following is true:
+    /// * `pairs` is empty
+    /// * batch size is 1 (no benefit over the single kernel)
+    /// * problem size per slice is below `METAL_THRESHOLD`
+    pub fn metal_matmul_batched(pairs: &[(&Mat, &Mat)]) -> Vec<Mat> {
+        if pairs.is_empty() { return vec![]; }
+        if pairs.len() == 1 {
+            return vec![metal_matmul(pairs[0].0, pairs[0].1)];
+        }
+
+        let (m, k) = (pairs[0].0.rows, pairs[0].0.cols);
+        let n      =  pairs[0].1.cols;
+
+        // Validate all pairs share the same shape.
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            assert_eq!((a.rows, a.cols), (m, k),
+                "metal_matmul_batched: pair {} A shape [{},{}] != [{},{}]",
+                i, a.rows, a.cols, m, k);
+            assert_eq!((b.rows, b.cols), (k, n),
+                "metal_matmul_batched: pair {} B shape [{},{}] != [{},{}]",
+                i, b.rows, b.cols, k, n);
+        }
+
+        let batch = pairs.len();
+
+        // Small problem — fall back to sequential single-kernel calls.
+        if m * k * n < METAL_THRESHOLD {
+            return pairs.iter().map(|(a, b)| metal_matmul(a, b)).collect();
+        }
+
+        METAL_CTX.with(|cell| {
+            let ctx = cell.get_or_init(init_context);
+
+            // Pack all A slices contiguously, then all B slices.
+            let a_flat: Vec<f32> = pairs.iter().flat_map(|(a, _)| a.data.iter().cloned()).collect();
+            let b_flat: Vec<f32> = pairs.iter().flat_map(|(_, b)| b.data.iter().cloned()).collect();
+
+            let buf_a = upload(&ctx.device, &a_flat);
+            let buf_b = upload(&ctx.device, &b_flat);
+            let buf_c = alloc_output(&ctx.device, batch * m * n);
+            let buf_m = upload_u32(&ctx.device, m as u32);
+            let buf_k = upload_u32(&ctx.device, k as u32);
+            let buf_n = upload_u32(&ctx.device, n as u32);
+
+            let cmd_buf = ctx.queue
+                .commandBuffer()
+                .expect("Metal: commandBuffer() failed");
+
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .expect("Metal: computeCommandEncoder() failed");
+
+            encoder.setComputePipelineState(&ctx.pipeline_batched);
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&buf_m), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&buf_k), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(&buf_n), 0, 5);
+            }
+
+            // XY grid: 16×16 tiles over [M, N].  Z grid: batch size B.
+            let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
+            let grid_size = MTLSize {
+                width:  (n + 15) / 16,
+                height: (m + 15) / 16,
+                depth:  batch,
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
+            encoder.endEncoding();
+
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+
+            // Unpack the packed output buffer into B separate Mat values.
+            let ptr = buf_c.contents().as_ptr() as *const f32;
+            let out_flat: &[f32] = unsafe { std::slice::from_raw_parts(ptr, batch * m * n) };
+
+            (0..batch).map(|b| {
+                let start = b * m * n;
+                Mat::new(out_flat[start..start + m * n].to_vec(), m, n)
+            }).collect()
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------------
     #[cfg(test)]
@@ -394,8 +534,75 @@ kernel void matmul_tiled(
                 assert!((got.at(r, c) - cpu.at(r, c)).abs() < 1e-5);
             }}
         }
+
+        // --- Batched kernel tests ---
+
+        #[test]
+        fn test_metal_matmul_batched_matches_single() {
+            // Each C_i = A_i @ B_i should equal individual metal_matmul results.
+            let m = 32; let k = 16; let n = 24;
+            let pairs: Vec<(Mat, Mat)> = (0..4).map(|b| {
+                let a = Mat::from_fn(m, k, |r, c| ((b * 100 + r * k + c) as f32) * 0.01);
+                let bm = Mat::from_fn(k, n, |r, c| ((b * 50  + r * n + c) as f32) * 0.01 - 0.5);
+                (a, bm)
+            }).collect();
+
+            let refs: Vec<(&Mat, &Mat)> = pairs.iter().map(|(a, b)| (a, b)).collect();
+            let batched = metal_matmul_batched(&refs);
+
+            for (i, ((a, b), got)) in pairs.iter().zip(batched.iter()).enumerate() {
+                let expected = small_matmul_cpu(a, b);
+                assert_eq!(got.rows, m); assert_eq!(got.cols, n);
+                for r in 0..m { for c in 0..n {
+                    let diff = (got.at(r, c) - expected.at(r, c)).abs();
+                    assert!(diff < 1e-3,
+                        "batch {i} [{r},{c}]: got {} expected {}", got.at(r,c), expected.at(r,c));
+                }}
+            }
+        }
+
+        #[test]
+        fn test_metal_matmul_batched_single_pair_delegates() {
+            // batch=1 delegates to single-kernel path, still correct
+            let a = Mat::from_fn(8, 8, |r, c| (r + c) as f32 * 0.1);
+            let b = Mat::from_fn(8, 8, |r, c| (r * c) as f32 * 0.05 + 0.1);
+            let result = metal_matmul_batched(&[(&a, &b)]);
+            assert_eq!(result.len(), 1);
+            let expected = small_matmul_cpu(&a, &b);
+            for r in 0..8 { for c in 0..8 {
+                assert!((result[0].at(r, c) - expected.at(r, c)).abs() < 1e-3);
+            }}
+        }
+
+        #[test]
+        fn test_metal_matmul_batched_empty() {
+            let result = metal_matmul_batched(&[]);
+            assert_eq!(result.len(), 0);
+        }
+
+        #[test]
+        fn test_metal_matmul_batched_non_square() {
+            // Verify non-square matrices work across a batch
+            let m = 5; let k = 7; let n = 3;
+            let pairs: Vec<(Mat, Mat)> = (0..3).map(|b| {
+                let a = Mat::from_fn(m, k, |r, c| (b * 10 + r + c) as f32);
+                let bm = Mat::from_fn(k, n, |r, c| (r * c + b + 1) as f32 * 0.1);
+                (a, bm)
+            }).collect();
+            let refs: Vec<(&Mat, &Mat)> = pairs.iter().map(|(a, b)| (a, b)).collect();
+            let batched = metal_matmul_batched(&refs);
+            assert_eq!(batched.len(), 3);
+            for (i, ((a, b), got)) in pairs.iter().zip(batched.iter()).enumerate() {
+                let expected = small_matmul_cpu(a, b);
+                for r in 0..m { for c in 0..n {
+                    let diff = (got.at(r, c) - expected.at(r, c)).abs();
+                    assert!(diff < 1e-2, "batch {i} [{r},{c}]: {:.4} vs {:.4}",
+                        got.at(r,c), expected.at(r,c));
+                }}
+            }
+        }
     }
 }
 
 #[cfg(feature = "metal")]
-pub use inner::metal_matmul;
+pub use inner::{metal_matmul, metal_matmul_batched};
