@@ -484,37 +484,50 @@ impl Gpt2 {
 
 /// KV cache for a single attention head.
 pub struct HeadKvCache {
-    pub k: Mat,    // [seq_len, d_head]  — grows as tokens are decoded
+    pub k: Mat,    // [seq_len, d_head]  — capped at context_length rows
     pub v: Mat,    // [seq_len, d_head]
     d_head: usize,
+    max_len: usize,
 }
 
 impl HeadKvCache {
-    fn new(d_head: usize) -> Self {
+    fn new(d_head: usize, max_len: usize) -> Self {
         HeadKvCache {
             k:      Mat::zeros(0, d_head),
             v:      Mat::zeros(0, d_head),
             d_head,
+            max_len,
         }
     }
 
-    /// Append one new row (one new token's K or V) to the cache.
+    /// Append one new row to the cache, evicting the oldest if at capacity.
     fn append_k(&mut self, row: &[f32]) {
         assert_eq!(row.len(), self.d_head);
-        let old_rows = self.k.rows;
-        let mut new_data = Vec::with_capacity((old_rows + 1) * self.d_head);
-        new_data.extend_from_slice(&self.k.data);
+        let start = if self.k.rows >= self.max_len {
+            // Drop the oldest row by skipping the first d_head elements
+            self.d_head
+        } else {
+            0
+        };
+        let mut new_data = Vec::with_capacity(self.max_len * self.d_head);
+        new_data.extend_from_slice(&self.k.data[start..]);
         new_data.extend_from_slice(row);
-        self.k = Mat::new(new_data, old_rows + 1, self.d_head);
+        let new_rows = new_data.len() / self.d_head;
+        self.k = Mat::new(new_data, new_rows, self.d_head);
     }
 
     fn append_v(&mut self, row: &[f32]) {
         assert_eq!(row.len(), self.d_head);
-        let old_rows = self.v.rows;
-        let mut new_data = Vec::with_capacity((old_rows + 1) * self.d_head);
-        new_data.extend_from_slice(&self.v.data);
+        let start = if self.v.rows >= self.max_len {
+            self.d_head
+        } else {
+            0
+        };
+        let mut new_data = Vec::with_capacity(self.max_len * self.d_head);
+        new_data.extend_from_slice(&self.v.data[start..]);
         new_data.extend_from_slice(row);
-        self.v = Mat::new(new_data, old_rows + 1, self.d_head);
+        let new_rows = new_data.len() / self.d_head;
+        self.v = Mat::new(new_data, new_rows, self.d_head);
     }
 }
 
@@ -524,8 +537,8 @@ pub struct BlockKvCache {
 }
 
 impl BlockKvCache {
-    fn new(n_heads: usize, d_head: usize) -> Self {
-        BlockKvCache { heads: (0..n_heads).map(|_| HeadKvCache::new(d_head)).collect() }
+    fn new(n_heads: usize, d_head: usize, max_len: usize) -> Self {
+        BlockKvCache { heads: (0..n_heads).map(|_| HeadKvCache::new(d_head, max_len)).collect() }
     }
 }
 
@@ -536,9 +549,10 @@ pub struct Gpt2KvCache {
 
 impl Gpt2KvCache {
     pub fn new(config: &Config) -> Self {
-        let d_head = config.d_head();
+        let d_head  = config.d_head();
+        let max_len = config.context_length;
         let blocks = (0..config.n_layers)
-            .map(|_| RefCell::new(BlockKvCache::new(config.n_heads, d_head)))
+            .map(|_| RefCell::new(BlockKvCache::new(config.n_heads, d_head, max_len)))
             .collect();
         Gpt2KvCache { blocks }
     }
@@ -990,6 +1004,45 @@ mod tests {
         let r1 = model.generate_cached(&[0, 1], 6, 0.0);
         let r2 = model.generate_cached(&[0, 1], 6, 0.0);
         assert_eq!(r1, r2, "greedy generation must be deterministic");
+    }
+
+    #[test]
+    fn test_kv_cache_respects_context_window() {
+        // Generate more tokens than context_length — cache must not grow beyond it.
+        let cfg = nano_config(); // context_length = 8
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let cache = Gpt2KvCache::new(&cfg);
+
+        // Simulate appending context_length + 4 tokens to one head cache
+        let d_head = cfg.d_head();
+        let row = vec![0.1f32; d_head];
+        let head_cache = &mut cache.blocks[0].borrow_mut().heads[0];
+        for _ in 0..(cfg.context_length + 4) {
+            head_cache.append_k(&row);
+            head_cache.append_v(&row);
+        }
+        assert_eq!(head_cache.k.rows, cfg.context_length,
+            "KV cache k rows {} should be capped at context_length {}",
+            head_cache.k.rows, cfg.context_length);
+        assert_eq!(head_cache.v.rows, cfg.context_length,
+            "KV cache v rows {} should be capped at context_length {}",
+            head_cache.v.rows, cfg.context_length);
+    }
+
+    #[test]
+    fn test_generate_cached_streaming_beyond_context() {
+        // Generating more tokens than context_length must complete without panic.
+        let cfg = nano_config(); // context_length = 8
+        let mut rng = make_rng();
+        let model = Gpt2::new(cfg.clone(), &mut rng);
+        let max_new = cfg.context_length + 4;
+        let mut count = 0usize;
+        model.generate_cached_streaming(&[0, 1, 2], max_new, 0.0, 0, |tok| {
+            assert!(tok < cfg.vocab_size);
+            count += 1;
+        });
+        assert_eq!(count, max_new);
     }
 
     // --- Weight tying ---

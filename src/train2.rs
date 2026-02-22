@@ -472,63 +472,6 @@ fn estimate_loss2(model: &Gpt2, data: &TextDataset, n_samples: usize) -> f32 {
     total / n_samples as f32
 }
 
-// =============================================================================
-// Text generation
-// =============================================================================
-
-pub fn generate2(
-    model: &Gpt2,
-    tokenizer: &CharTokenizer,
-    prompt: &str,
-    max_new_tokens: usize,
-    temperature: f32,
-    top_k: usize,
-) -> String {
-    use crate::tokenizer::Tokenizer;
-
-    let ctx_len = model.config.context_length;
-    let vocab_size = model.config.vocab_size;
-
-    let mut token_ids: Vec<usize> = tokenizer.encode(prompt)
-        .iter()
-        .map(|&x| x as usize)
-        .collect();
-
-    print!("{}", prompt);
-
-    for _ in 0..max_new_tokens {
-        let context: Vec<usize> = if token_ids.len() > ctx_len {
-            token_ids[token_ids.len() - ctx_len..].to_vec()
-        } else {
-            token_ids.clone()
-        };
-
-        for p in model.parameters() { p.zero_grad(); }
-        let logits_node = model.forward(&context);
-        let logits = logits_node.data(); // [T, V]
-        let t = logits.rows;
-
-        // Get last row and apply temperature
-        let mut probs = vec![0.0f32; vocab_size];
-        let row_max = (0..vocab_size).map(|c| logits.at(t - 1, c)).fold(f32::NEG_INFINITY, f32::max);
-        let mut sum_exp = 0.0f32;
-        for c in 0..vocab_size {
-            let e = ((logits.at(t - 1, c) - row_max) / temperature).exp();
-            probs[c] = e;
-            sum_exp += e;
-        }
-        for p in &mut probs { *p /= sum_exp; }
-
-        let next_token = sample_top_k(&probs, top_k);
-        let ch = tokenizer.decode(&[next_token as u32]);
-        print!("{}", ch);
-        token_ids.push(next_token);
-    }
-
-    println!();
-
-    tokenizer.decode(&token_ids.iter().map(|&x| x as u32).collect::<Vec<_>>())
-}
 
 /// Sample from the top-k entries of a probability distribution.
 fn sample_top_k(probs: &[f32], k: usize) -> usize {
