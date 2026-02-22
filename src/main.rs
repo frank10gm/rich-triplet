@@ -277,7 +277,6 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     eprintln!("[ Gemma3 ] Loading weights from {}...", weights_dir);
     model.load_weights_from_dir(weights_dir)
         .expect("failed to load weights");
-    model.quantize_inference_free_f32();
 
     let token_ids: Vec<usize> = tok.encode(prompt).iter().map(|&id| id as usize).collect();
     if token_ids.is_empty() {

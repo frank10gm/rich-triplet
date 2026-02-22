@@ -376,6 +376,7 @@ impl Gemma3Model {
             in_features: cfg.hidden_size,
             out_features: cfg.vocab_size,
             q4_weight: None,
+            bf16_weight: None,
         };
 
         Gemma3Model { embed_tokens: embed, layers, norm, lm_head, config: cfg }
@@ -637,14 +638,14 @@ fn apply_tensor_inner(
     // Strip optional "language_model." prefix (present in vision-language model checkpoints)
     let name = t.name.strip_prefix("language_model.").unwrap_or(t.name.as_str());
 
-    // Global tensors
+    // Global tensors — embeddings and norms stay as f32 (they are small
+    // and used differently from projection weights).
     if name == "model.embed_tokens.weight" {
         return Some(set_node(&model.embed_tokens, &t.data, t.shape[0], t.shape[1]));
     }
     if name == "model.norm.weight" {
         return Some(set_node(&model.norm.gamma, &t.data, 1, t.shape[0]));
     }
-    // lm_head may or may not be present (weight tying means it may just reference embed)
     if name == "lm_head.weight" {
         return Some(set_node(&model.lm_head.weight, &t.data, t.shape[0], t.shape[1]));
     }
@@ -658,6 +659,7 @@ fn apply_tensor_inner(
     let layer = &mut model.layers[layer_idx];
 
     match layer_name {
+        // Layer-norm weights are small scalars — keep as f32.
         "input_layernorm.weight" =>
             Some(set_node(&layer.input_layernorm.gamma, &t.data, 1, t.shape[0])),
         "post_attention_layernorm.weight" =>
@@ -666,31 +668,54 @@ fn apply_tensor_inner(
             Some(set_node(&layer.pre_feedforward_layernorm.gamma, &t.data, 1, t.shape[0])),
         "post_feedforward_layernorm.weight" =>
             Some(set_node(&layer.post_feedforward_layernorm.gamma, &t.data, 1, t.shape[0])),
-        "self_attn.q_proj.weight" =>
-            Some(set_node(&layer.self_attn.q_proj.weight, &t.data, t.shape[0], t.shape[1])),
-        "self_attn.k_proj.weight" =>
-            Some(set_node(&layer.self_attn.k_proj.weight, &t.data, t.shape[0], t.shape[1])),
-        "self_attn.v_proj.weight" =>
-            Some(set_node(&layer.self_attn.v_proj.weight, &t.data, t.shape[0], t.shape[1])),
-        "self_attn.o_proj.weight" =>
-            Some(set_node(&layer.self_attn.o_proj.weight, &t.data, t.shape[0], t.shape[1])),
         "self_attn.q_norm.weight" =>
             Some(set_node(&layer.self_attn.q_norm.gamma, &t.data, 1, t.shape[0])),
         "self_attn.k_norm.weight" =>
             Some(set_node(&layer.self_attn.k_norm.gamma, &t.data, 1, t.shape[0])),
+
+        // Large projection weights: store as BF16 when available (lossless, 2× RAM).
+        "self_attn.q_proj.weight" =>
+            Some(set_linear(&mut layer.self_attn.q_proj, t, t.shape[0], t.shape[1])),
+        "self_attn.k_proj.weight" =>
+            Some(set_linear(&mut layer.self_attn.k_proj, t, t.shape[0], t.shape[1])),
+        "self_attn.v_proj.weight" =>
+            Some(set_linear(&mut layer.self_attn.v_proj, t, t.shape[0], t.shape[1])),
+        "self_attn.o_proj.weight" =>
+            Some(set_linear(&mut layer.self_attn.o_proj, t, t.shape[0], t.shape[1])),
         "mlp.gate_proj.weight" =>
-            Some(set_node(&layer.mlp.gate_proj.weight, &t.data, t.shape[0], t.shape[1])),
+            Some(set_linear(&mut layer.mlp.gate_proj, t, t.shape[0], t.shape[1])),
         "mlp.up_proj.weight" =>
-            Some(set_node(&layer.mlp.up_proj.weight, &t.data, t.shape[0], t.shape[1])),
+            Some(set_linear(&mut layer.mlp.up_proj, t, t.shape[0], t.shape[1])),
         "mlp.down_proj.weight" =>
-            Some(set_node(&layer.mlp.down_proj.weight, &t.data, t.shape[0], t.shape[1])),
+            Some(set_linear(&mut layer.mlp.down_proj, t, t.shape[0], t.shape[1])),
         _ => Some(false),
     }
 }
 
+/// Set a TensorNode's f32 data directly (used for small tensors: norms, embeddings).
 fn set_node(node: &TensorNode, data: &[f32], rows: usize, cols: usize) -> bool {
     if data.len() != rows * cols { return false; }
     node.set_data(Mat::new(data.to_vec(), rows, cols));
+    true
+}
+
+/// Set a Linear2 weight, preferring BF16 storage when the tensor was BF16 on disk.
+/// Falls back to f32 if no BF16 data is available (e.g. F32 or F16 safetensors).
+fn set_linear(
+    linear: &mut crate::nn2::Linear2,
+    t: &crate::transformer3::SafeTensor,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    if let Some(ref bits) = t.bf16_data {
+        if bits.len() == rows * cols {
+            linear.load_bf16(bits.clone(), rows, cols);
+            return true;
+        }
+    }
+    // Fallback: store as f32
+    if t.data.len() != rows * cols { return false; }
+    linear.weight.set_data(Mat::new(t.data.clone(), rows, cols));
     true
 }
 

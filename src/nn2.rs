@@ -23,7 +23,7 @@
 /// raw data and a gradient accumulator. The optimizer reads `.grad()` and
 /// writes `.set_data()` directly on these leaf nodes.
 
-use crate::autograd2::{TensorNode, Mat, Q4Mat};
+use crate::autograd2::{TensorNode, Mat, MatBf16, Q4Mat};
 use crate::nn::InitRng; // reuse the RNG from Phase 2
 
 // =============================================================================
@@ -115,6 +115,9 @@ pub struct Linear2 {
     /// INT4 quantized weight, set by `quantize()`.
     /// When present, forward uses `matmul_q4_t` instead of the f32 weight.
     pub q4_weight: Option<Q4Mat>,
+    /// BF16 weight storage (inference-only). When present and q4_weight is
+    /// absent, forward dequantizes on-the-fly: 2× less RAM than f32, lossless.
+    pub bf16_weight: Option<MatBf16>,
 }
 
 impl Linear2 {
@@ -128,6 +131,7 @@ impl Linear2 {
             in_features,
             out_features,
             q4_weight: None,
+            bf16_weight: None,
         }
     }
 
@@ -144,6 +148,7 @@ impl Linear2 {
             in_features,
             out_features,
             q4_weight: None,
+            bf16_weight: None,
         }
     }
 
@@ -175,23 +180,38 @@ impl Linear2 {
     }
 
     /// Fused linear: output = input @ weight.T + bias
+    /// Store weights as BF16 for inference-only use (lossless, 2× less RAM).
+    ///
+    /// Clears the f32 TensorNode weight so it doesn't consume memory.
+    /// Do NOT call this if you need backward passes.
+    pub fn load_bf16(&mut self, bits: Vec<u16>, rows: usize, cols: usize) {
+        self.bf16_weight = Some(MatBf16 { data: bits, rows, cols });
+        self.weight.set_data(Mat::zeros(0, 0));
+    }
+
     /// Keeps weight directly in the graph so its gradient is tracked.
     ///
-    /// When a Q4 weight has been stored via `quantize()`, the forward matmul
-    /// uses `matmul_q4_t` (INT4, no alloc) instead of f32.  The backward pass
-    /// still uses the f32 weight for exact gradients.
+    /// Priority: INT4 (q4_weight) > BF16 (bf16_weight) > f32 (weight).
     fn fused_linear(&self, input: &TensorNode) -> TensorNode {
         // We implement linear as a single custom node that tracks both
         // input and weight — avoiding a separate transpose node.
         let x = input.data().clone();
         let b = self.bias.data().clone();
 
-        // Forward matmul: use INT4 path if available, f32 otherwise.
+        // Forward matmul: INT4 > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
             assert_eq!(x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
-            // q4.matmul_q4_t(x) computes x @ q4.T  : [T, out_features]
             let mut o = q4.matmul_q4_t(&x);
+            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
+            o
+        } else if let Some(ref bf16) = self.bf16_weight {
+            // Dequantize BF16 → f32 on the fly (one bit-shift per element).
+            let w = bf16.to_f32();
+            assert_eq!(x.cols, w.cols,
+                "Linear (bf16): input cols {} != weight cols {}", x.cols, w.cols);
+            let wt = w.transpose();
+            let mut o = x.matmul(&wt);
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o
         } else {

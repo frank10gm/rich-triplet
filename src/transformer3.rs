@@ -1489,7 +1489,8 @@ impl GptOssModel {
 pub struct SafeTensor {
     pub name:   String,
     pub shape:  Vec<usize>,
-    pub data:   Vec<f32>,    // always f32 after conversion
+    pub data:   Vec<f32>,             // always f32 after conversion
+    pub bf16_data: Option<Vec<u16>>,  // raw BF16 bits, set only when dtype was BF16
 }
 
 /// Load all tensors from a safetensors binary blob (the raw file bytes).
@@ -1575,24 +1576,39 @@ fn parse_tensor_value(name: String, value_json: String, data_section: &[u8]) -> 
     if byte_end > data_section.len() { return None; }
 
     let raw = &data_section[byte_start..byte_end];
+
+    let bf16_data: Option<Vec<u16>>;
     let data: Vec<f32> = match dtype.as_str() {
-        "F32" => raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                    .collect(),
-        "BF16" => raw.chunks_exact(2)
-                     .map(|c| {
-                         let bits = u16::from_le_bytes(c.try_into().unwrap()) as u32;
-                         f32::from_bits(bits << 16)
-                     })
-                     .collect(),
-        "F16" => raw.chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
-                    .collect(),
+        "F32" => {
+            bf16_data = None;
+            raw.chunks_exact(4)
+               .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+               .collect()
+        }
+        "BF16" => {
+            // Preserve raw u16 bits so callers can store weights in BF16
+            // without the f32 round-trip cost. Also compute f32 for callers
+            // that still need it (e.g. layer-norm weights, embeddings).
+            let bits: Vec<u16> = raw.chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let f32s = bits.iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+            bf16_data = Some(bits);
+            f32s
+        }
+        "F16" => {
+            bf16_data = None;
+            raw.chunks_exact(2)
+               .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+               .collect()
+        }
         _ => return None,
     };
 
     let shape: Vec<usize> = shape.iter().map(|&v| v as usize).collect();
-    Some(SafeTensor { name, shape, data })
+    Some(SafeTensor { name, shape, data, bf16_data })
 }
 
 /// Extract the string value of `"key":"value"` from a JSON object string.
