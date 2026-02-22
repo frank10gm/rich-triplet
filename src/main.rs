@@ -287,7 +287,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     print!("{}", prompt);
     std::io::stdout().flush().ok();
 
-    model.generate_streaming(&token_ids, args.max_new, args.temperature, args.top_k, args.seed, |tok_id| {
+    model.generate_cached_streaming(&token_ids, args.max_new, args.temperature, args.top_k, args.seed, |tok_id| {
         let text = tok.decode(&[tok_id as u32]);
         print!("{}", text);
         std::io::stdout().flush().ok();

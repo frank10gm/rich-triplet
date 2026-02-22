@@ -38,6 +38,7 @@
 use crate::autograd2::{TensorNode, Mat};
 use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2, Trainable};
 use crate::nn::InitRng;
+use std::cell::RefCell;
 
 // ============================================================================
 // Config4 — Gemma 3 hyperparameters
@@ -70,6 +71,8 @@ pub struct Config4 {
     pub query_pre_attn_scalar: f32,
     /// EOS token id (used to stop generation).
     pub eos_token_id: usize,
+    /// Maximum sequence length for KV cache allocation.
+    pub max_position_embeddings: usize,
 }
 
 impl Config4 {
@@ -90,6 +93,7 @@ impl Config4 {
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
             eos_token_id: 1,      // <eos> in Gemma tokenizer
+            max_position_embeddings: 32768,
         }
     }
 
@@ -110,6 +114,7 @@ impl Config4 {
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
             eos_token_id: 1,
+            max_position_embeddings: 32768,
         }
     }
 
@@ -655,6 +660,246 @@ fn set_node(node: &TensorNode, data: &[f32], rows: usize, cols: usize) -> bool {
 }
 
 // ============================================================================
+// KV cache — per-layer storage for autoregressive decoding
+// ============================================================================
+
+/// Per-layer K/V cache for Gemma 3 autoregressive decoding.
+///
+/// Pre-allocated to `max_position_embeddings` rows.  During generation
+/// rows are filled one step at a time; `seq_len` tracks how many are valid.
+pub struct Gemma3LayerKvCache {
+    /// [max_seq_len, n_kv_heads * head_dim]
+    pub k: Mat,
+    /// [max_seq_len, n_kv_heads * head_dim]
+    pub v: Mat,
+    /// Number of valid (filled) rows.
+    pub seq_len: usize,
+}
+
+impl Gemma3LayerKvCache {
+    pub fn new(n_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
+        Gemma3LayerKvCache {
+            k: Mat::zeros(max_seq_len, n_kv_heads * head_dim),
+            v: Mat::zeros(max_seq_len, n_kv_heads * head_dim),
+            seq_len: 0,
+        }
+    }
+
+    /// Append `new_k` / `new_v` rows (both [n_new, n_kv_heads * head_dim]).
+    pub fn append(&mut self, new_k: &Mat, new_v: &Mat) {
+        let n_new = new_k.rows;
+        let d     = new_k.cols;
+        for r in 0..n_new {
+            for c in 0..d {
+                *self.k.at_mut(self.seq_len + r, c) = new_k.at(r, c);
+                *self.v.at_mut(self.seq_len + r, c) = new_v.at(r, c);
+            }
+        }
+        self.seq_len += n_new;
+    }
+
+    /// Return filled portion of K: [seq_len, cols].
+    pub fn k_filled(&self) -> Mat {
+        Mat::from_fn(self.seq_len, self.k.cols, |r, c| self.k.at(r, c))
+    }
+
+    /// Return filled portion of V: [seq_len, cols].
+    pub fn v_filled(&self) -> Mat {
+        Mat::from_fn(self.seq_len, self.v.cols, |r, c| self.v.at(r, c))
+    }
+
+    /// Return last `window` rows of K (or all rows when seq_len < window).
+    pub fn k_last(&self, window: usize) -> Mat {
+        let start = self.seq_len.saturating_sub(window);
+        let rows  = self.seq_len - start;
+        Mat::from_fn(rows, self.k.cols, |r, c| self.k.at(start + r, c))
+    }
+
+    /// Return last `window` rows of V (or all rows when seq_len < window).
+    pub fn v_last(&self, window: usize) -> Mat {
+        let start = self.seq_len.saturating_sub(window);
+        let rows  = self.seq_len - start;
+        Mat::from_fn(rows, self.v.cols, |r, c| self.v.at(start + r, c))
+    }
+}
+
+/// Full KV cache for all Gemma 3 layers.
+pub struct Gemma3KvCache {
+    pub layers: Vec<RefCell<Gemma3LayerKvCache>>,
+}
+
+impl Gemma3KvCache {
+    pub fn new(config: &Config4) -> Self {
+        let nkv = config.num_key_value_heads;
+        let d   = config.head_dim;
+        let max = config.max_position_embeddings;
+        let layers = (0..config.num_hidden_layers)
+            .map(|_| RefCell::new(Gemma3LayerKvCache::new(nkv, d, max)))
+            .collect();
+        Gemma3KvCache { layers }
+    }
+
+    /// Reset all layers (start a new sequence).
+    pub fn clear(&self) {
+        for layer in &self.layers {
+            layer.borrow_mut().seq_len = 0;
+        }
+    }
+}
+
+// ============================================================================
+// Cached forward passes
+// ============================================================================
+
+impl Gemma3Attention {
+    /// Cached forward: `x` is [n_new, hidden] — typically 1 token during decode.
+    ///
+    /// Steps:
+    ///   1. Project → Q [n_new, nq*d], K [n_new, nkv*d], V [n_new, nkv*d]
+    ///   2. Per-head RMSNorm on Q and K (before RoPE, Gemma 3 specific)
+    ///   3. RoPE at absolute positions [cache.seq_len .. cache.seq_len + n_new)
+    ///   4. Append K, V to cache
+    ///   5. Select context: last `window` rows (local) or full cache (global)
+    ///   6. GQA attention (no causal mask — cache only holds past tokens)
+    ///   7. Output projection
+    pub fn forward_cached(
+        &self,
+        x: &TensorNode,
+        cache: &mut Gemma3LayerKvCache,
+    ) -> TensorNode {
+        let n_new      = x.data().rows;
+        let d          = self.head_dim;
+        let nq         = self.n_q_heads;
+        let nkv        = self.n_kv_heads;
+        let seq_offset = cache.seq_len;
+
+        // 1. Projections
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        // 2. Per-head RMSNorm
+        let q = apply_per_head_norm(&q, &self.q_norm, n_new, nq,  d);
+        let k = apply_per_head_norm(&k, &self.k_norm, n_new, nkv, d);
+
+        // 3. RoPE at absolute positions
+        let q = apply_rope_at_offset(&q, nq,  n_new, d, self.rope_theta, seq_offset);
+        let k = apply_rope_at_offset(&k, nkv, n_new, d, self.rope_theta, seq_offset);
+
+        // 4. Append to cache
+        cache.append(&k.data().clone(), &v.data().clone());
+
+        // 5. Select context window
+        let (k_ctx, v_ctx) = match self.sliding_window {
+            Some(w) => (cache.k_last(w), cache.v_last(w)),
+            None    => (cache.k_filled(), cache.v_filled()),
+        };
+
+        // 6. GQA attention
+        let attn_out = gqa_attention_cached(
+            &q.data(), &k_ctx, &v_ctx, nq, nkv, d, self.attn_scale,
+        );
+
+        // 7. Output projection
+        self.o_proj.forward(&TensorNode::leaf(attn_out))
+    }
+}
+
+impl Gemma3Block {
+    /// Cached forward: `x` is [n_new, hidden].
+    ///
+    /// Mirrors the 4-norm Gemma 3 block structure exactly, using the KV cache
+    /// for attention.  The MLP always processes n_new tokens (no FFN cache).
+    pub fn forward_cached(
+        &self,
+        x: &TensorNode,
+        cache: &mut Gemma3LayerKvCache,
+    ) -> TensorNode {
+        let normed  = self.input_layernorm.forward(x);
+        let attn    = self.self_attn.forward_cached(&normed, cache);
+        let attn    = self.post_attention_layernorm.forward(&attn);
+        let x2      = x.add(&attn);
+
+        let normed2  = self.pre_feedforward_layernorm.forward(&x2);
+        let mlp_out  = self.mlp.forward(&normed2);
+        let mlp_out  = self.post_feedforward_layernorm.forward(&mlp_out);
+        x2.add(&mlp_out)
+    }
+}
+
+impl Gemma3Model {
+    /// Generate `max_new` tokens using a KV cache.
+    ///
+    /// Each decode step runs only 1 token through the model, reducing
+    /// generation from O(N²·T) to O(N·T) — a factor of `max_new` speedup.
+    ///
+    /// Prefill: run the full prompt through `forward_cached` once per layer,
+    /// filling the cache.  Sample the first new token from the last logit row.
+    ///
+    /// Decode: run 1 token per step.  K/V is appended to the cache; local
+    /// layers attend to the last `window` entries, global layers to all.
+    pub fn generate_cached_streaming(
+        &self,
+        token_ids: &[usize],
+        max_new: usize,
+        temperature: f32,
+        top_k: usize,
+        seed: u64,
+        mut callback: impl FnMut(usize),
+    ) {
+        use crate::transformer3::SamplingParams;
+
+        let params = SamplingParams {
+            temperature,
+            top_k,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed,
+            eos_token_id: Some(self.config.eos_token_id),
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+        };
+
+        let cache  = Gemma3KvCache::new(&self.config);
+        let h      = self.config.hidden_size;
+        let scale  = (h as f32).sqrt();
+        let te     = self.embed_tokens.data().clone();
+        let mut rng  = LcgRng::new(seed);
+        let mut seen: Vec<usize> = token_ids.to_vec();
+
+        // ----- Prefill -----
+        let t_prompt = token_ids.len();
+        let x_data = Mat::from_fn(t_prompt, h, |row, col| {
+            te.at(token_ids[row], col) * scale
+        });
+        let mut x = TensorNode::leaf(x_data);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+        }
+        let logits_node = self.lm_head.forward(&self.norm.forward(&x));
+        let first = sample_token(&logits_node.data(), t_prompt - 1, &params, &seen, &mut rng);
+        callback(first);
+        seen.push(first);
+        if params.eos_token_id == Some(first) { return; }
+
+        // ----- Decode loop -----
+        let mut prev = first;
+        for _ in 1..max_new {
+            let x_data = Mat::from_fn(1, h, |_, col| te.at(prev, col) * scale);
+            let mut x = TensorNode::leaf(x_data);
+            for (i, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+            }
+            let logits_node = self.lm_head.forward(&self.norm.forward(&x));
+            prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
+            callback(prev);
+            seen.push(prev);
+            if params.eos_token_id == Some(prev) { break; }
+        }
+    }
+}
+
+// ============================================================================
 // Attention helpers
 // ============================================================================
 
@@ -905,6 +1150,101 @@ fn gqa_attention_windowed(
     TensorNode::leaf(out_data)
 }
 
+/// Apply RoPE to [n_new, n_heads * head_dim] with positions starting at `offset`.
+///
+/// Used in the KV-cached decode path where token row `r` is at absolute
+/// sequence position `offset + r`.  This is the inference-only counterpart
+/// to `apply_rope_to_all_heads` (which always starts at position 0).
+fn apply_rope_at_offset(
+    x: &TensorNode,
+    n_heads: usize,
+    n_new: usize,
+    head_dim: usize,
+    theta: f32,
+    offset: usize,
+) -> TensorNode {
+    let x_data = x.data().clone();
+    let mut out = x_data.clone();
+    for h in 0..n_heads {
+        for row in 0..n_new {
+            let pos   = offset + row;
+            let pairs = head_dim / 2;
+            for i in 0..pairs {
+                let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let c0 = h * head_dim + 2 * i;
+                let c1 = h * head_dim + 2 * i + 1;
+                let x0 = x_data.at(row, c0);
+                let x1 = x_data.at(row, c1);
+                *out.at_mut(row, c0) = x0 * cos_a - x1 * sin_a;
+                *out.at_mut(row, c1) = x1 * cos_a + x0 * sin_a;
+            }
+        }
+    }
+    // Inference-only: plain leaf, no backward.
+    TensorNode::leaf(out)
+}
+
+/// GQA attention for the cached decode path (no causal mask needed).
+///
+/// q [n_new, nq*d]  vs  k_ctx [T', nkv*d], v_ctx [T', nkv*d]
+/// → output Mat [n_new, nq*d]
+///
+/// The cache already contains only past tokens, so no causal masking is
+/// required.  Uses the caller-supplied `scale` (Gemma 3's
+/// `1/sqrt(query_pre_attn_scalar)`, not the default `1/sqrt(d_head)`).
+fn gqa_attention_cached(
+    q_data: &Mat,
+    k_ctx:  &Mat,
+    v_ctx:  &Mat,
+    n_q_heads:  usize,
+    n_kv_heads: usize,
+    d_head:     usize,
+    scale:      f32,
+) -> Mat {
+    let t_q  = q_data.rows;
+    let t_kv = k_ctx.rows;
+    let group = n_q_heads / n_kv_heads;
+    let mut out = Mat::zeros(t_q, n_q_heads * d_head);
+
+    for qh in 0..n_q_heads {
+        let kvh = qh / group;
+
+        let q_h = Mat::from_fn(t_q,  d_head, |r, c| q_data.at(r, qh  * d_head + c));
+        let k_h = Mat::from_fn(t_kv, d_head, |r, c| k_ctx.at(r, kvh * d_head + c));
+        let v_h = Mat::from_fn(t_kv, d_head, |r, c| v_ctx.at(r, kvh * d_head + c));
+
+        // scores [t_q, t_kv] scaled
+        let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+
+        // Softmax over t_kv dimension
+        let mut w = Mat::zeros(t_q, t_kv);
+        for r in 0..t_q {
+            let row_max = (0..t_kv).map(|c| scores.at(r, c))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut row_sum = 0.0f32;
+            for c in 0..t_kv {
+                let e = (scores.at(r, c) - row_max).exp();
+                *w.at_mut(r, c) = e;
+                row_sum += e;
+            }
+            if row_sum > 0.0 {
+                for c in 0..t_kv { *w.at_mut(r, c) /= row_sum; }
+            }
+        }
+
+        // Output [t_q, d_head]
+        let out_h = w.matmul(&v_h);
+        for r in 0..t_q {
+            for c in 0..d_head {
+                *out.at_mut(r, qh * d_head + c) = out_h.at(r, c);
+            }
+        }
+    }
+    out
+}
+
 /// Multiply a TensorNode's data by a scalar (with backward).
 fn scale_tensor(x: &TensorNode, factor: f32) -> TensorNode {
     if (factor - 1.0).abs() < 1e-9 { return x.clone(); }
@@ -1019,6 +1359,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 16.0,  // matches head_dim for this tiny cfg
             eos_token_id: 1,
+            max_position_embeddings: 128,
         }
     }
 
@@ -1191,5 +1532,118 @@ mod tests {
         });
         assert!(!generated.is_empty(), "should generate at least one token");
         assert!(generated.len() <= 5);
+    }
+
+    // -------------------------------------------------------------------------
+    // KV cache tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_layer_kv_cache_append_and_len() {
+        let mut cache = Gemma3LayerKvCache::new(1, 16, 64);
+        assert_eq!(cache.seq_len, 0);
+        cache.append(&Mat::zeros(3, 16), &Mat::zeros(3, 16));
+        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.k_filled().rows, 3);
+        cache.append(&Mat::zeros(1, 16), &Mat::zeros(1, 16));
+        assert_eq!(cache.seq_len, 4);
+    }
+
+    #[test]
+    fn test_layer_kv_cache_k_last_window() {
+        let d = 2;
+        let mut cache = Gemma3LayerKvCache::new(1, d, 32);
+        for i in 0..10usize {
+            let row = Mat::from_fn(1, d, |_, c| (i * d + c) as f32);
+            cache.append(&row, &row);
+        }
+        assert_eq!(cache.seq_len, 10);
+        let k_win = cache.k_last(4);
+        assert_eq!(k_win.rows, 4);
+        // rows 6..10: first row of window is row 6, values 12, 13
+        assert!((k_win.at(0, 0) - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_gemma3_kv_cache_new_and_clear() {
+        let cfg = tiny_cfg();
+        let cache = Gemma3KvCache::new(&cfg);
+        assert_eq!(cache.layers.len(), cfg.num_hidden_layers);
+        cache.layers[0].borrow_mut().seq_len = 42;
+        cache.clear();
+        for layer in &cache.layers {
+            assert_eq!(layer.borrow().seq_len, 0);
+        }
+    }
+
+    #[test]
+    fn test_attention_forward_cached_shape_and_cache_grows() {
+        let cfg = tiny_cfg();
+        let mut rng = InitRng::new(55);
+        let attn = Gemma3Attention::new(&cfg, 0, &mut rng);
+        let mut cache = Gemma3LayerKvCache::new(
+            cfg.num_key_value_heads, cfg.head_dim, cfg.max_position_embeddings);
+        let x = TensorNode::leaf(Mat::zeros(1, cfg.hidden_size));
+        let out = attn.forward_cached(&x, &mut cache);
+        assert_eq!(out.data().rows, 1);
+        assert_eq!(out.data().cols, cfg.hidden_size);
+        assert_eq!(cache.seq_len, 1);
+        // Second call: cache grows to 2
+        let out2 = attn.forward_cached(&x, &mut cache);
+        assert_eq!(out2.data().rows, 1);
+        assert_eq!(cache.seq_len, 2);
+    }
+
+    #[test]
+    fn test_generate_cached_streaming_produces_tokens() {
+        let cfg = tiny_cfg();
+        let mut rng = InitRng::new(7);
+        let model = Gemma3Model::new(cfg, &mut rng);
+        let mut generated = Vec::new();
+        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 42, |tok| {
+            generated.push(tok);
+        });
+        assert!(!generated.is_empty());
+        assert!(generated.len() <= 5);
+    }
+
+    #[test]
+    fn test_cached_first_token_matches_uncached() {
+        // With temperature=0 (greedy), the first generated token must be
+        // identical whether we use the cached or the non-cached path.
+        let cfg = tiny_cfg();
+        let mut rng = InitRng::new(42);
+        let model = Gemma3Model::new(cfg.clone(), &mut rng);
+        let prompt = vec![0usize, 1, 2, 3];
+
+        // Non-cached: full forward, greedy argmax on last row
+        let logits = model.forward(&prompt);
+        let ldata  = logits.data().clone();
+        let t      = ldata.rows;
+        let v      = ldata.cols;
+        let uncached = (0..v)
+            .max_by(|&a, &b| ldata.at(t-1, a).partial_cmp(&ldata.at(t-1, b)).unwrap())
+            .unwrap();
+
+        // Cached: greedy (temperature=0)
+        let mut cached_tok = usize::MAX;
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |tok| { cached_tok = tok; });
+
+        assert_eq!(uncached, cached_tok,
+            "cached first token {} must match non-cached {}", cached_tok, uncached);
+    }
+
+    #[test]
+    fn test_cached_output_finite_after_long_prefill() {
+        // Prefill with more tokens than the sliding window to exercise the
+        // windowed attention path in local layers.
+        let cfg = tiny_cfg(); // window=8
+        let mut rng = InitRng::new(11);
+        let model = Gemma3Model::new(cfg.clone(), &mut rng);
+        let prompt: Vec<usize> = (0..20).map(|i| i % cfg.vocab_size).collect();
+        let mut toks = Vec::new();
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |t| toks.push(t));
+        assert_eq!(toks.len(), 1);
+        assert!(toks[0] < cfg.vocab_size);
     }
 }
