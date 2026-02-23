@@ -250,18 +250,34 @@ impl GgufFile {
 
     /// Decode a Q4_0 tensor into our internal Q4Mat format.
     ///
-    /// GGUF Q4_0 block: [f16 scale (2 bytes)] [16 bytes nibbles (32 × u4)]
-    /// Nibble value range: 0..15 unsigned, actual = nibble - 8
+    /// ## GGUF Q4_0 block layout (18 bytes for 32 elements):
+    ///   [scale: f16le, 2 bytes]
+    ///   [qs: 16 bytes]
     ///
-    /// Our Q4Mat: same nibble packing but 4-bit two's complement (-7..7)
-    /// with f32 scales where scale = absmax/7.
+    /// Nibble packing in qs is SPLIT (not interleaved):
+    ///   qs[k] low  nibble = element k        (k = 0..15)
+    ///   qs[k] high nibble = element k + 16   (k = 0..15)
     ///
-    /// Conversion:
-    ///   GGUF_scale (f16) encodes absmax/8.
-    ///   Our scale should be absmax/7.
-    ///   So our_scale = gguf_scale * 8/7.
-    ///   Nibbles: GGUF stores v ∈ 0..15; we store v - 8 re-encoded as 4-bit two's complement.
-    ///   Equivalently: our_nibble = (v.wrapping_sub(8)) & 0x0F.
+    /// Nibble values are unsigned 0..15; actual weight = (nibble - 8) * scale.
+    ///
+    /// ## Our Q4Mat layout (interleaved nibbles):
+    ///   packed[k] low  nibble = element 2k
+    ///   packed[k] high nibble = element 2k+1
+    ///   values are 4-bit two's complement; actual weight = nibble_signed * scale
+    ///   where nibble_signed = if nibble >= 8 { nibble - 16 } else { nibble }
+    ///
+    /// ## Conversion:
+    ///   1. Reorder: split layout → interleaved layout
+    ///   2. Remap nibble: v (0..15) → (v - 8) & 0x0F (our two's complement encoding)
+    ///   3. Scale: use GGUF scale directly. GGUF dequant = (nibble-8)*scale.
+    ///             After nibble remapping to two's complement, our dequant = signed*scale.
+    ///             Both give the same result, so no scale adjustment needed.
+    ///
+    /// ## Shape:
+    ///   GGUF stores weight matrices as [in_features, out_features] (transposed vs HuggingFace).
+    ///   Our matmul uses `fused_linear` which does `input @ weight.T`, so weight must be
+    ///   [out_features, in_features]. We transpose on load:
+    ///   GGUF shape[0] = in_features = our cols, shape[1] = out_features = our rows.
     pub fn decode_q4_0_to_q4mat(&self, idx: usize) -> io::Result<Q4Mat> {
         let info = &self.tensor_info[idx];
         assert_eq!(info.gguf_type, GgufType::Q4_0,
@@ -271,11 +287,10 @@ impl GgufFile {
         let n_elem = info.n_elements();
         let n_blocks = (n_elem + 31) / 32;
 
-        // Parse shape: GGUF stores shape as [cols, rows] (Fortran order) for 2D tensors.
-        // We want [rows, cols] (C order) as used in our Mat.
+        // GGUF shape is [in_features, out_features]; we store [out_features, in_features].
         let (rows, cols) = match info.shape.len() {
             1 => (1, info.shape[0]),
-            2 => (info.shape[1], info.shape[0]),  // transpose: GGUF is [cols, rows]
+            2 => (info.shape[1], info.shape[0]),  // transpose
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("unexpected shape rank {} for {}", info.shape.len(), info.name))),
         };
@@ -284,48 +299,48 @@ impl GgufFile {
         let n_packed = (n_elem + 1) / 2;
         let mut packed = vec![0u8; n_packed];
 
+        // Helper: write nibble `v` for absolute element index `elem` into our packed array.
+        // Our layout: packed[elem/2], low nibble if even, high nibble if odd.
+        let set_nibble = |packed: &mut Vec<u8>, elem: usize, v: u8| {
+            let byte_idx = elem / 2;
+            if elem % 2 == 0 {
+                packed[byte_idx] = (packed[byte_idx] & 0xF0) | (v & 0x0F);
+            } else {
+                packed[byte_idx] = (packed[byte_idx] & 0x0F) | ((v & 0x0F) << 4);
+            }
+        };
+
         for b in 0..n_blocks {
             let block_off = b * 18;
-            // f16 scale
-            let scale_bits = u16::from_le_bytes([bytes[block_off], bytes[block_off + 1]]);
-            let gguf_scale = f16_to_f32(scale_bits);
-            // Convert: GGUF scale = absmax/8, ours = absmax/7
-            let our_scale = gguf_scale * (8.0 / 7.0);
-            scales.push(our_scale);
 
-            // 16 bytes of nibbles, 32 nibbles total
-            // GGUF packing: byte k has nibbles for element 2k (low) and 2k+1 (high)
-            // Our packing: element k is at packed[k/2], low nibble if k even, high if k odd
-            // They are identical in packing order — just need to remap value (subtract 8).
+            // f16 scale → f32.
+            // GGUF dequant: (nibble - 8) * scale. After nibble remapping to two's complement,
+            // our dequant does: signed_nibble * scale. Both are equivalent, so store as-is.
+            let scale_bits = u16::from_le_bytes([bytes[block_off], bytes[block_off + 1]]);
+            scales.push(f16_to_f32(scale_bits));
+
             let nibble_off = block_off + 2;
             let start_elem = b * 32;
             let end_elem   = (start_elem + 32).min(n_elem);
 
-            for byte_i in 0..16 {
-                let src_byte = bytes[nibble_off + byte_i];
-                let lo = src_byte & 0x0F;
-                let hi = (src_byte >> 4) & 0x0F;
+            // GGUF split layout:
+            //   qs[k] low  nibble → element (start + k)       for k in 0..16
+            //   qs[k] high nibble → element (start + k + 16)  for k in 0..16
+            for k in 0..16 {
+                let src = bytes[nibble_off + k];
 
-                let elem0 = start_elem + byte_i * 2;
-                let elem1 = elem0 + 1;
-
-                // Remap: GGUF unsigned 0..15 → two's complement (subtract 8)
-                // (v - 8) & 0x0F gives the correct 4-bit two's complement nibble
-                if elem0 < end_elem {
-                    let our_lo = lo.wrapping_sub(8) & 0x0F;
-                    packed[elem0 / 2] = if elem0 % 2 == 0 {
-                        (packed[elem0 / 2] & 0xF0) | our_lo
-                    } else {
-                        (packed[elem0 / 2] & 0x0F) | (our_lo << 4)
-                    };
+                // Low nibble → element start + k
+                let e0 = start_elem + k;
+                if e0 < end_elem {
+                    let v = src & 0x0F;
+                    set_nibble(&mut packed, e0, v.wrapping_sub(8) & 0x0F);
                 }
-                if elem1 < end_elem {
-                    let our_hi = hi.wrapping_sub(8) & 0x0F;
-                    packed[elem1 / 2] = if elem1 % 2 == 0 {
-                        (packed[elem1 / 2] & 0xF0) | our_hi
-                    } else {
-                        (packed[elem1 / 2] & 0x0F) | (our_hi << 4)
-                    };
+
+                // High nibble → element start + k + 16
+                let e1 = start_elem + k + 16;
+                if e1 < end_elem {
+                    let v = (src >> 4) & 0x0F;
+                    set_nibble(&mut packed, e1, v.wrapping_sub(8) & 0x0F);
                 }
             }
         }
