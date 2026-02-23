@@ -2079,9 +2079,7 @@ impl Tokenizer for HfBpeTokenizer {
             };
             out.push_str(tok);
         }
-        // Replace ▁ with space and strip leading space
-        let decoded = out.replace('\u{2581}', " ");
-        decoded.trim_start_matches(' ').to_string()
+        out.replace('\u{2581}', " ")
     }
 
     fn vocab_size(&self) -> usize { self.id_to_token.len() }
