@@ -218,9 +218,22 @@ impl Linear2 {
         let out_data = if let Some(ref q4) = self.q4_weight {
             assert_eq!(x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
-            #[cfg(feature = "metal")]
-            let mut o = crate::metal_ops::metal_matmul_q4_t(&x, q4);
-            #[cfg(not(feature = "metal"))]
+            // Strategy by feature:
+            // - blas: dequantize Q4→f32 once, then use BLAS matmul_bt (AMX/NEON, fast for any M)
+            // - metal (no blas): use Metal GPU kernel for M>1 (prefill), scalar loop for M=1 (decode)
+            // - neither: scalar Q4 loop
+            #[cfg(feature = "blas")]
+            let mut o = {
+                let w = q4.dequantize();
+                x.matmul_bt(&w)
+            };
+            #[cfg(all(feature = "metal", not(feature = "blas")))]
+            let mut o = if x.rows > 1 {
+                crate::metal_ops::metal_matmul_q4_t(&x, q4)
+            } else {
+                q4.matmul_q4_t(&x)
+            };
+            #[cfg(not(any(feature = "blas", feature = "metal")))]
             let mut o = q4.matmul_q4_t(&x);
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o
