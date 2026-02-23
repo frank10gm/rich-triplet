@@ -16,7 +16,8 @@
       "Bash(wc:*)",
       "Bash(ls:*)",
       "Bash(cargo tree:*)",
-      "WebFetch(domain:medium.com)"
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:lib.rs)"
     ]
   }
 }

@@ -564,6 +564,280 @@ impl Gemma3Model {
         self.lm_head.quantize_and_free_f32();
         eprintln!("[ Gemma3 ] Quantization done.");
     }
+
+    // -------------------------------------------------------------------------
+    // GGUF weight loading
+    // -------------------------------------------------------------------------
+
+    /// Load weights from a GGUF file (e.g. google/gemma-3-4b-it-qat-q4_0-gguf).
+    ///
+    /// Supports Q4_0, F32, F16, and BF16 tensors.
+    /// Q4_0 tensors are loaded directly into `Linear2::q4_weight` (no BF16 copy).
+    /// F16 tensors are converted to f32 on load.
+    /// BF16 tensors are stored as `MatBf16` (lossless, 2× less RAM than f32).
+    ///
+    /// Tensor name mapping (GGUF blk.* → HuggingFace model.layers.* convention):
+    /// - `token_embd.weight`           → embed_tokens
+    /// - `output_norm.weight`          → model.norm
+    /// - `blk.{i}.attn_norm.weight`    → input_layernorm
+    /// - `blk.{i}.post_attn_norm.weight` → post_attention_layernorm
+    /// - `blk.{i}.ffn_pre_norm.weight` → pre_feedforward_layernorm
+    /// - `blk.{i}.ffn_post_norm.weight`→ post_feedforward_layernorm
+    /// - `blk.{i}.attn_q_norm.weight`  → self_attn.q_norm
+    /// - `blk.{i}.attn_k_norm.weight`  → self_attn.k_norm
+    /// - `blk.{i}.attn_q.weight`       → self_attn.q_proj
+    /// - `blk.{i}.attn_k.weight`       → self_attn.k_proj
+    /// - `blk.{i}.attn_v.weight`       → self_attn.v_proj
+    /// - `blk.{i}.attn_output.weight`  → self_attn.o_proj
+    /// - `blk.{i}.ffn_gate.weight`     → mlp.gate_proj
+    /// - `blk.{i}.ffn_up.weight`       → mlp.up_proj
+    /// - `blk.{i}.ffn_down.weight`     → mlp.down_proj
+    pub fn load_weights_from_gguf(&mut self, path: &str) -> std::io::Result<()> {
+        use crate::gguf_loader::{GgufFile, GgufType};
+        use crate::autograd2::MatBf16;
+
+        eprintln!("[ GGUF ] Opening {}...", path);
+        let gguf = GgufFile::open(path)?;
+        eprintln!("[ GGUF ] Found {} tensors.", gguf.tensor_info.len());
+
+        // Print architecture metadata
+        if let Some(arch) = gguf.metadata.get("general.architecture").and_then(|v| v.as_str()) {
+            eprintln!("[ GGUF ] Architecture: {}", arch);
+        }
+
+        let n_tensors = gguf.tensor_info.len();
+        let mut loaded = 0usize;
+
+        for idx in 0..n_tensors {
+            let name = gguf.tensor_info[idx].name.clone();
+            let gtype = gguf.tensor_info[idx].gguf_type;
+
+            // Helper: load tensor as f32 vec (handles F32/F16 → f32)
+            let load_f32 = |gguf: &GgufFile, idx: usize| -> std::io::Result<Vec<f32>> {
+                match gguf.tensor_info[idx].gguf_type {
+                    GgufType::F32 => gguf.decode_f32(idx),
+                    GgufType::F16 => gguf.decode_f16_to_f32(idx),
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                        format!("expected f32/f16 for norm tensor {}", gguf.tensor_info[idx].name))),
+                }
+            };
+
+            // ---- token embedding ----
+            if name == "token_embd.weight" {
+                let shape = gguf.tensor_info[idx].shape.clone();
+                // GGUF stores as [cols, rows] — for embed: [hidden, vocab]
+                // We want [vocab, hidden]
+                let (vocab, hidden) = if shape.len() == 2 {
+                    (shape[1], shape[0])
+                } else {
+                    (shape[0], 1)
+                };
+                match gtype {
+                    GgufType::Bf16 => {
+                        let bits = gguf.decode_bf16(idx)?;
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
+                    GgufType::F16 => {
+                        let f32s = gguf.decode_f16_to_f32(idx)?;
+                        let bits: Vec<u16> = f32s.iter()
+                            .map(|&f| MatBf16::f32_to_bf16(f))
+                            .collect();
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
+                    GgufType::F32 => {
+                        let f32s = gguf.decode_f32(idx)?;
+                        let bits: Vec<u16> = f32s.iter()
+                            .map(|&f| MatBf16::f32_to_bf16(f))
+                            .collect();
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
+                    _ => {
+                        eprintln!("[ GGUF ] Warning: token_embd type {:?} not supported, skipping", gtype);
+                    }
+                }
+                loaded += 1;
+                continue;
+            }
+
+            // ---- output norm ----
+            if name == "output_norm.weight" {
+                let f32s = load_f32(&gguf, idx)?;
+                let n = f32s.len();
+                self.norm.gamma.set_data(crate::autograd2::Mat::new(f32s, 1, n));
+                loaded += 1;
+                continue;
+            }
+
+            // ---- per-layer tensors: blk.{i}.* ----
+            if let Some(rest) = name.strip_prefix("blk.") {
+                if let Some(dot) = rest.find('.') {
+                    let layer_idx: usize = match rest[..dot].parse() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if layer_idx >= self.layers.len() { continue; }
+                    let tensor_name = &rest[dot + 1..];
+                    let layer = &mut self.layers[layer_idx];
+
+                    match tensor_name {
+                        // ---- layer norms (f32) ----
+                        "attn_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.input_layernorm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        "post_attn_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.post_attention_layernorm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        "ffn_pre_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.pre_feedforward_layernorm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        "ffn_post_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.post_feedforward_layernorm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        "attn_q_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.self_attn.q_norm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        "attn_k_norm.weight" => {
+                            let f32s = load_f32(&gguf, idx)?;
+                            let n = f32s.len();
+                            layer.self_attn.k_norm.gamma.set_data(
+                                crate::autograd2::Mat::new(f32s, 1, n));
+                            loaded += 1;
+                        }
+                        // ---- projection weights ----
+                        "attn_q.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.q_proj)?;
+                            loaded += 1;
+                        }
+                        "attn_k.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.k_proj)?;
+                            loaded += 1;
+                        }
+                        "attn_v.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.v_proj)?;
+                            loaded += 1;
+                        }
+                        "attn_output.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.o_proj)?;
+                            loaded += 1;
+                        }
+                        "ffn_gate.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.mlp.gate_proj)?;
+                            loaded += 1;
+                        }
+                        "ffn_up.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.mlp.up_proj)?;
+                            loaded += 1;
+                        }
+                        "ffn_down.weight" => {
+                            load_linear_from_gguf(&gguf, idx, &mut layer.mlp.down_proj)?;
+                            loaded += 1;
+                        }
+                        _ => {
+                            // unknown sub-tensor, skip
+                        }
+                    }
+                }
+            }
+
+            if loaded % 50 == 0 && loaded > 0 {
+                eprintln!("[ GGUF ] Loaded {}/{} tensors...", loaded, n_tensors);
+            }
+        }
+
+        // Gemma 3 uses weight tying: lm_head shares embed_tokens weights.
+        // Copy embed_bf16 to lm_head.
+        if let Some(ref e) = self.embed_bf16 {
+            self.lm_head.load_bf16(e.data.clone(), e.rows, e.cols);
+        }
+
+        eprintln!("[ GGUF ] Done. Loaded {} tensors.", loaded);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// GGUF loading helpers (free functions)
+// ============================================================================
+
+fn model_set_embed_bf16(
+    model: &mut Gemma3Model,
+    bits: Vec<u16>,
+    vocab: usize,
+    hidden: usize,
+) {
+    use crate::autograd2::MatBf16;
+    model.embed_bf16 = Some(MatBf16 { data: bits.clone(), rows: vocab, cols: hidden });
+    model.embed_tokens.set_data(crate::autograd2::Mat::zeros(vocab, hidden));
+    model.lm_head.load_bf16(bits, vocab, hidden);
+}
+
+/// Load a Linear2 weight from a GGUF tensor, supporting Q4_0, BF16, F16, F32.
+fn load_linear_from_gguf(
+    gguf: &crate::gguf_loader::GgufFile,
+    idx: usize,
+    linear: &mut crate::nn2::Linear2,
+) -> std::io::Result<()> {
+    use crate::gguf_loader::GgufType;
+    use crate::autograd2::MatBf16;
+
+    let gtype = gguf.tensor_info[idx].gguf_type;
+    let shape = &gguf.tensor_info[idx].shape;
+    // GGUF stores weight as [in_features, out_features] (Fortran/column-major)
+    // Our Linear2 stores weight as [out_features, in_features] (row-major)
+    // GgufFile::decode_q4_0_to_q4mat already handles the transpose.
+    // For BF16/F16/F32 we need to handle it here.
+    let (rows, cols) = if shape.len() >= 2 {
+        (shape[1], shape[0])  // transpose: GGUF [cols, rows] → our [rows, cols]
+    } else {
+        (1, shape[0])
+    };
+
+    match gtype {
+        GgufType::Q4_0 => {
+            let q4 = gguf.decode_q4_0_to_q4mat(idx)?;
+            linear.q4_weight = Some(q4);
+            linear.bf16_weight = None;
+            linear.weight.set_data(crate::autograd2::Mat::zeros(0, 0));
+        }
+        GgufType::Bf16 => {
+            let bits = gguf.decode_bf16(idx)?;
+            linear.load_bf16(bits, rows, cols);
+        }
+        GgufType::F16 => {
+            let f32s = gguf.decode_f16_to_f32(idx)?;
+            let bits: Vec<u16> = f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+            linear.load_bf16(bits, rows, cols);
+        }
+        GgufType::F32 => {
+            let f32s = gguf.decode_f32(idx)?;
+            linear.weight.set_data(crate::autograd2::Mat::new(f32s, rows, cols));
+        }
+        _ => {
+            eprintln!("[ GGUF ] Warning: unsupported type {:?} for tensor {}, skipping",
+                gtype, gguf.tensor_info[idx].name);
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -631,6 +905,165 @@ impl Trainable for Gemma3Model {
 }
 
 // ============================================================================
+// Binary weight cache  (fast save/load, skips safetensors parsing)
+// ============================================================================
+//
+// Format:  MAGIC(8) | N_RECORDS(u32le) | record* | EOF
+// Record:  name_len(u32le) | name(utf8) | dtype(u8: 0=f32, 1=bf16) |
+//          rows(u32le) | cols(u32le) | data(rows*cols * dtype_bytes)
+//
+// On load the file is mmap'd; no heap copies until each record is consumed.
+
+const CACHE_MAGIC: &[u8; 8] = b"G3CACHE1";
+
+impl Gemma3Model {
+    /// Save all weights to a binary cache file for fast subsequent loads.
+    pub fn save_cache(&self, path: &str) -> std::io::Result<()> {
+        use std::io::{BufWriter, Write};
+        let f = std::fs::File::create(path)?;
+        let mut w = BufWriter::new(f);
+
+        // Collect all (name, dtype, rows, cols, raw_bytes) tuples
+        let mut records: Vec<(&str, u8, usize, usize, Vec<u8>)> = Vec::new();
+
+        // Helper closures
+        let f32_rec = |name: &'static str, data: &[f32], rows: usize, cols: usize| -> (&'static str, u8, usize, usize, Vec<u8>) {
+            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }.to_vec();
+            (name, 0u8, rows, cols, bytes)
+        };
+        let bf16_rec = |name: &'static str, data: &[u16], rows: usize, cols: usize| -> (&'static str, u8, usize, usize, Vec<u8>) {
+            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) }.to_vec();
+            (name, 1u8, rows, cols, bytes)
+        };
+
+        // embed_tokens (bf16)
+        if let Some(ref e) = self.embed_bf16 {
+            records.push(bf16_rec("model.embed_tokens.weight", &e.data, e.rows, e.cols));
+        }
+
+        // final norm
+        {
+            let g = self.norm.gamma.data();
+            records.push(f32_rec("model.norm.weight", &g.data, g.rows, g.cols));
+        }
+
+        // per-layer weights
+        for (i, layer) in self.layers.iter().enumerate() {
+            let push_norm = |name: String, node: &crate::autograd2::TensorNode, records: &mut Vec<_>| {
+                let g = node.data();
+                let bytes = unsafe { std::slice::from_raw_parts(g.data.as_ptr() as *const u8, g.data.len() * 4) }.to_vec();
+                records.push((Box::leak(name.into_boxed_str()) as &str, 0u8, g.rows, g.cols, bytes));
+            };
+            let prefix = format!("model.layers.{}", i);
+            push_norm(format!("{}.input_layernorm.weight", prefix), &layer.input_layernorm.gamma, &mut records);
+            push_norm(format!("{}.post_attention_layernorm.weight", prefix), &layer.post_attention_layernorm.gamma, &mut records);
+            push_norm(format!("{}.pre_feedforward_layernorm.weight", prefix), &layer.pre_feedforward_layernorm.gamma, &mut records);
+            push_norm(format!("{}.post_feedforward_layernorm.weight", prefix), &layer.post_feedforward_layernorm.gamma, &mut records);
+            push_norm(format!("{}.self_attn.q_norm.weight", prefix), &layer.self_attn.q_norm.gamma, &mut records);
+            push_norm(format!("{}.self_attn.k_norm.weight", prefix), &layer.self_attn.k_norm.gamma, &mut records);
+
+            let push_bf16 = |name: String, lin: &crate::nn2::Linear2, records: &mut Vec<_>| {
+                if let Some(ref b) = lin.bf16_weight {
+                    let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) }.to_vec();
+                    records.push((Box::leak(name.into_boxed_str()) as &str, 1u8, b.rows, b.cols, bytes));
+                }
+            };
+            push_bf16(format!("{}.self_attn.q_proj.weight", prefix), &layer.self_attn.q_proj, &mut records);
+            push_bf16(format!("{}.self_attn.k_proj.weight", prefix), &layer.self_attn.k_proj, &mut records);
+            push_bf16(format!("{}.self_attn.v_proj.weight", prefix), &layer.self_attn.v_proj, &mut records);
+            push_bf16(format!("{}.self_attn.o_proj.weight", prefix), &layer.self_attn.o_proj, &mut records);
+            push_bf16(format!("{}.mlp.gate_proj.weight", prefix), &layer.mlp.gate_proj, &mut records);
+            push_bf16(format!("{}.mlp.up_proj.weight", prefix), &layer.mlp.up_proj, &mut records);
+            push_bf16(format!("{}.mlp.down_proj.weight", prefix), &layer.mlp.down_proj, &mut records);
+        }
+
+        // Write header
+        w.write_all(CACHE_MAGIC)?;
+        w.write_all(&(records.len() as u32).to_le_bytes())?;
+
+        // Write records
+        for (name, dtype, rows, cols, data) in &records {
+            let name_bytes = name.as_bytes();
+            w.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(name_bytes)?;
+            w.write_all(&[*dtype])?;
+            w.write_all(&(*rows as u32).to_le_bytes())?;
+            w.write_all(&(*cols as u32).to_le_bytes())?;
+            w.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    /// Load weights from a binary cache file (fast path).
+    /// Returns false if the file doesn't exist or has wrong magic.
+    pub fn load_cache(&mut self, path: &str) -> std::io::Result<bool> {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[ Cache ] No cache file at {}: {}", path, e);
+                return Ok(false);
+            }
+        };
+        eprintln!("[ Cache ] Reading cache file {}...", path);
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        eprintln!("[ Cache ] Read {} MB", buf.len() / 1_048_576);
+
+        if buf.len() < 12 || &buf[..8] != CACHE_MAGIC {
+            eprintln!("[ Cache ] Bad magic or too short, ignoring cache.");
+            return Ok(false);
+        }
+
+        let n_records = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        eprintln!("[ Cache ] Loading {} records...", n_records);
+        let mut pos = 12usize;
+
+        let read_u32 = |buf: &[u8], p: &mut usize| -> u32 {
+            let v = u32::from_le_bytes(buf[*p..*p+4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+
+        for _ in 0..n_records {
+            let name_len = read_u32(&buf, &mut pos) as usize;
+            let name = std::str::from_utf8(&buf[pos..pos+name_len]).unwrap().to_string();
+            pos += name_len;
+            let dtype = buf[pos]; pos += 1;
+            let rows = read_u32(&buf, &mut pos) as usize;
+            let cols = read_u32(&buf, &mut pos) as usize;
+            let n_elems = rows * cols;
+            let elem_bytes = if dtype == 0 { 4 } else { 2 };
+            let data_bytes = &buf[pos..pos + n_elems * elem_bytes];
+            pos += n_elems * elem_bytes;
+
+            // Synthesize a SafeTensor and reuse apply_tensor
+            let mut st = crate::transformer3::SafeTensor {
+                name: name,
+                shape: vec![rows, cols],
+                data: Vec::new(),
+                bf16_data: None,
+            };
+            if dtype == 0 {
+                // f32
+                let mut f32s = vec![0.0f32; n_elems];
+                unsafe { std::ptr::copy_nonoverlapping(data_bytes.as_ptr(), f32s.as_mut_ptr() as *mut u8, data_bytes.len()); }
+                st.data = f32s;
+            } else {
+                // bf16
+                let mut u16s = vec![0u16; n_elems];
+                unsafe { std::ptr::copy_nonoverlapping(data_bytes.as_ptr(), u16s.as_mut_ptr() as *mut u8, data_bytes.len()); }
+                // Also fill f32 data for the f32 fallback path
+                st.data = u16s.iter().map(|&b| crate::autograd2::MatBf16::bf16_to_f32(b)).collect();
+                st.bf16_data = Some(u16s);
+            }
+            apply_tensor(self, &st);
+        }
+        Ok(true)
+    }
+}
+
+// ============================================================================
 // Weight name → model field mapping
 // ============================================================================
 
@@ -662,7 +1095,8 @@ fn apply_tensor_inner(
         return Some(set_node(&model.embed_tokens, &t.data, t.shape[0], t.shape[1]));
     }
     if name == "model.norm.weight" {
-        return Some(set_node(&model.norm.gamma, &t.data, 1, t.shape[0]));
+        let n = t.data.len();
+        return Some(set_node(&model.norm.gamma, &t.data, 1, n));
     }
     if name == "lm_head.weight" {
         return Some(set_node(&model.lm_head.weight, &t.data, t.shape[0], t.shape[1]));
@@ -677,19 +1111,20 @@ fn apply_tensor_inner(
     let layer = &mut model.layers[layer_idx];
 
     match layer_name {
-        // Layer-norm weights are small scalars — keep as f32.
+        // Layer-norm weights: use data.len() as size to handle both
+        // 1D [N] (safetensors) and 2D [1,N] (cache file) shapes.
         "input_layernorm.weight" =>
-            Some(set_node(&layer.input_layernorm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.input_layernorm.gamma, &t.data, 1, t.data.len())),
         "post_attention_layernorm.weight" =>
-            Some(set_node(&layer.post_attention_layernorm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.post_attention_layernorm.gamma, &t.data, 1, t.data.len())),
         "pre_feedforward_layernorm.weight" =>
-            Some(set_node(&layer.pre_feedforward_layernorm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.pre_feedforward_layernorm.gamma, &t.data, 1, t.data.len())),
         "post_feedforward_layernorm.weight" =>
-            Some(set_node(&layer.post_feedforward_layernorm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.post_feedforward_layernorm.gamma, &t.data, 1, t.data.len())),
         "self_attn.q_norm.weight" =>
-            Some(set_node(&layer.self_attn.q_norm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.self_attn.q_norm.gamma, &t.data, 1, t.data.len())),
         "self_attn.k_norm.weight" =>
-            Some(set_node(&layer.self_attn.k_norm.gamma, &t.data, 1, t.shape[0])),
+            Some(set_node(&layer.self_attn.k_norm.gamma, &t.data, 1, t.data.len())),
 
         // Large projection weights: store as BF16 when available (lossless, 2× RAM).
         "self_attn.q_proj.weight" =>

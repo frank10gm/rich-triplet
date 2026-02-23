@@ -12,6 +12,7 @@ mod transformer2;
 mod train2;
 mod transformer3;
 mod transformer4;
+mod gguf_loader;
 #[cfg(feature = "metal")]
 mod metal_ops;
 
@@ -93,6 +94,8 @@ struct CliArgs {
     merges:      Option<String>,
     /// --tokenizer-model PATH : SentencePiece .model file (required with --weights for Gemma 3)
     tokenizer_model: Option<String>,
+    /// --tokenizer-dir DIR   : directory containing tokenizer.json (for GGUF, where tokenizer is separate)
+    tokenizer_dir: Option<String>,
     /// --model NAME      : which architecture to use (gpt-oss | gemma3-1b | gemma3-4b)
     model:       Option<String>,
     /// --max-new N       : tokens to generate (default 200)
@@ -120,7 +123,7 @@ impl CliArgs {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut a = CliArgs {
             prompt: None, weights: None, vocab: None, merges: None,
-            tokenizer_model: None, model: None,
+            tokenizer_model: None, tokenizer_dir: None, model: None,
             max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
             seed: 42, train_steps: 200, checkpoint: None,
             pretokenize: None, benchmark: false,
@@ -133,6 +136,7 @@ impl CliArgs {
                 "--vocab"       => { i += 1; if i < args.len() { a.vocab       = Some(args[i].clone()); } }
                 "--merges"           => { i += 1; if i < args.len() { a.merges           = Some(args[i].clone()); } }
                 "--tokenizer-model"  => { i += 1; if i < args.len() { a.tokenizer_model  = Some(args[i].clone()); } }
+                "--tokenizer-dir"    => { i += 1; if i < args.len() { a.tokenizer_dir    = Some(args[i].clone()); } }
                 "--model"            => { i += 1; if i < args.len() { a.model            = Some(args[i].clone()); } }
                 "--max-new"     => { i += 1; if i < args.len() { a.max_new     = args[i].parse().unwrap_or(200); } }
                 "--temp"        => { i += 1; if i < args.len() { a.temperature = args[i].parse().unwrap_or(0.8); } }
@@ -178,6 +182,7 @@ fn print_help() {
     println!("  --vocab PATH             BPE vocab.json      (GPT-OSS)");
     println!("  --merges PATH            BPE merges.txt      (GPT-OSS)");
     println!("  --tokenizer-model PATH   SentencePiece .model (Gemma 3)");
+    println!("  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is separate)");
     println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b");
     println!("  --max-new N              Tokens to generate          [default: 200]");
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
@@ -254,14 +259,43 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     use tokenizer::HfBpeTokenizer;
     use transformer4::{Gemma3Model, Config4};
 
-    let weights_dir = args.weights.as_deref().unwrap();
+    let weights_path = args.weights.as_deref().unwrap();
     let model_name = args.model.as_deref().unwrap_or("gemma3-1b");
 
+    // Determine if --weights points to a GGUF file or a directory of safetensors.
+    let is_gguf = weights_path.ends_with(".gguf");
+
+    // The tokenizer lives next to the weights (directory for safetensors).
+    // For GGUF files, the tokenizer is NOT included — pass --tokenizer-dir pointing
+    // to the original safetensors directory (e.g. google/gemma-3-4b-it).
+    let weights_dir = if is_gguf {
+        // Parent directory of the .gguf file (used as fallback for cache only)
+        std::path::Path::new(weights_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string())
+    } else {
+        weights_path.trim_end_matches('/').to_string()
+    };
+
+    // Tokenizer directory: explicit --tokenizer-dir overrides, then weights_dir
+    let tok_dir = args.tokenizer_dir.as_deref()
+        .unwrap_or(&weights_dir)
+        .trim_end_matches('/');
+
     // Try tokenizer.json (BPE) first, then fall back to tokenizer.model (SentencePiece)
-    let tok_json_path = format!("{}/tokenizer.json", weights_dir.trim_end_matches('/'));
+    let tok_json_path = format!("{}/tokenizer.json", tok_dir);
     eprintln!("[ Gemma3 ] Loading tokenizer from {}...", tok_json_path);
     let tok = HfBpeTokenizer::from_json_file(&tok_json_path)
-        .expect("failed to load tokenizer.json");
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to load tokenizer from {}: {}", tok_json_path, e);
+            if is_gguf && args.tokenizer_dir.is_none() {
+                eprintln!("Hint: GGUF files do not include a tokenizer.");
+                eprintln!("      Pass --tokenizer-dir pointing to your safetensors directory,");
+                eprintln!("      e.g.: --tokenizer-dir /path/to/gemma-3-4b-it/");
+            }
+            std::process::exit(1);
+        });
     eprintln!("[ Gemma3 ] Vocab size: {}", tok.vocab_size());
 
     let config = match model_name {
@@ -274,12 +308,28 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     let mut rng = InitRng::new(0);
     let mut model = Gemma3Model::new(config, &mut rng);
 
-    eprintln!("[ Gemma3 ] Loading weights from {}...", weights_dir);
-    model.load_weights_from_dir(weights_dir)
-        .expect("failed to load weights");
+    if is_gguf {
+        // --- GGUF path: load directly from .gguf file ---
+        eprintln!("[ Gemma3 ] Loading weights from GGUF: {}...", weights_path);
+        model.load_weights_from_gguf(weights_path)
+            .expect("failed to load GGUF weights");
+    } else {
+        // --- Safetensors path: try cache first, then load + save cache ---
+        let cache_path = format!("{}/gemma3-{}.cache", weights_dir, model_name);
+        let loaded_from_cache = model.load_cache(&cache_path).unwrap_or(false);
 
-    eprintln!("[ Gemma3 ] Quantizing weights to INT4...");
-    model.quantize_all_weights();
+        if loaded_from_cache {
+            eprintln!("[ Gemma3 ] Loaded weights from cache ({}).", cache_path);
+        } else {
+            eprintln!("[ Gemma3 ] Loading weights from {}...", weights_dir);
+            model.load_weights_from_dir(&weights_dir)
+                .expect("failed to load weights");
+            eprintln!("[ Gemma3 ] Saving weight cache to {}...", cache_path);
+            model.save_cache(&cache_path)
+                .expect("failed to save cache");
+            eprintln!("[ Gemma3 ] Cache saved.");
+        }
+    }
 
     // Gemma 3-IT requires the chat template:
     //   <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n

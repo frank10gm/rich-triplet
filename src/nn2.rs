@@ -214,21 +214,17 @@ impl Linear2 {
         let x = input.data().clone();
         let b = self.bias.data().clone();
 
-        // Forward matmul: INT4 > BF16 > f32.
+        // Forward matmul priority: Q4 > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
-            assert_eq!(x.cols, q4.cols,
-                "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
-            // Strategy by feature:
-            // - metal: GEMV kernel — one threadgroup per output neuron, simd_sum over K.
-            //          Correct and fast for any M (optimised for M=1 decode).
-            // - blas: row-by-row dequant + cblas_sdot (no full matrix allocation)
-            // - neither: scalar loop
-            #[cfg(feature = "metal")]
-            let mut o = crate::metal_ops::metal_matmul_q4_t(&x, q4);
-            #[cfg(all(feature = "blas", not(feature = "metal")))]
-            let mut o = q4.matmul_q4_t_blas(&x);
-            #[cfg(not(any(feature = "blas", feature = "metal")))]
-            let mut o = q4.matmul_q4_t(&x);
+            // Q4_0: dequantize to f32 then BLAS matmul.
+            // This is the path used when weights are loaded from GGUF Q4_0 files.
+            let w = q4.dequantize();
+            assert_eq!(x.cols, w.cols,
+                "Linear (q4): input cols {} != weight cols {}", x.cols, w.cols);
+            #[cfg(feature = "blas")]
+            let mut o = x.matmul_bt(&w);
+            #[cfg(not(feature = "blas"))]
+            let mut o = x.matmul(&w.transpose());
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o
         } else if let Some(ref bf16) = self.bf16_weight {
