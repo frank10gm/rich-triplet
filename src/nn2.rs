@@ -369,6 +369,12 @@ impl RmsNorm2 {
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         x.rms_norm(&self.gamma, self.eps)
     }
+
+    /// Gemma3 variant: applies `(1 + gamma)` scaling instead of `gamma`.
+    /// Used by all norm layers in Gemma3 (gamma is stored as zeros-init, trained offset).
+    pub fn forward_gemma3(&self, x: &TensorNode) -> TensorNode {
+        x.rms_norm_gemma3(&self.gamma, self.eps)
+    }
 }
 
 impl Module2 for RmsNorm2 {

@@ -278,7 +278,16 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     model.load_weights_from_dir(weights_dir)
         .expect("failed to load weights");
 
-    let token_ids: Vec<usize> = tok.encode(prompt).iter().map(|&id| id as usize).collect();
+    // Gemma 3-IT requires the chat template:
+    //   <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+    // Special token ids: bos=2, start_of_turn=105, end_of_turn=106, \n=107, user=2364
+    // We inject these directly rather than via the tokenizer, which would
+    // tokenize the literal text "<start_of_turn>" as subword pieces.
+    let mut token_ids: Vec<usize> = vec![2, 105, 2364, 107]; // <bos><start_of_turn>user\n
+    token_ids.extend(tok.encode(prompt).iter().map(|&id| id as usize));
+    token_ids.extend_from_slice(&[106, 107, 105]); // <end_of_turn>\n<start_of_turn>
+    // encode "model\n" — or just use the known ids: model=4368, \n=107
+    token_ids.extend_from_slice(&[4368, 107]); // model\n
     if token_ids.is_empty() {
         eprintln!("Error: prompt encodes to zero tokens");
         std::process::exit(1);

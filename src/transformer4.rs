@@ -98,7 +98,11 @@ impl Config4 {
     }
 
     /// Gemma 3 4B configuration.
-    /// Source: unsloth/gemma-3-4b-pt config.json
+    /// Source: google/gemma-3-4b-it config.json / unsloth/gemma-3-4b-pt config.json
+    ///
+    /// rope_scaling: {factor: 8.0, rope_type: "linear"} applies to global layers only.
+    /// Effective global theta = rope_theta (1M) * factor (8) = 8M.
+    /// Local layers use rope_local_base_freq = 10_000 (no scaling).
     pub fn gemma3_4b() -> Self {
         Config4 {
             vocab_size: 262208,
@@ -110,10 +114,10 @@ impl Config4 {
             head_dim: 256,
             sliding_window: Some(1024),
             rope_theta_local: 10_000.0,
-            rope_theta_global: 1_000_000.0,
+            rope_theta_global: 8_000_000.0,  // 1_000_000 * rope_scaling.factor(8.0)
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
-            eos_token_id: 1,
+            eos_token_id: 1,  // also 106, checked separately in generate loop
             max_position_embeddings: 32768,
         }
     }
@@ -317,15 +321,15 @@ impl Gemma3Block {
     ///   8. output = x2 + mlp
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         // Attention sub-block
-        let normed = self.input_layernorm.forward(x);
+        let normed = self.input_layernorm.forward_gemma3(x);
         let attn   = self.self_attn.forward(&normed);
-        let attn   = self.post_attention_layernorm.forward(&attn);
+        let attn   = self.post_attention_layernorm.forward_gemma3(&attn);
         let x2     = x.add(&attn);
 
         // MLP sub-block
-        let normed2 = self.pre_feedforward_layernorm.forward(&x2);
+        let normed2 = self.pre_feedforward_layernorm.forward_gemma3(&x2);
         let mlp_out = self.mlp.forward(&normed2);
-        let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out);
+        let mlp_out = self.post_feedforward_layernorm.forward_gemma3(&mlp_out);
         x2.add(&mlp_out)
     }
 }
@@ -418,7 +422,7 @@ impl Gemma3Model {
             x = layer.forward(&x);
         }
 
-        let normed  = self.norm.forward(&x);
+        let normed  = self.norm.forward_gemma3(&x);
         self.lm_head.forward(&normed)
     }
 
@@ -877,14 +881,14 @@ impl Gemma3Block {
         x: &TensorNode,
         cache: &mut Gemma3LayerKvCache,
     ) -> TensorNode {
-        let normed  = self.input_layernorm.forward(x);
+        let normed  = self.input_layernorm.forward_gemma3(x);
         let attn    = self.self_attn.forward_cached(&normed, cache);
-        let attn    = self.post_attention_layernorm.forward(&attn);
+        let attn    = self.post_attention_layernorm.forward_gemma3(&attn);
         let x2      = x.add(&attn);
 
-        let normed2  = self.pre_feedforward_layernorm.forward(&x2);
+        let normed2  = self.pre_feedforward_layernorm.forward_gemma3(&x2);
         let mlp_out  = self.mlp.forward(&normed2);
-        let mlp_out  = self.post_feedforward_layernorm.forward(&mlp_out);
+        let mlp_out  = self.post_feedforward_layernorm.forward_gemma3(&mlp_out);
         x2.add(&mlp_out)
     }
 }
@@ -922,6 +926,9 @@ impl Gemma3Model {
             presence_penalty: 0.0,
         };
 
+        // Gemma 3 uses two EOS token ids: 1 (<eos>) and 106 (<end_of_turn>).
+        let is_eos = |tok: usize| tok == 1 || tok == 106;
+
         let cache  = Gemma3KvCache::new(&self.config);
         let h      = self.config.hidden_size;
         let scale  = (h as f32).sqrt();
@@ -949,7 +956,7 @@ impl Gemma3Model {
                 eprintln!("[DBG] after_layer{}[last_tok] RMS: {:.4}", i, rms);
             }
         }
-        let normed_final = self.norm.forward(&x);
+        let normed_final = self.norm.forward_gemma3(&x);
         {
             let nd = normed_final.data();
             let row = t_prompt - 1;
@@ -976,7 +983,7 @@ impl Gemma3Model {
         let first = sample_token(&logits_node.data(), t_prompt - 1, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);
-        if params.eos_token_id == Some(first) { return; }
+        if is_eos(first) { return; }
 
         // ----- Decode loop -----
         let mut prev = first;
@@ -986,11 +993,11 @@ impl Gemma3Model {
             for (i, layer) in self.layers.iter().enumerate() {
                 x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
             }
-            let logits_node = self.lm_head.forward(&self.norm.forward(&x));
+            let logits_node = self.lm_head.forward(&self.norm.forward_gemma3(&x));
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
             callback(prev);
             seen.push(prev);
-            if params.eos_token_id == Some(prev) { break; }
+            if is_eos(prev) { break; }
         }
     }
 }
@@ -1021,8 +1028,8 @@ fn apply_per_head_norm(
             x_data.at(row, h * head_dim + col)
         });
         let head_node = TensorNode::leaf(head_data);
-        // Apply RMSNorm
-        let normed = norm.forward(&head_node);
+        // Apply RMSNorm (Gemma3 uses (1 + gamma) scaling)
+        let normed = norm.forward_gemma3(&head_node);
         let normed_data = normed.data().clone();
         // Write back into out
         for row in 0..t {
@@ -1062,17 +1069,16 @@ fn apply_per_head_norm(
                 let rms = (sq_sum / head_dim as f32 + eps).sqrt();
                 let inv_rms = 1.0 / rms;
 
-                // dL/dx[row, h*d+col] = dL/dy[row, h*d+col] * gamma[col] * inv_rms
-                //   + sum_j( dL/dy[row, h*d+j] * gamma[j] * x[row, h*d+j] ) * (-1/rms^3) * x[row, h*d+col] / d
+                // dL/dx uses (1 + gamma) as the effective scale (Gemma3 RMSNorm)
                 let mut dot_dy_gamma_x = 0.0f32;
                 for col in 0..head_dim {
                     dot_dy_gamma_x += dout.at(row, h * head_dim + col)
-                        * norm_gamma_c.data().at(0, col)
+                        * (1.0 + norm_gamma_c.data().at(0, col))
                         * x_data.at(row, h * head_dim + col);
                 }
 
                 for col in 0..head_dim {
-                    let g    = norm_gamma_c.data().at(0, col);
+                    let g    = 1.0 + norm_gamma_c.data().at(0, col);
                     let xi   = x_data.at(row, h * head_dim + col);
                     let dy   = dout.at(row, h * head_dim + col);
                     let term1 = dy * g * inv_rms;
@@ -1309,16 +1315,25 @@ fn gqa_attention_cached(
         let v_h = Mat::from_fn(t_kv, d_head, |r, c| v_ctx.at(r, kvh * d_head + c));
 
         // scores [t_q, t_kv] scaled
-        let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+        let raw_scores = q_h.matmul(&k_h.transpose()).scale(scale);
 
-        // Softmax over t_kv dimension
+        // Causal mask: query at absolute position (t_kv - t_q + r) may only
+        // attend to keys at positions 0..=(t_kv - t_q + r).
+        // During decode t_q==1 so this is a no-op; during prefill it masks
+        // the upper triangle so tokens cannot attend to future positions.
+        let causal_offset = t_kv - t_q; // absolute position of query row 0
         let mut w = Mat::zeros(t_q, t_kv);
         for r in 0..t_q {
-            let row_max = (0..t_kv).map(|c| scores.at(r, c))
+            let max_kv = causal_offset + r; // last valid key index for this query
+            let row_max = (0..=max_kv).map(|c| raw_scores.at(r, c))
                 .fold(f32::NEG_INFINITY, f32::max);
             let mut row_sum = 0.0f32;
             for c in 0..t_kv {
-                let e = (scores.at(r, c) - row_max).exp();
+                let e = if c <= max_kv {
+                    (raw_scores.at(r, c) - row_max).exp()
+                } else {
+                    0.0
+                };
                 *w.at_mut(r, c) = e;
                 row_sum += e;
             }

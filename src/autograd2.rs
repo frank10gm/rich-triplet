@@ -1710,6 +1710,71 @@ impl TensorNode {
         out
     }
 
+    /// Gemma3 RMS Layer Normalization — uses `(1 + gamma)` scaling.
+    ///
+    /// Gemma3 stores gamma initialized to **zeros** (not ones) and applies
+    /// the formula:
+    ///   RMSNorm_gemma3(x) = x / sqrt(mean(x²) + eps) * (1 + gamma)
+    ///
+    /// This differs from the standard `rms_norm` which applies just `gamma`.
+    /// All norm layers in Gemma3 (input_layernorm, post_attention_layernorm,
+    /// pre_feedforward_layernorm, post_feedforward_layernorm, q_norm, k_norm,
+    /// and the final norm) use this formula.
+    pub fn rms_norm_gemma3(&self, gamma: &TensorNode, eps: f32) -> TensorNode {
+        let x = self.data().clone();
+        let g = gamma.data().clone();
+        let (t, d) = (x.rows, x.cols);
+        let inv_d = 1.0 / d as f32;
+
+        let mut rms_inv = vec![0.0f32; t];
+        let mut x_hat   = Mat::zeros(t, d);
+
+        for r in 0..t {
+            let mean_sq = (0..d).map(|c| x.at(r, c).powi(2)).sum::<f32>() * inv_d;
+            rms_inv[r] = 1.0 / (mean_sq + eps).sqrt();
+            for c in 0..d {
+                *x_hat.at_mut(r, c) = x.at(r, c) * rms_inv[r];
+            }
+        }
+
+        // (1 + gamma) scaling
+        let out_data = Mat::from_fn(t, d, |r, c| x_hat.at(r, c) * (1.0 + g.at(0, c)));
+        let out = TensorNode::leaf(out_data);
+
+        let self_c  = self.clone();
+        let gamma_c = gamma.clone();
+        let out_c   = out.clone();
+        let x_hat_s = x_hat.clone();
+        let rms_inv_s = rms_inv.clone();
+
+        out.0.borrow_mut().backward_fn = Some(Box::new(move || {
+            let dout = out_c.0.borrow().grad.clone();
+            let g    = gamma_c.0.borrow().data.clone();
+
+            // dγ = sum_t(dout[t] * x̂[t])  (same as rms_norm since d/dgamma of (1+g)*x̂ = x̂)
+            let mut dg = Mat::zeros(1, d);
+            for c in 0..d {
+                for r in 0..t { *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c); }
+            }
+            gamma_c.0.borrow_mut().grad.add_assign(&dg);
+
+            // dx uses (1 + gamma) as the effective scale
+            let mut dx = Mat::zeros(t, d);
+            for r in 0..t {
+                let d_row: Vec<f32> = (0..d).map(|c| dout.at(r, c) * (1.0 + g.at(0, c))).collect();
+                let mean_dxh = d_row.iter().enumerate()
+                    .map(|(c, &dv)| dv * x_hat_s.at(r, c))
+                    .sum::<f32>() * inv_d;
+                for c in 0..d {
+                    *dx.at_mut(r, c) = rms_inv_s[r] * (d_row[c] - x_hat_s.at(r, c) * mean_dxh);
+                }
+            }
+            self_c.0.borrow_mut().grad.add_assign(&dx);
+        }));
+        out.0.borrow_mut().prev = vec![self.clone(), gamma.clone()];
+        out
+    }
+
     /// SiLU (Sigmoid Linear Unit) activation: SiLU(x) = x * sigmoid(x)
     ///
     /// This is the activation used inside SwiGLU (the GPT-OSS FFN activation).
