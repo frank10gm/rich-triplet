@@ -34,10 +34,9 @@
 /// Gemma 3 uses a SentencePiece tokenizer (`tokenizer.model`). Pass token
 /// ids produced by an external tokenizer (Python `transformers`, etc.), or
 /// use the `sentencepiece` feature once added to this project.
-
-use crate::autograd2::{TensorNode, Mat};
-use crate::nn2::{Linear2, RmsNorm2, SwiGluMlp2, Module2, Trainable};
+use crate::autograd2::{Mat, TensorNode};
 use crate::nn::InitRng;
+use crate::nn2::{Linear2, Module2, RmsNorm2, SwiGluMlp2, Trainable};
 use std::cell::RefCell;
 
 // ============================================================================
@@ -92,7 +91,7 @@ impl Config4 {
             rope_theta_global: 1_000_000.0,
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
-            eos_token_id: 1,      // <eos> in Gemma tokenizer
+            eos_token_id: 1, // <eos> in Gemma tokenizer
             max_position_embeddings: 32768,
         }
     }
@@ -114,10 +113,10 @@ impl Config4 {
             head_dim: 256,
             sliding_window: Some(1024),
             rope_theta_local: 10_000.0,
-            rope_theta_global: 8_000_000.0,  // 1_000_000 * rope_scaling.factor(8.0)
+            rope_theta_global: 8_000_000.0, // 1_000_000 * rope_scaling.factor(8.0)
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
-            eos_token_id: 1,  // also 106, checked separately in generate loop
+            eos_token_id: 1, // also 106, checked separately in generate loop
             max_position_embeddings: 32768,
         }
     }
@@ -148,14 +147,14 @@ impl Config4 {
 /// - Local layers use a sliding window causal mask.
 /// - RoPE theta differs between local (10k) and global (1M) layers.
 pub struct Gemma3Attention {
-    pub q_proj:  Linear2,   // [hidden, n_q_heads * head_dim]
-    pub k_proj:  Linear2,   // [hidden, n_kv_heads * head_dim]
-    pub v_proj:  Linear2,   // [hidden, n_kv_heads * head_dim]
-    pub o_proj:  Linear2,   // [n_q_heads * head_dim, hidden]
+    pub q_proj: Linear2, // [hidden, n_q_heads * head_dim]
+    pub k_proj: Linear2, // [hidden, n_kv_heads * head_dim]
+    pub v_proj: Linear2, // [hidden, n_kv_heads * head_dim]
+    pub o_proj: Linear2, // [n_q_heads * head_dim, hidden]
     /// Per-head RMSNorm on Q (Gemma 3 specific).
-    pub q_norm:  RmsNorm2,  // [1, head_dim]
+    pub q_norm: RmsNorm2, // [1, head_dim]
     /// Per-head RMSNorm on K (Gemma 3 specific).
-    pub k_norm:  RmsNorm2,  // [1, head_dim]
+    pub k_norm: RmsNorm2, // [1, head_dim]
     pub n_q_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -178,18 +177,22 @@ impl Gemma3Attention {
         let is_global = cfg.is_global_layer(layer_idx);
 
         Gemma3Attention {
-            q_proj:  Linear2::new_no_bias(h, nq * d, rng),
-            k_proj:  Linear2::new_no_bias(h, nkv * d, rng),
-            v_proj:  Linear2::new_no_bias(h, nkv * d, rng),
-            o_proj:  Linear2::new_no_bias(nq * d, h, rng),
-            q_norm:  RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
-            k_norm:  RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
+            q_proj: Linear2::new_no_bias(h, nq * d, rng),
+            k_proj: Linear2::new_no_bias(h, nkv * d, rng),
+            v_proj: Linear2::new_no_bias(h, nkv * d, rng),
+            o_proj: Linear2::new_no_bias(nq * d, h, rng),
+            q_norm: RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
+            k_norm: RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
             n_q_heads: nq,
             n_kv_heads: nkv,
             head_dim: d,
             attn_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
             sliding_window: if is_global { None } else { cfg.sliding_window },
-            rope_theta: if is_global { cfg.rope_theta_global } else { cfg.rope_theta_local },
+            rope_theta: if is_global {
+                cfg.rope_theta_global
+            } else {
+                cfg.rope_theta_local
+            },
         }
     }
 
@@ -201,9 +204,9 @@ impl Gemma3Attention {
         let nkv = self.n_kv_heads;
 
         // Project to Q, K, V
-        let q = self.q_proj.forward(x);  // [T, nq*d]
-        let k = self.k_proj.forward(x);  // [T, nkv*d]
-        let v = self.v_proj.forward(x);  // [T, nkv*d]
+        let q = self.q_proj.forward(x); // [T, nq*d]
+        let k = self.k_proj.forward(x); // [T, nkv*d]
+        let v = self.v_proj.forward(x); // [T, nkv*d]
 
         // Per-head RMSNorm on Q and K (Gemma 3 specific)
         let q = apply_per_head_norm(&q, &self.q_norm, t, nq, d);
@@ -248,23 +251,23 @@ impl Module2 for Gemma3Attention {
 ///
 /// output = down_proj(SiLU(gate_proj(x)) * up_proj(x))
 pub struct Gemma3Mlp {
-    pub gate_proj: Linear2,   // [hidden, intermediate]
-    pub up_proj:   Linear2,   // [hidden, intermediate]
-    pub down_proj: Linear2,   // [intermediate, hidden]
+    pub gate_proj: Linear2, // [hidden, intermediate]
+    pub up_proj: Linear2,   // [hidden, intermediate]
+    pub down_proj: Linear2, // [intermediate, hidden]
 }
 
 impl Gemma3Mlp {
     pub fn new(cfg: &Config4, rng: &mut InitRng) -> Self {
         Gemma3Mlp {
             gate_proj: Linear2::new_no_bias(cfg.hidden_size, cfg.intermediate_size, rng),
-            up_proj:   Linear2::new_no_bias(cfg.hidden_size, cfg.intermediate_size, rng),
+            up_proj: Linear2::new_no_bias(cfg.hidden_size, cfg.intermediate_size, rng),
             down_proj: Linear2::new_no_bias(cfg.intermediate_size, cfg.hidden_size, rng),
         }
     }
 
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         let gate = self.gate_proj.forward(x).silu();
-        let up   = self.up_proj.forward(x);
+        let up = self.up_proj.forward(x);
         let hidden = gate.mul_elem_node(&up);
         self.down_proj.forward(&hidden)
     }
@@ -286,25 +289,25 @@ impl Module2 for Gemma3Mlp {
 
 /// One transformer block: pre-norm → attention → residual → pre-norm → MLP → residual.
 pub struct Gemma3Block {
-    pub input_layernorm:          RmsNorm2,
-    pub self_attn:                Gemma3Attention,
+    pub input_layernorm: RmsNorm2,
+    pub self_attn: Gemma3Attention,
     pub post_attention_layernorm: RmsNorm2,
     /// Pre-FFN norm (Gemma 3 uses an extra "pre_feedforward_layernorm").
     pub pre_feedforward_layernorm: RmsNorm2,
     /// Post-FFN norm (Gemma 3 uses "post_feedforward_layernorm").
     pub post_feedforward_layernorm: RmsNorm2,
-    pub mlp:                      Gemma3Mlp,
+    pub mlp: Gemma3Mlp,
 }
 
 impl Gemma3Block {
     pub fn new(cfg: &Config4, layer_idx: usize, rng: &mut InitRng) -> Self {
         Gemma3Block {
-            input_layernorm:            RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
-            self_attn:                  Gemma3Attention::new(cfg, layer_idx, rng),
-            post_attention_layernorm:   RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
-            pre_feedforward_layernorm:  RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            input_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            self_attn: Gemma3Attention::new(cfg, layer_idx, rng),
+            post_attention_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            pre_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
             post_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
-            mlp:                        Gemma3Mlp::new(cfg, rng),
+            mlp: Gemma3Mlp::new(cfg, rng),
         }
     }
 
@@ -322,9 +325,9 @@ impl Gemma3Block {
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         // Attention sub-block
         let normed = self.input_layernorm.forward_gemma3(x);
-        let attn   = self.self_attn.forward(&normed);
-        let attn   = self.post_attention_layernorm.forward_gemma3(&attn);
-        let x2     = x.add(&attn);
+        let attn = self.self_attn.forward(&normed);
+        let attn = self.post_attention_layernorm.forward_gemma3(&attn);
+        let x2 = x.add(&attn);
 
         // MLP sub-block
         let normed2 = self.pre_feedforward_layernorm.forward_gemma3(&x2);
@@ -353,21 +356,22 @@ impl Module2 for Gemma3Block {
 
 /// The full Gemma 3 model.
 pub struct Gemma3Model {
-    pub embed_tokens: TensorNode,     // [vocab_size, hidden_size] — small f32 placeholder; real data in embed_bf16
+    pub embed_tokens: TensorNode, // [vocab_size, hidden_size] — small f32 placeholder; real data in embed_bf16
     /// BF16 embedding table (vocab_size × hidden_size). Populated by load_weights_from_dir.
     /// Used for fast row lookups without a 2.7 GB f32 allocation.
-    pub embed_bf16:   Option<crate::autograd2::MatBf16>,
-    pub layers:       Vec<Gemma3Block>,
-    pub norm:         RmsNorm2,       // final layer norm
-    pub lm_head:      Linear2,        // [hidden_size, vocab_size] — weight-tied with embed_tokens
-    pub config:       Config4,
+    pub embed_bf16: Option<crate::autograd2::MatBf16>,
+    pub layers: Vec<Gemma3Block>,
+    pub norm: RmsNorm2,   // final layer norm
+    pub lm_head: Linear2, // [hidden_size, vocab_size] — weight-tied with embed_tokens
+    pub config: Config4,
 }
 
 impl Gemma3Model {
     pub fn new(cfg: Config4, rng: &mut InitRng) -> Self {
         let embed = TensorNode::leaf(Mat::new(
             rng.normal_vec(cfg.vocab_size * cfg.hidden_size, 0.02),
-            cfg.vocab_size, cfg.hidden_size,
+            cfg.vocab_size,
+            cfg.hidden_size,
         ));
         let layers: Vec<Gemma3Block> = (0..cfg.num_hidden_layers)
             .map(|i| Gemma3Block::new(&cfg, i, rng))
@@ -386,7 +390,14 @@ impl Gemma3Model {
             bf16_weight: None,
         };
 
-        Gemma3Model { embed_tokens: embed, embed_bf16: None, layers, norm, lm_head, config: cfg }
+        Gemma3Model {
+            embed_tokens: embed,
+            embed_bf16: None,
+            layers,
+            norm,
+            lm_head,
+            config: cfg,
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -406,18 +417,21 @@ impl Gemma3Model {
 
         // Wire backward: scatter gradient back to embed_tokens rows.
         let embed_node = self.embed_tokens.clone();
-        let x_c        = x.clone();
-        let ids        = token_ids.to_vec();
-        x.set_backward(Box::new(move || {
-            let dout = x_c.grad().clone(); // [T, h]
-            let mut dte = embed_node.grad().clone();
-            for (row, &tid) in ids.iter().enumerate() {
-                for col in 0..h {
-                    *dte.at_mut(tid, col) += dout.at(row, col) * scale;
+        let x_c = x.clone();
+        let ids = token_ids.to_vec();
+        x.set_backward(
+            Box::new(move || {
+                let dout = x_c.grad().clone(); // [T, h]
+                let mut dte = embed_node.grad().clone();
+                for (row, &tid) in ids.iter().enumerate() {
+                    for col in 0..h {
+                        *dte.at_mut(tid, col) += dout.at(row, col) * scale;
+                    }
                 }
-            }
-            embed_node.set_grad(dte);
-        }), vec![self.embed_tokens.clone()]);
+                embed_node.set_grad(dte);
+            }),
+            vec![self.embed_tokens.clone()],
+        );
 
         let mut x = x;
 
@@ -425,7 +439,7 @@ impl Gemma3Model {
             x = layer.forward(&x);
         }
 
-        let normed  = self.norm.forward_gemma3(&x);
+        let normed = self.norm.forward_gemma3(&x);
         self.lm_head.forward(&normed)
     }
 
@@ -467,7 +481,9 @@ impl Gemma3Model {
         let next = sample_token(&logits, t - 1, &params, &seen, &mut rng);
         callback(next);
         seen.push(next);
-        if params.eos_token_id == Some(next) { return; }
+        if params.eos_token_id == Some(next) {
+            return;
+        }
 
         let mut prev = next;
         for _ in 1..max_new {
@@ -476,7 +492,9 @@ impl Gemma3Model {
             prev = sample_token(&logits, 0, &params, &seen, &mut rng);
             callback(prev);
             seen.push(prev);
-            if params.eos_token_id == Some(prev) { break; }
+            if params.eos_token_id == Some(prev) {
+                break;
+            }
         }
     }
 
@@ -492,8 +510,8 @@ impl Gemma3Model {
     /// - `model.layers.{i}.self_attn.q_norm.weight`
     /// - etc.
     pub fn load_weights_from_dir(&mut self, dir: &str) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| format!("cannot read dir {}: {}", dir, e))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("cannot read dir {}: {}", dir, e))?;
 
         let mut loaded_shards = 0usize;
         let mut loaded_tensors = 0usize;
@@ -505,15 +523,17 @@ impl Gemma3Model {
                 continue;
             }
 
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("cannot read {:?}: {}", path, e))?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("cannot read {:?}: {}", path, e))?;
 
             let tensors = crate::transformer3::parse_safetensors(&bytes)
                 .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
 
             for t in &tensors {
                 loaded_tensors += 1;
-                if apply_tensor(self, t) { matched += 1; }
+                if apply_tensor(self, t) {
+                    matched += 1;
+                }
             }
             loaded_shards += 1;
         }
@@ -522,8 +542,10 @@ impl Gemma3Model {
             return Err(format!("no .safetensors files found in {}", dir));
         }
 
-        println!("Gemma3: loaded {} tensors ({} matched) from {} shards in {}",
-            loaded_tensors, matched, loaded_shards, dir);
+        println!(
+            "Gemma3: loaded {} tensors ({} matched) from {} shards in {}",
+            loaded_tensors, matched, loaded_shards, dir
+        );
         Ok(())
     }
 
@@ -593,15 +615,19 @@ impl Gemma3Model {
     /// - `blk.{i}.ffn_up.weight`       → mlp.up_proj
     /// - `blk.{i}.ffn_down.weight`     → mlp.down_proj
     pub fn load_weights_from_gguf(&mut self, path: &str) -> std::io::Result<()> {
-        use crate::gguf_loader::{GgufFile, GgufType};
         use crate::autograd2::MatBf16;
+        use crate::gguf_loader::{GgufFile, GgufType};
 
         eprintln!("[ GGUF ] Opening {}...", path);
         let gguf = GgufFile::open(path)?;
         eprintln!("[ GGUF ] Found {} tensors.", gguf.tensor_info.len());
 
         // Print architecture metadata
-        if let Some(arch) = gguf.metadata.get("general.architecture").and_then(|v| v.as_str()) {
+        if let Some(arch) = gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+        {
             eprintln!("[ GGUF ] Architecture: {}", arch);
         }
 
@@ -617,8 +643,13 @@ impl Gemma3Model {
                 match gguf.tensor_info[idx].gguf_type {
                     GgufType::F32 => gguf.decode_f32(idx),
                     GgufType::F16 => gguf.decode_f16_to_f32(idx),
-                    _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                        format!("expected f32/f16 for norm tensor {}", gguf.tensor_info[idx].name))),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "expected f32/f16 for norm tensor {}",
+                            gguf.tensor_info[idx].name
+                        ),
+                    )),
                 }
             };
 
@@ -632,7 +663,10 @@ impl Gemma3Model {
                 } else {
                     (shape[0], 1)
                 };
-                eprintln!("[ GGUF ] token_embd: type={:?} vocab={} hidden={}", gtype, vocab, hidden);
+                eprintln!(
+                    "[ GGUF ] token_embd: type={:?} vocab={} hidden={}",
+                    gtype, vocab, hidden
+                );
                 match gtype {
                     GgufType::Bf16 => {
                         let bits = gguf.decode_bf16(idx)?;
@@ -640,29 +674,29 @@ impl Gemma3Model {
                     }
                     GgufType::F16 => {
                         let f32s = gguf.decode_f16_to_f32(idx)?;
-                        let bits: Vec<u16> = f32s.iter()
-                            .map(|&f| MatBf16::f32_to_bf16(f))
-                            .collect();
+                        let bits: Vec<u16> =
+                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::F32 => {
                         let f32s = gguf.decode_f32(idx)?;
-                        let bits: Vec<u16> = f32s.iter()
-                            .map(|&f| MatBf16::f32_to_bf16(f))
-                            .collect();
+                        let bits: Vec<u16> =
+                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::Q4_0 => {
                         // Dequantize Q4_0 embedding to f32, then convert to BF16 for storage.
                         // Memory order: flat[tok * hidden + col] — no transpose needed.
                         let f32s = gguf.decode_q4_0_to_f32(idx)?;
-                        let bits: Vec<u16> = f32s.iter()
-                            .map(|&f| MatBf16::f32_to_bf16(f))
-                            .collect();
+                        let bits: Vec<u16> =
+                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     _ => {
-                        eprintln!("[ GGUF ] Warning: token_embd type {:?} not supported, skipping", gtype);
+                        eprintln!(
+                            "[ GGUF ] Warning: token_embd type {:?} not supported, skipping",
+                            gtype
+                        );
                     }
                 }
                 loaded += 1;
@@ -673,8 +707,13 @@ impl Gemma3Model {
             if name == "output_norm.weight" {
                 let f32s = load_f32(&gguf, idx)?;
                 let n = f32s.len();
-                eprintln!("[ DBG ] output_norm first 8: {:?}", &f32s[..8.min(n)]);
-                self.norm.gamma.set_data(crate::autograd2::Mat::new(f32s, 1, n));
+                eprintln!("[ DBG ] output_norm first 8 (raw): {:?}", &f32s[..8.min(n)]);
+                // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but forward_gemma3
+                // applies (1 + gamma).  Subtract 1 so the net result is (1 + w) * x_norm.
+                let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                self.norm
+                    .gamma
+                    .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                 loaded += 1;
                 continue;
             }
@@ -686,7 +725,9 @@ impl Gemma3Model {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    if layer_idx >= self.layers.len() { continue; }
+                    if layer_idx >= self.layers.len() {
+                        continue;
+                    }
                     let tensor_name = &rest[dot + 1..];
                     let layer = &mut self.layers[layer_idx];
 
@@ -696,48 +737,79 @@ impl Gemma3Model {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
                             if layer_idx == 0 {
-                                eprintln!("[ DBG ] blk.0.attn_norm first 8: {:?}", &f32s[..8.min(n)]);
+                                eprintln!(
+                                    "[ DBG ] blk.0.attn_norm first 8 (raw): {:?}",
+                                    &f32s[..8.min(n)]
+                                );
                             }
-                            layer.input_layernorm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but
+                            // forward_gemma3 already applies (1 + gamma).  Subtract 1
+                            // so the net effect is the correct (1 + w) * x_norm.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .input_layernorm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         // post_attention_layernorm
                         "post_attn_norm.weight" | "post_attention_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            layer.post_attention_layernorm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .post_attention_layernorm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         // pre_feedforward_layernorm
                         "ffn_pre_norm.weight" | "ffn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            layer.pre_feedforward_layernorm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .pre_feedforward_layernorm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         // post_feedforward_layernorm
                         "ffn_post_norm.weight" | "post_ffw_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            layer.post_feedforward_layernorm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .post_feedforward_layernorm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         "attn_q_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            layer.self_attn.q_norm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .self_attn
+                                .q_norm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         "attn_k_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            layer.self_attn.k_norm.gamma.set_data(
-                                crate::autograd2::Mat::new(f32s, 1, n));
+                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
+                            layer
+                                .self_attn
+                                .k_norm
+                                .gamma
+                                .set_data(crate::autograd2::Mat::new(adjusted, 1, n));
                             loaded += 1;
                         }
                         // ---- projection weights ----
@@ -748,7 +820,9 @@ impl Gemma3Model {
                                 if let Some(ref q4) = layer.self_attn.q_proj.q4_weight {
                                     let deq = q4.dequantize();
                                     eprint!("[ GGUF debug ] blk.0.attn_q first 8 values: ");
-                                    for i in 0..8 { eprint!("{:.4} ", deq.data[i]); }
+                                    for i in 0..8 {
+                                        eprint!("{:.4} ", deq.data[i]);
+                                    }
                                     eprintln!("  shape={}x{}", q4.rows, q4.cols);
                                 }
                             }
@@ -810,15 +884,16 @@ impl Gemma3Model {
 // GGUF loading helpers (free functions)
 // ============================================================================
 
-fn model_set_embed_bf16(
-    model: &mut Gemma3Model,
-    bits: Vec<u16>,
-    vocab: usize,
-    hidden: usize,
-) {
+fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, hidden: usize) {
     use crate::autograd2::MatBf16;
-    model.embed_bf16 = Some(MatBf16 { data: bits.clone(), rows: vocab, cols: hidden });
-    model.embed_tokens.set_data(crate::autograd2::Mat::zeros(vocab, hidden));
+    model.embed_bf16 = Some(MatBf16 {
+        data: bits.clone(),
+        rows: vocab,
+        cols: hidden,
+    });
+    model
+        .embed_tokens
+        .set_data(crate::autograd2::Mat::zeros(vocab, hidden));
     model.lm_head.load_bf16(bits, vocab, hidden);
 }
 
@@ -828,8 +903,8 @@ fn load_linear_from_gguf(
     idx: usize,
     linear: &mut crate::nn2::Linear2,
 ) -> std::io::Result<()> {
-    use crate::gguf_loader::GgufType;
     use crate::autograd2::MatBf16;
+    use crate::gguf_loader::GgufType;
 
     let gtype = gguf.tensor_info[idx].gguf_type;
     let shape = &gguf.tensor_info[idx].shape;
@@ -838,7 +913,7 @@ fn load_linear_from_gguf(
     // GgufFile::decode_q4_0_to_q4mat already handles the transpose.
     // For BF16/F16/F32 we need to handle it here.
     let (rows, cols) = if shape.len() >= 2 {
-        (shape[1], shape[0])  // transpose: GGUF [cols, rows] → our [rows, cols]
+        (shape[1], shape[0]) // transpose: GGUF [cols, rows] → our [rows, cols]
     } else {
         (1, shape[0])
     };
@@ -861,11 +936,15 @@ fn load_linear_from_gguf(
         }
         GgufType::F32 => {
             let f32s = gguf.decode_f32(idx)?;
-            linear.weight.set_data(crate::autograd2::Mat::new(f32s, rows, cols));
+            linear
+                .weight
+                .set_data(crate::autograd2::Mat::new(f32s, rows, cols));
         }
         _ => {
-            eprintln!("[ GGUF ] Warning: unsupported type {:?} for tensor {}, skipping",
-                gtype, gguf.tensor_info[idx].name);
+            eprintln!(
+                "[ GGUF ] Warning: unsupported type {:?} for tensor {}, skipping",
+                gtype, gguf.tensor_info[idx].name
+            );
         }
     }
     Ok(())
@@ -902,34 +981,41 @@ impl Trainable for Gemma3Model {
         let mut probs = Mat::zeros(t, v);
         let mut loss_val = 0.0f32;
         for r in 0..t {
-            let row_max = (0..v).map(|c| logits.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+            let row_max = (0..v)
+                .map(|c| logits.at(r, c))
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut sum_exp = 0.0f32;
             for c in 0..v {
                 let e = (logits.at(r, c) - row_max).exp();
                 *probs.at_mut(r, c) = e;
                 sum_exp += e;
             }
-            for c in 0..v { *probs.at_mut(r, c) /= sum_exp; }
+            for c in 0..v {
+                *probs.at_mut(r, c) /= sum_exp;
+            }
             loss_val -= probs.at(r, targets[r]).ln().max(-100.0);
         }
         loss_val /= t as f32;
 
         let loss = TensorNode::leaf(Mat::new(vec![loss_val], 1, 1));
-        let logits_c     = logits_node.clone();
+        let logits_c = logits_node.clone();
         let probs_stored = probs;
-        let targets_v    = targets.to_vec();
+        let targets_v = targets.to_vec();
 
-        loss.set_backward(Box::new(move || {
-            let mut dlogits = logits_c.grad().clone();
-            for r in 0..t {
-                for c in 0..v {
-                    let ind = if c == targets_v[r] { 1.0f32 } else { 0.0 };
-                    *dlogits.at_mut(r, c) += (probs_stored.at(r, c) - ind) / t as f32;
+        loss.set_backward(
+            Box::new(move || {
+                let mut dlogits = logits_c.grad().clone();
+                for r in 0..t {
+                    for c in 0..v {
+                        let ind = if c == targets_v[r] { 1.0f32 } else { 0.0 };
+                        *dlogits.at_mut(r, c) += (probs_stored.at(r, c) - ind) / t as f32;
+                    }
                 }
-            }
-            logits_c.set_grad(dlogits);
-            logits_c.call_backward_fn();
-        }), vec![logits_node]);
+                logits_c.set_grad(dlogits);
+                logits_c.call_backward_fn();
+            }),
+            vec![logits_node],
+        );
 
         loss
     }
@@ -958,18 +1044,35 @@ impl Gemma3Model {
         let mut records: Vec<(&str, u8, usize, usize, Vec<u8>)> = Vec::new();
 
         // Helper closures
-        let f32_rec = |name: &'static str, data: &[f32], rows: usize, cols: usize| -> (&'static str, u8, usize, usize, Vec<u8>) {
-            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }.to_vec();
+        let f32_rec = |name: &'static str,
+                       data: &[f32],
+                       rows: usize,
+                       cols: usize|
+         -> (&'static str, u8, usize, usize, Vec<u8>) {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
+                    .to_vec();
             (name, 0u8, rows, cols, bytes)
         };
-        let bf16_rec = |name: &'static str, data: &[u16], rows: usize, cols: usize| -> (&'static str, u8, usize, usize, Vec<u8>) {
-            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) }.to_vec();
+        let bf16_rec = |name: &'static str,
+                        data: &[u16],
+                        rows: usize,
+                        cols: usize|
+         -> (&'static str, u8, usize, usize, Vec<u8>) {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) }
+                    .to_vec();
             (name, 1u8, rows, cols, bytes)
         };
 
         // embed_tokens (bf16)
         if let Some(ref e) = self.embed_bf16 {
-            records.push(bf16_rec("model.embed_tokens.weight", &e.data, e.rows, e.cols));
+            records.push(bf16_rec(
+                "model.embed_tokens.weight",
+                &e.data,
+                e.rows,
+                e.cols,
+            ));
         }
 
         // final norm
@@ -980,32 +1083,103 @@ impl Gemma3Model {
 
         // per-layer weights
         for (i, layer) in self.layers.iter().enumerate() {
-            let push_norm = |name: String, node: &crate::autograd2::TensorNode, records: &mut Vec<_>| {
-                let g = node.data();
-                let bytes = unsafe { std::slice::from_raw_parts(g.data.as_ptr() as *const u8, g.data.len() * 4) }.to_vec();
-                records.push((Box::leak(name.into_boxed_str()) as &str, 0u8, g.rows, g.cols, bytes));
-            };
+            let push_norm =
+                |name: String, node: &crate::autograd2::TensorNode, records: &mut Vec<_>| {
+                    let g = node.data();
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(g.data.as_ptr() as *const u8, g.data.len() * 4)
+                    }
+                    .to_vec();
+                    records.push((
+                        Box::leak(name.into_boxed_str()) as &str,
+                        0u8,
+                        g.rows,
+                        g.cols,
+                        bytes,
+                    ));
+                };
             let prefix = format!("model.layers.{}", i);
-            push_norm(format!("{}.input_layernorm.weight", prefix), &layer.input_layernorm.gamma, &mut records);
-            push_norm(format!("{}.post_attention_layernorm.weight", prefix), &layer.post_attention_layernorm.gamma, &mut records);
-            push_norm(format!("{}.pre_feedforward_layernorm.weight", prefix), &layer.pre_feedforward_layernorm.gamma, &mut records);
-            push_norm(format!("{}.post_feedforward_layernorm.weight", prefix), &layer.post_feedforward_layernorm.gamma, &mut records);
-            push_norm(format!("{}.self_attn.q_norm.weight", prefix), &layer.self_attn.q_norm.gamma, &mut records);
-            push_norm(format!("{}.self_attn.k_norm.weight", prefix), &layer.self_attn.k_norm.gamma, &mut records);
+            push_norm(
+                format!("{}.input_layernorm.weight", prefix),
+                &layer.input_layernorm.gamma,
+                &mut records,
+            );
+            push_norm(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                &layer.post_attention_layernorm.gamma,
+                &mut records,
+            );
+            push_norm(
+                format!("{}.pre_feedforward_layernorm.weight", prefix),
+                &layer.pre_feedforward_layernorm.gamma,
+                &mut records,
+            );
+            push_norm(
+                format!("{}.post_feedforward_layernorm.weight", prefix),
+                &layer.post_feedforward_layernorm.gamma,
+                &mut records,
+            );
+            push_norm(
+                format!("{}.self_attn.q_norm.weight", prefix),
+                &layer.self_attn.q_norm.gamma,
+                &mut records,
+            );
+            push_norm(
+                format!("{}.self_attn.k_norm.weight", prefix),
+                &layer.self_attn.k_norm.gamma,
+                &mut records,
+            );
 
             let push_bf16 = |name: String, lin: &crate::nn2::Linear2, records: &mut Vec<_>| {
                 if let Some(ref b) = lin.bf16_weight {
-                    let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) }.to_vec();
-                    records.push((Box::leak(name.into_boxed_str()) as &str, 1u8, b.rows, b.cols, bytes));
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2)
+                    }
+                    .to_vec();
+                    records.push((
+                        Box::leak(name.into_boxed_str()) as &str,
+                        1u8,
+                        b.rows,
+                        b.cols,
+                        bytes,
+                    ));
                 }
             };
-            push_bf16(format!("{}.self_attn.q_proj.weight", prefix), &layer.self_attn.q_proj, &mut records);
-            push_bf16(format!("{}.self_attn.k_proj.weight", prefix), &layer.self_attn.k_proj, &mut records);
-            push_bf16(format!("{}.self_attn.v_proj.weight", prefix), &layer.self_attn.v_proj, &mut records);
-            push_bf16(format!("{}.self_attn.o_proj.weight", prefix), &layer.self_attn.o_proj, &mut records);
-            push_bf16(format!("{}.mlp.gate_proj.weight", prefix), &layer.mlp.gate_proj, &mut records);
-            push_bf16(format!("{}.mlp.up_proj.weight", prefix), &layer.mlp.up_proj, &mut records);
-            push_bf16(format!("{}.mlp.down_proj.weight", prefix), &layer.mlp.down_proj, &mut records);
+            push_bf16(
+                format!("{}.self_attn.q_proj.weight", prefix),
+                &layer.self_attn.q_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.self_attn.k_proj.weight", prefix),
+                &layer.self_attn.k_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.self_attn.v_proj.weight", prefix),
+                &layer.self_attn.v_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.self_attn.o_proj.weight", prefix),
+                &layer.self_attn.o_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                &layer.mlp.gate_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.mlp.up_proj.weight", prefix),
+                &layer.mlp.up_proj,
+                &mut records,
+            );
+            push_bf16(
+                format!("{}.mlp.down_proj.weight", prefix),
+                &layer.mlp.down_proj,
+                &mut records,
+            );
         }
 
         // Write header
@@ -1051,16 +1225,19 @@ impl Gemma3Model {
         let mut pos = 12usize;
 
         let read_u32 = |buf: &[u8], p: &mut usize| -> u32 {
-            let v = u32::from_le_bytes(buf[*p..*p+4].try_into().unwrap());
+            let v = u32::from_le_bytes(buf[*p..*p + 4].try_into().unwrap());
             *p += 4;
             v
         };
 
         for _ in 0..n_records {
             let name_len = read_u32(&buf, &mut pos) as usize;
-            let name = std::str::from_utf8(&buf[pos..pos+name_len]).unwrap().to_string();
+            let name = std::str::from_utf8(&buf[pos..pos + name_len])
+                .unwrap()
+                .to_string();
             pos += name_len;
-            let dtype = buf[pos]; pos += 1;
+            let dtype = buf[pos];
+            pos += 1;
             let rows = read_u32(&buf, &mut pos) as usize;
             let cols = read_u32(&buf, &mut pos) as usize;
             let n_elems = rows * cols;
@@ -1078,14 +1255,29 @@ impl Gemma3Model {
             if dtype == 0 {
                 // f32
                 let mut f32s = vec![0.0f32; n_elems];
-                unsafe { std::ptr::copy_nonoverlapping(data_bytes.as_ptr(), f32s.as_mut_ptr() as *mut u8, data_bytes.len()); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data_bytes.as_ptr(),
+                        f32s.as_mut_ptr() as *mut u8,
+                        data_bytes.len(),
+                    );
+                }
                 st.data = f32s;
             } else {
                 // bf16
                 let mut u16s = vec![0u16; n_elems];
-                unsafe { std::ptr::copy_nonoverlapping(data_bytes.as_ptr(), u16s.as_mut_ptr() as *mut u8, data_bytes.len()); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data_bytes.as_ptr(),
+                        u16s.as_mut_ptr() as *mut u8,
+                        data_bytes.len(),
+                    );
+                }
                 // Also fill f32 data for the f32 fallback path
-                st.data = u16s.iter().map(|&b| crate::autograd2::MatBf16::bf16_to_f32(b)).collect();
+                st.data = u16s
+                    .iter()
+                    .map(|&b| crate::autograd2::MatBf16::bf16_to_f32(b))
+                    .collect();
                 st.bf16_data = Some(u16s);
             }
             apply_tensor(self, &st);
@@ -1107,7 +1299,10 @@ fn apply_tensor_inner(
     t: &crate::transformer3::SafeTensor,
 ) -> Option<bool> {
     // Strip optional "language_model." prefix (present in vision-language model checkpoints)
-    let name = t.name.strip_prefix("language_model.").unwrap_or(t.name.as_str());
+    let name = t
+        .name
+        .strip_prefix("language_model.")
+        .unwrap_or(t.name.as_str());
 
     // Global tensors
     if name == "model.embed_tokens.weight" {
@@ -1115,47 +1310,91 @@ fn apply_tensor_inner(
         if let Some(ref bits) = t.bf16_data {
             if bits.len() == t.shape[0] * t.shape[1] {
                 use crate::autograd2::MatBf16;
-                model.embed_bf16 = Some(MatBf16 { data: bits.clone(), rows: t.shape[0], cols: t.shape[1] });
+                model.embed_bf16 = Some(MatBf16 {
+                    data: bits.clone(),
+                    rows: t.shape[0],
+                    cols: t.shape[1],
+                });
                 // Keep a tiny f32 placeholder so the TensorNode shape is consistent.
-                model.embed_tokens.set_data(crate::autograd2::Mat::zeros(t.shape[0], t.shape[1]));
+                model
+                    .embed_tokens
+                    .set_data(crate::autograd2::Mat::zeros(t.shape[0], t.shape[1]));
                 // Also store as bf16 in lm_head so the vocab projection is fast.
-                model.lm_head.load_bf16(bits.clone(), t.shape[0], t.shape[1]);
+                model
+                    .lm_head
+                    .load_bf16(bits.clone(), t.shape[0], t.shape[1]);
                 return Some(true);
             }
         }
-        return Some(set_node(&model.embed_tokens, &t.data, t.shape[0], t.shape[1]));
+        return Some(set_node(
+            &model.embed_tokens,
+            &t.data,
+            t.shape[0],
+            t.shape[1],
+        ));
     }
     if name == "model.norm.weight" {
         let n = t.data.len();
         return Some(set_node(&model.norm.gamma, &t.data, 1, n));
     }
     if name == "lm_head.weight" {
-        return Some(set_node(&model.lm_head.weight, &t.data, t.shape[0], t.shape[1]));
+        return Some(set_node(
+            &model.lm_head.weight,
+            &t.data,
+            t.shape[0],
+            t.shape[1],
+        ));
     }
 
     // Per-layer tensors: "model.layers.{i}.{...}"
     let rest = name.strip_prefix("model.layers.")?;
     let dot = rest.find('.')?;
     let layer_idx: usize = rest[..dot].parse().ok()?;
-    if layer_idx >= model.layers.len() { return Some(false); }
+    if layer_idx >= model.layers.len() {
+        return Some(false);
+    }
     let layer_name = &rest[dot + 1..];
     let layer = &mut model.layers[layer_idx];
 
     match layer_name {
         // Layer-norm weights: use data.len() as size to handle both
         // 1D [N] (safetensors) and 2D [1,N] (cache file) shapes.
-        "input_layernorm.weight" =>
-            Some(set_node(&layer.input_layernorm.gamma, &t.data, 1, t.data.len())),
-        "post_attention_layernorm.weight" =>
-            Some(set_node(&layer.post_attention_layernorm.gamma, &t.data, 1, t.data.len())),
-        "pre_feedforward_layernorm.weight" =>
-            Some(set_node(&layer.pre_feedforward_layernorm.gamma, &t.data, 1, t.data.len())),
-        "post_feedforward_layernorm.weight" =>
-            Some(set_node(&layer.post_feedforward_layernorm.gamma, &t.data, 1, t.data.len())),
-        "self_attn.q_norm.weight" =>
-            Some(set_node(&layer.self_attn.q_norm.gamma, &t.data, 1, t.data.len())),
-        "self_attn.k_norm.weight" =>
-            Some(set_node(&layer.self_attn.k_norm.gamma, &t.data, 1, t.data.len())),
+        "input_layernorm.weight" => Some(set_node(
+            &layer.input_layernorm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
+        "post_attention_layernorm.weight" => Some(set_node(
+            &layer.post_attention_layernorm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
+        "pre_feedforward_layernorm.weight" => Some(set_node(
+            &layer.pre_feedforward_layernorm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
+        "post_feedforward_layernorm.weight" => Some(set_node(
+            &layer.post_feedforward_layernorm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
+        "self_attn.q_norm.weight" => Some(set_node(
+            &layer.self_attn.q_norm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
+        "self_attn.k_norm.weight" => Some(set_node(
+            &layer.self_attn.k_norm.gamma,
+            &t.data,
+            1,
+            t.data.len(),
+        )),
 
         // Large projection weights: store as BF16 when available (lossless, 2× RAM).
         "self_attn.q_proj.weight" => {
@@ -1169,30 +1408,58 @@ fn apply_tensor_inner(
                     d.data[..8.min(d.data.len())].to_vec()
                 };
                 eprint!("[ ST  debug ] model.layers.0.self_attn.q_proj first 8 values: ");
-                for v in &vals { eprint!("{:.4} ", v); }
+                for v in &vals {
+                    eprint!("{:.4} ", v);
+                }
                 eprintln!("  shape={}x{}", t.shape[0], t.shape[1]);
             }
             Some(r)
         }
-        "self_attn.k_proj.weight" =>
-            Some(set_linear(&mut layer.self_attn.k_proj, t, t.shape[0], t.shape[1])),
-        "self_attn.v_proj.weight" =>
-            Some(set_linear(&mut layer.self_attn.v_proj, t, t.shape[0], t.shape[1])),
-        "self_attn.o_proj.weight" =>
-            Some(set_linear(&mut layer.self_attn.o_proj, t, t.shape[0], t.shape[1])),
-        "mlp.gate_proj.weight" =>
-            Some(set_linear(&mut layer.mlp.gate_proj, t, t.shape[0], t.shape[1])),
-        "mlp.up_proj.weight" =>
-            Some(set_linear(&mut layer.mlp.up_proj, t, t.shape[0], t.shape[1])),
-        "mlp.down_proj.weight" =>
-            Some(set_linear(&mut layer.mlp.down_proj, t, t.shape[0], t.shape[1])),
+        "self_attn.k_proj.weight" => Some(set_linear(
+            &mut layer.self_attn.k_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
+        "self_attn.v_proj.weight" => Some(set_linear(
+            &mut layer.self_attn.v_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
+        "self_attn.o_proj.weight" => Some(set_linear(
+            &mut layer.self_attn.o_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
+        "mlp.gate_proj.weight" => Some(set_linear(
+            &mut layer.mlp.gate_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
+        "mlp.up_proj.weight" => Some(set_linear(
+            &mut layer.mlp.up_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
+        "mlp.down_proj.weight" => Some(set_linear(
+            &mut layer.mlp.down_proj,
+            t,
+            t.shape[0],
+            t.shape[1],
+        )),
         _ => Some(false),
     }
 }
 
 /// Set a TensorNode's f32 data directly (used for small tensors: norms, embeddings).
 fn set_node(node: &TensorNode, data: &[f32], rows: usize, cols: usize) -> bool {
-    if data.len() != rows * cols { return false; }
+    if data.len() != rows * cols {
+        return false;
+    }
     node.set_data(Mat::new(data.to_vec(), rows, cols));
     true
 }
@@ -1212,7 +1479,9 @@ fn set_linear(
         }
     }
     // Fallback: store as f32
-    if t.data.len() != rows * cols { return false; }
+    if t.data.len() != rows * cols {
+        return false;
+    }
     linear.weight.set_data(Mat::new(t.data.clone(), rows, cols));
     true
 }
@@ -1246,7 +1515,7 @@ impl Gemma3LayerKvCache {
     /// Append `new_k` / `new_v` rows (both [n_new, n_kv_heads * head_dim]).
     pub fn append(&mut self, new_k: &Mat, new_v: &Mat) {
         let n_new = new_k.rows;
-        let d     = new_k.cols;
+        let d = new_k.cols;
         for r in 0..n_new {
             for c in 0..d {
                 *self.k.at_mut(self.seq_len + r, c) = new_k.at(r, c);
@@ -1269,14 +1538,14 @@ impl Gemma3LayerKvCache {
     /// Return last `window` rows of K (or all rows when seq_len < window).
     pub fn k_last(&self, window: usize) -> Mat {
         let start = self.seq_len.saturating_sub(window);
-        let rows  = self.seq_len - start;
+        let rows = self.seq_len - start;
         Mat::from_fn(rows, self.k.cols, |r, c| self.k.at(start + r, c))
     }
 
     /// Return last `window` rows of V (or all rows when seq_len < window).
     pub fn v_last(&self, window: usize) -> Mat {
         let start = self.seq_len.saturating_sub(window);
-        let rows  = self.seq_len - start;
+        let rows = self.seq_len - start;
         Mat::from_fn(rows, self.v.cols, |r, c| self.v.at(start + r, c))
     }
 }
@@ -1289,7 +1558,7 @@ pub struct Gemma3KvCache {
 impl Gemma3KvCache {
     pub fn new(config: &Config4) -> Self {
         let nkv = config.num_key_value_heads;
-        let d   = config.head_dim;
+        let d = config.head_dim;
         // Cap at 2048 tokens for typical generation — the full 32768 would
         // pre-allocate ~7 GB for Gemma3-4b before any token is processed.
         let max = config.max_position_embeddings.min(2048);
@@ -1322,15 +1591,11 @@ impl Gemma3Attention {
     ///   5. Select context: last `window` rows (local) or full cache (global)
     ///   6. GQA attention (no causal mask — cache only holds past tokens)
     ///   7. Output projection
-    pub fn forward_cached(
-        &self,
-        x: &TensorNode,
-        cache: &mut Gemma3LayerKvCache,
-    ) -> TensorNode {
-        let n_new      = x.data().rows;
-        let d          = self.head_dim;
-        let nq         = self.n_q_heads;
-        let nkv        = self.n_kv_heads;
+    pub fn forward_cached(&self, x: &TensorNode, cache: &mut Gemma3LayerKvCache) -> TensorNode {
+        let n_new = x.data().rows;
+        let d = self.head_dim;
+        let nq = self.n_q_heads;
+        let nkv = self.n_kv_heads;
         let seq_offset = cache.seq_len;
 
         // 1. Projections
@@ -1339,11 +1604,11 @@ impl Gemma3Attention {
         let v = self.v_proj.forward(x);
 
         // 2. Per-head RMSNorm
-        let q = apply_per_head_norm(&q, &self.q_norm, n_new, nq,  d);
+        let q = apply_per_head_norm(&q, &self.q_norm, n_new, nq, d);
         let k = apply_per_head_norm(&k, &self.k_norm, n_new, nkv, d);
 
         // 3. RoPE at absolute positions
-        let q = apply_rope_at_offset(&q, nq,  n_new, d, self.rope_theta, seq_offset);
+        let q = apply_rope_at_offset(&q, nq, n_new, d, self.rope_theta, seq_offset);
         let k = apply_rope_at_offset(&k, nkv, n_new, d, self.rope_theta, seq_offset);
 
         // 4. Append to cache
@@ -1352,13 +1617,11 @@ impl Gemma3Attention {
         // 5. Select context window
         let (k_ctx, v_ctx) = match self.sliding_window {
             Some(w) => (cache.k_last(w), cache.v_last(w)),
-            None    => (cache.k_filled(), cache.v_filled()),
+            None => (cache.k_filled(), cache.v_filled()),
         };
 
         // 6. GQA attention
-        let attn_out = gqa_attention_cached(
-            &q.data(), &k_ctx, &v_ctx, nq, nkv, d, self.attn_scale,
-        );
+        let attn_out = gqa_attention_cached(&q.data(), &k_ctx, &v_ctx, nq, nkv, d, self.attn_scale);
 
         // 7. Output projection
         self.o_proj.forward(&TensorNode::leaf(attn_out))
@@ -1370,19 +1633,15 @@ impl Gemma3Block {
     ///
     /// Mirrors the 4-norm Gemma 3 block structure exactly, using the KV cache
     /// for attention.  The MLP always processes n_new tokens (no FFN cache).
-    pub fn forward_cached(
-        &self,
-        x: &TensorNode,
-        cache: &mut Gemma3LayerKvCache,
-    ) -> TensorNode {
-        let normed  = self.input_layernorm.forward_gemma3(x);
-        let attn    = self.self_attn.forward_cached(&normed, cache);
-        let attn    = self.post_attention_layernorm.forward_gemma3(&attn);
-        let x2      = x.add(&attn);
+    pub fn forward_cached(&self, x: &TensorNode, cache: &mut Gemma3LayerKvCache) -> TensorNode {
+        let normed = self.input_layernorm.forward_gemma3(x);
+        let attn = self.self_attn.forward_cached(&normed, cache);
+        let attn = self.post_attention_layernorm.forward_gemma3(&attn);
+        let x2 = x.add(&attn);
 
-        let normed2  = self.pre_feedforward_layernorm.forward_gemma3(&x2);
-        let mlp_out  = self.mlp.forward(&normed2);
-        let mlp_out  = self.post_feedforward_layernorm.forward_gemma3(&mlp_out);
+        let normed2 = self.pre_feedforward_layernorm.forward_gemma3(&x2);
+        let mlp_out = self.mlp.forward(&normed2);
+        let mlp_out = self.post_feedforward_layernorm.forward_gemma3(&mlp_out);
         x2.add(&mlp_out)
     }
 }
@@ -1442,17 +1701,19 @@ impl Gemma3Model {
         // Gemma 3 uses two EOS token ids: 1 (<eos>) and 106 (<end_of_turn>).
         let is_eos = |tok: usize| tok == 1 || tok == 106;
 
-        let cache  = Gemma3KvCache::new(&self.config);
-        let h      = self.config.hidden_size;
-        let scale  = (h as f32).sqrt();
-        let mut rng  = LcgRng::new(seed);
+        let cache = Gemma3KvCache::new(&self.config);
+        let h = self.config.hidden_size;
+        let scale = (h as f32).sqrt();
+        let mut rng = LcgRng::new(seed);
         let mut seen: Vec<usize> = token_ids.to_vec();
 
         // Helper: look up one embedding row from BF16 table (preferred) or f32.
         let embed_row = |tok: usize| -> Vec<f32> {
             if let Some(ref bf16) = self.embed_bf16 {
                 use crate::autograd2::MatBf16;
-                (0..h).map(|c| MatBf16::bf16_to_f32(bf16.data[tok * h + c]) * scale).collect()
+                (0..h)
+                    .map(|c| MatBf16::bf16_to_f32(bf16.data[tok * h + c]) * scale)
+                    .collect()
             } else {
                 let te = self.embed_tokens.data();
                 (0..h).map(|c| te.at(tok, c) * scale).collect()
@@ -1477,7 +1738,7 @@ impl Gemma3Model {
             x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
             if i == 0 {
                 let xd = x.data();
-                let vals: Vec<f32> = (0..8.min(xd.cols)).map(|c| xd.at(xd.rows-1, c)).collect();
+                let vals: Vec<f32> = (0..8.min(xd.cols)).map(|c| xd.at(xd.rows - 1, c)).collect();
                 eprintln!("[ DBG ] after layer 0, last tok first 8: {:?}", vals);
             }
         }
@@ -1499,7 +1760,9 @@ impl Gemma3Model {
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);
-        if is_eos(first) { return; }
+        if is_eos(first) {
+            return;
+        }
 
         // ----- Decode loop -----
         let mut prev = first;
@@ -1517,7 +1780,9 @@ impl Gemma3Model {
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
             callback(prev);
             seen.push(prev);
-            if is_eos(prev) { break; }
+            if is_eos(prev) {
+                break;
+            }
         }
     }
 }
@@ -1544,9 +1809,7 @@ fn apply_per_head_norm(
 
     for h in 0..n_heads {
         // Extract head slice [T, head_dim]
-        let head_data = Mat::from_fn(t, head_dim, |row, col| {
-            x_data.at(row, h * head_dim + col)
-        });
+        let head_data = Mat::from_fn(t, head_dim, |row, col| x_data.at(row, h * head_dim + col));
         let head_node = TensorNode::leaf(head_data);
         // Apply RMSNorm (Gemma3 uses (1 + gamma) scaling)
         let normed = norm.forward_gemma3(&head_node);
@@ -1567,49 +1830,53 @@ fn apply_per_head_norm(
     // We store the per-head forward outputs so we can call their backward.
     // This is a simplified implementation — gradients for the norm gamma
     // are accumulated across heads.
-    let x_c      = x.clone();
+    let x_c = x.clone();
     let result_c = result.clone();
     let norm_gamma_c = norm.gamma.clone();
     let eps = norm.eps;
 
-    result.set_backward(Box::new(move || {
-        let dout = result_c.grad().clone();  // [T, n_heads * head_dim]
-        let x_data = x_c.data().clone();
-        let mut dx = x_c.grad().clone();
+    result.set_backward(
+        Box::new(move || {
+            let dout = result_c.grad().clone(); // [T, n_heads * head_dim]
+            let x_data = x_c.data().clone();
+            let mut dx = x_c.grad().clone();
 
-        for h in 0..n_heads {
-            // Recompute RMSNorm stats for this head (needed for backward).
-            for row in 0..t {
-                // Compute RMS
-                let mut sq_sum = 0.0f32;
-                for col in 0..head_dim {
-                    let v = x_data.at(row, h * head_dim + col);
-                    sq_sum += v * v;
-                }
-                let rms = (sq_sum / head_dim as f32 + eps).sqrt();
-                let inv_rms = 1.0 / rms;
+            for h in 0..n_heads {
+                // Recompute RMSNorm stats for this head (needed for backward).
+                for row in 0..t {
+                    // Compute RMS
+                    let mut sq_sum = 0.0f32;
+                    for col in 0..head_dim {
+                        let v = x_data.at(row, h * head_dim + col);
+                        sq_sum += v * v;
+                    }
+                    let rms = (sq_sum / head_dim as f32 + eps).sqrt();
+                    let inv_rms = 1.0 / rms;
 
-                // dL/dx uses (1 + gamma) as the effective scale (Gemma3 RMSNorm)
-                let mut dot_dy_gamma_x = 0.0f32;
-                for col in 0..head_dim {
-                    dot_dy_gamma_x += dout.at(row, h * head_dim + col)
-                        * (1.0 + norm_gamma_c.data().at(0, col))
-                        * x_data.at(row, h * head_dim + col);
-                }
+                    // dL/dx uses (1 + gamma) as the effective scale (Gemma3 RMSNorm)
+                    let mut dot_dy_gamma_x = 0.0f32;
+                    for col in 0..head_dim {
+                        dot_dy_gamma_x += dout.at(row, h * head_dim + col)
+                            * (1.0 + norm_gamma_c.data().at(0, col))
+                            * x_data.at(row, h * head_dim + col);
+                    }
 
-                for col in 0..head_dim {
-                    let g    = 1.0 + norm_gamma_c.data().at(0, col);
-                    let xi   = x_data.at(row, h * head_dim + col);
-                    let dy   = dout.at(row, h * head_dim + col);
-                    let term1 = dy * g * inv_rms;
-                    let term2 = xi * inv_rms * inv_rms * inv_rms * dot_dy_gamma_x / head_dim as f32;
-                    *dx.at_mut(row, h * head_dim + col) += term1 - term2;
+                    for col in 0..head_dim {
+                        let g = 1.0 + norm_gamma_c.data().at(0, col);
+                        let xi = x_data.at(row, h * head_dim + col);
+                        let dy = dout.at(row, h * head_dim + col);
+                        let term1 = dy * g * inv_rms;
+                        let term2 =
+                            xi * inv_rms * inv_rms * inv_rms * dot_dy_gamma_x / head_dim as f32;
+                        *dx.at_mut(row, h * head_dim + col) += term1 - term2;
+                    }
                 }
             }
-        }
-        x_c.set_grad(dx);
-        x_c.call_backward_fn();
-    }), vec![x.clone()]);
+            x_c.set_grad(dx);
+            x_c.call_backward_fn();
+        }),
+        vec![x.clone()],
+    );
 
     result
 }
@@ -1646,32 +1913,35 @@ fn apply_rope_to_all_heads(
     // RoPE backward: the rotation matrix is orthogonal, so the backward is
     // just the transpose rotation (negate the sin terms).
     let result = TensorNode::leaf(out);
-    let x_c      = x.clone();
+    let x_c = x.clone();
     let result_c = result.clone();
 
-    result.set_backward(Box::new(move || {
-        let dout   = result_c.grad().clone();
-        let mut dx = x_c.grad().clone();
-        for h in 0..n_heads {
-            for pos in 0..t {
-                let pairs = head_dim / 2;
-                for i in 0..pairs {
-                    let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
-                    let cos_a = angle.cos();
-                    let sin_a = angle.sin();
-                    let c0 = h * head_dim + 2 * i;
-                    let c1 = h * head_dim + 2 * i + 1;
-                    // Inverse rotation: [cos, sin; -sin, cos] (transpose of forward)
-                    let dy0 = dout.at(pos, c0);
-                    let dy1 = dout.at(pos, c1);
-                    *dx.at_mut(pos, c0) +=  dy0 * cos_a + dy1 * sin_a;
-                    *dx.at_mut(pos, c1) += -dy0 * sin_a + dy1 * cos_a;
+    result.set_backward(
+        Box::new(move || {
+            let dout = result_c.grad().clone();
+            let mut dx = x_c.grad().clone();
+            for h in 0..n_heads {
+                for pos in 0..t {
+                    let pairs = head_dim / 2;
+                    for i in 0..pairs {
+                        let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                        let cos_a = angle.cos();
+                        let sin_a = angle.sin();
+                        let c0 = h * head_dim + 2 * i;
+                        let c1 = h * head_dim + 2 * i + 1;
+                        // Inverse rotation: [cos, sin; -sin, cos] (transpose of forward)
+                        let dy0 = dout.at(pos, c0);
+                        let dy1 = dout.at(pos, c1);
+                        *dx.at_mut(pos, c0) += dy0 * cos_a + dy1 * sin_a;
+                        *dx.at_mut(pos, c1) += -dy0 * sin_a + dy1 * cos_a;
+                    }
                 }
             }
-        }
-        x_c.set_grad(dx);
-        x_c.call_backward_fn();
-    }), vec![x.clone()]);
+            x_c.set_grad(dx);
+            x_c.call_backward_fn();
+        }),
+        vec![x.clone()],
+    );
 
     result
 }
@@ -1696,7 +1966,7 @@ fn gqa_attention_full(
     // We need scale = 1/sqrt(query_pre_attn_scalar).
     // Ratio = sqrt(d_head) / sqrt(query_pre_attn_scalar).
     let default_scale = 1.0 / (d_head as f32).sqrt();
-    let ratio = scale / default_scale;  // multiply Q by this to get the right scale
+    let ratio = scale / default_scale; // multiply Q by this to get the right scale
 
     let q_scaled = scale_tensor(q, ratio);
     TensorNode::batched_gqa_attention(&q_scaled, k, v, n_q_heads, n_kv_heads, d_head)
@@ -1735,12 +2005,18 @@ fn gqa_attention_windowed(
         let mut masked = Mat::from_fn(t, t, |r, c| {
             let causal_ok = c <= r;
             let window_ok = r < window || c >= r + 1 - window;
-            if causal_ok && window_ok { scores.at(r, c) } else { f32::NEG_INFINITY }
+            if causal_ok && window_ok {
+                scores.at(r, c)
+            } else {
+                f32::NEG_INFINITY
+            }
         });
 
         // Softmax per row
         for r in 0..t {
-            let row_max = (0..t).map(|c| masked.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+            let row_max = (0..t)
+                .map(|c| masked.at(r, c))
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut sum_exp = 0.0f32;
             for c in 0..t {
                 let v = if masked.at(r, c) == f32::NEG_INFINITY {
@@ -1752,7 +2028,9 @@ fn gqa_attention_windowed(
                 sum_exp += v;
             }
             if sum_exp > 0.0 {
-                for c in 0..t { *masked.at_mut(r, c) /= sum_exp; }
+                for c in 0..t {
+                    *masked.at_mut(r, c) /= sum_exp;
+                }
             }
         }
 
@@ -1786,7 +2064,7 @@ fn apply_rope_at_offset(
     let mut out = x_data.clone();
     for h in 0..n_heads {
         for row in 0..n_new {
-            let pos   = offset + row;
+            let pos = offset + row;
             let pairs = head_dim / 2;
             for i in 0..pairs {
                 let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
@@ -1815,14 +2093,14 @@ fn apply_rope_at_offset(
 /// `1/sqrt(query_pre_attn_scalar)`, not the default `1/sqrt(d_head)`).
 fn gqa_attention_cached(
     q_data: &Mat,
-    k_ctx:  &Mat,
-    v_ctx:  &Mat,
-    n_q_heads:  usize,
+    k_ctx: &Mat,
+    v_ctx: &Mat,
+    n_q_heads: usize,
     n_kv_heads: usize,
-    d_head:     usize,
-    scale:      f32,
+    d_head: usize,
+    scale: f32,
 ) -> Mat {
-    let t_q  = q_data.rows;
+    let t_q = q_data.rows;
     let t_kv = k_ctx.rows;
     let group = n_q_heads / n_kv_heads;
     let mut out = Mat::zeros(t_q, n_q_heads * d_head);
@@ -1830,7 +2108,7 @@ fn gqa_attention_cached(
     for qh in 0..n_q_heads {
         let kvh = qh / group;
 
-        let q_h = Mat::from_fn(t_q,  d_head, |r, c| q_data.at(r, qh  * d_head + c));
+        let q_h = Mat::from_fn(t_q, d_head, |r, c| q_data.at(r, qh * d_head + c));
         let k_h = Mat::from_fn(t_kv, d_head, |r, c| k_ctx.at(r, kvh * d_head + c));
         let v_h = Mat::from_fn(t_kv, d_head, |r, c| v_ctx.at(r, kvh * d_head + c));
 
@@ -1845,7 +2123,8 @@ fn gqa_attention_cached(
         let mut w = Mat::zeros(t_q, t_kv);
         for r in 0..t_q {
             let max_kv = causal_offset + r; // last valid key index for this query
-            let row_max = (0..=max_kv).map(|c| raw_scores.at(r, c))
+            let row_max = (0..=max_kv)
+                .map(|c| raw_scores.at(r, c))
                 .fold(f32::NEG_INFINITY, f32::max);
             let mut row_sum = 0.0f32;
             for c in 0..t_kv {
@@ -1858,7 +2137,9 @@ fn gqa_attention_cached(
                 row_sum += e;
             }
             if row_sum > 0.0 {
-                for c in 0..t_kv { *w.at_mut(r, c) /= row_sum; }
+                for c in 0..t_kv {
+                    *w.at_mut(r, c) /= row_sum;
+                }
             }
         }
 
@@ -1875,17 +2156,22 @@ fn gqa_attention_cached(
 
 /// Multiply a TensorNode's data by a scalar (with backward).
 fn scale_tensor(x: &TensorNode, factor: f32) -> TensorNode {
-    if (factor - 1.0).abs() < 1e-9 { return x.clone(); }
+    if (factor - 1.0).abs() < 1e-9 {
+        return x.clone();
+    }
     let scaled = x.data().scale(factor);
     let result = TensorNode::leaf(scaled);
     let x_c = x.clone();
     let result_c = result.clone();
-    result.set_backward(Box::new(move || {
-        let dout = result_c.grad().clone();
-        let new_grad = x_c.grad().clone().add(&dout.scale(factor));
-        x_c.set_grad(new_grad);
-        x_c.call_backward_fn();
-    }), vec![x.clone()]);
+    result.set_backward(
+        Box::new(move || {
+            let dout = result_c.grad().clone();
+            let new_grad = x_c.grad().clone().add(&dout.scale(factor));
+            x_c.set_grad(new_grad);
+            x_c.call_backward_fn();
+        }),
+        vec![x.clone()],
+    );
     result
 }
 
@@ -1893,11 +2179,18 @@ fn scale_tensor(x: &TensorNode, factor: f32) -> TensorNode {
 // Minimal LCG RNG (copied from transformer3 pattern)
 // ============================================================================
 
-struct LcgRng { state: u64 }
+struct LcgRng {
+    state: u64,
+}
 impl LcgRng {
-    fn new(seed: u64) -> Self { LcgRng { state: seed.wrapping_add(1) } }
+    fn new(seed: u64) -> Self {
+        LcgRng {
+            state: seed.wrapping_add(1),
+        }
+    }
     fn next_f32(&mut self) -> f32 {
-        self.state = self.state
+        self.state = self
+            .state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((self.state >> 32) as f32) / (u32::MAX as f32)
@@ -1929,29 +2222,41 @@ fn sample_token(
 
     // Temperature
     if params.temperature > 0.0 && params.temperature != 1.0 {
-        for s in &mut scores { *s /= params.temperature; }
+        for s in &mut scores {
+            *s /= params.temperature;
+        }
     }
 
     // Softmax
     let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
     let sum: f32 = probs.iter().sum();
-    for p in &mut probs { *p /= sum; }
+    for p in &mut probs {
+        *p /= sum;
+    }
 
     // Top-k
     if params.top_k > 0 && params.top_k < v {
         let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        for i in params.top_k..v { probs[indexed[i].0] = 0.0; }
+        for i in params.top_k..v {
+            probs[indexed[i].0] = 0.0;
+        }
         let sum: f32 = probs.iter().sum();
-        for p in &mut probs { *p /= sum; }
+        for p in &mut probs {
+            *p /= sum;
+        }
     }
 
     // Greedy
     if params.temperature == 0.0 {
-        return probs.iter().cloned().enumerate()
+        return probs
+            .iter()
+            .cloned()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(i, _)| i).unwrap_or(0);
+            .map(|(i, _)| i)
+            .unwrap_or(0);
     }
 
     // Sample
@@ -1959,7 +2264,9 @@ fn sample_token(
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
-        if r <= cumulative { return i; }
+        if r <= cumulative {
+            return i;
+        }
     }
     v - 1
 }
@@ -1982,10 +2289,10 @@ mod tests {
             intermediate_size: 64,
             head_dim: 16,
             sliding_window: Some(8),
-            rope_theta_local:  10_000.0,
+            rope_theta_local: 10_000.0,
             rope_theta_global: 1_000_000.0,
             rms_norm_eps: 1e-6,
-            query_pre_attn_scalar: 16.0,  // matches head_dim for this tiny cfg
+            query_pre_attn_scalar: 16.0, // matches head_dim for this tiny cfg
             eos_token_id: 1,
             max_position_embeddings: 128,
         }
@@ -1997,8 +2304,13 @@ mod tests {
         // Pattern: 5 local, 1 global (every 6th starting at index 5)
         for i in 0..18 {
             let expected_global = i % 6 == 5;
-            assert_eq!(cfg.is_global_layer(i), expected_global,
-                "layer {}: is_global should be {}", i, expected_global);
+            assert_eq!(
+                cfg.is_global_layer(i),
+                expected_global,
+                "layer {}: is_global should be {}",
+                i,
+                expected_global
+            );
         }
     }
 
@@ -2034,7 +2346,10 @@ mod tests {
         let logits = model.forward(&token_ids);
         let d = logits.data();
         assert_eq!(d.rows, 4, "logits rows should equal T=4");
-        assert_eq!(d.cols, cfg.vocab_size, "logits cols should equal vocab_size");
+        assert_eq!(
+            d.cols, cfg.vocab_size,
+            "logits cols should equal vocab_size"
+        );
     }
 
     #[test]
@@ -2047,8 +2362,13 @@ mod tests {
         let d = logits.data();
         for r in 0..d.rows {
             for c in 0..d.cols {
-                assert!(d.at(r, c).is_finite(),
-                    "logits[{},{}] = {} is not finite", r, c, d.at(r, c));
+                assert!(
+                    d.at(r, c).is_finite(),
+                    "logits[{},{}] = {} is not finite",
+                    r,
+                    c,
+                    d.at(r, c)
+                );
             }
         }
     }
@@ -2059,8 +2379,10 @@ mod tests {
         let mut rng = InitRng::new(3);
         let model = Gemma3Model::new(cfg.clone(), &mut rng);
         let token_ids = vec![1usize, 3, 5, 2];
-        let targets   = vec![3usize, 5, 2, 0];
-        for p in model.parameters() { p.zero_grad(); }
+        let targets = vec![3usize, 5, 2, 0];
+        for p in model.parameters() {
+            p.zero_grad();
+        }
         let loss = model.loss_tokens(&token_ids, &targets);
         let v = loss.data().at(0, 0);
         assert!(v.is_finite() && v > 0.0, "loss = {}", v);
@@ -2072,14 +2394,19 @@ mod tests {
         let mut rng = InitRng::new(11);
         let model = Gemma3Model::new(cfg.clone(), &mut rng);
         let token_ids = vec![0usize, 1, 2];
-        let targets   = vec![1usize, 2, 3];
-        for p in model.parameters() { p.zero_grad(); }
+        let targets = vec![1usize, 2, 3];
+        for p in model.parameters() {
+            p.zero_grad();
+        }
         let loss = model.loss_tokens(&token_ids, &targets);
         loss.backward();
         // embed_tokens should have non-zero gradient on the rows we looked up
         let eg = model.embed_tokens.grad();
         let any_nonzero = (0..eg.rows).any(|r| (0..eg.cols).any(|c| eg.at(r, c) != 0.0));
-        assert!(any_nonzero, "embed_tokens.grad should be non-zero after backward");
+        assert!(
+            any_nonzero,
+            "embed_tokens.grad should be non-zero after backward"
+        );
     }
 
     #[test]
@@ -2088,10 +2415,16 @@ mod tests {
         // on the same input because local uses a window mask.
         let cfg = tiny_cfg();
         let mut rng = InitRng::new(5);
-        let attn_local  = Gemma3Attention::new(&cfg, 0, &mut rng); // local
+        let attn_local = Gemma3Attention::new(&cfg, 0, &mut rng); // local
         let attn_global = Gemma3Attention::new(&cfg, 5, &mut rng); // global
-        assert!(attn_local.sliding_window.is_some(),  "layer 0 should be local");
-        assert!(attn_global.sliding_window.is_none(), "layer 5 should be global");
+        assert!(
+            attn_local.sliding_window.is_some(),
+            "layer 0 should be local"
+        );
+        assert!(
+            attn_global.sliding_window.is_none(),
+            "layer 5 should be global"
+        );
     }
 
     #[test]
@@ -2145,8 +2478,11 @@ mod tests {
         let params = model.parameters();
         assert!(!params.is_empty(), "model should have parameters");
         // Rough sanity check: at minimum embed + lm_head + norms + attn + mlp per layer
-        assert!(params.len() > cfg.num_hidden_layers * 5,
-            "expected many parameter tensors, got {}", params.len());
+        assert!(
+            params.len() > cfg.num_hidden_layers * 5,
+            "expected many parameter tensors, got {}",
+            params.len()
+        );
     }
 
     #[test]
@@ -2210,7 +2546,10 @@ mod tests {
         let mut rng = InitRng::new(55);
         let attn = Gemma3Attention::new(&cfg, 0, &mut rng);
         let mut cache = Gemma3LayerKvCache::new(
-            cfg.num_key_value_heads, cfg.head_dim, cfg.max_position_embeddings);
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.max_position_embeddings,
+        );
         let x = TensorNode::leaf(Mat::zeros(1, cfg.hidden_size));
         let out = attn.forward_cached(&x, &mut cache);
         assert_eq!(out.data().rows, 1);
@@ -2246,19 +2585,24 @@ mod tests {
 
         // Non-cached: full forward, greedy argmax on last row
         let logits = model.forward(&prompt);
-        let ldata  = logits.data().clone();
-        let t      = ldata.rows;
-        let v      = ldata.cols;
+        let ldata = logits.data().clone();
+        let t = ldata.rows;
+        let v = ldata.cols;
         let uncached = (0..v)
-            .max_by(|&a, &b| ldata.at(t-1, a).partial_cmp(&ldata.at(t-1, b)).unwrap())
+            .max_by(|&a, &b| ldata.at(t - 1, a).partial_cmp(&ldata.at(t - 1, b)).unwrap())
             .unwrap();
 
         // Cached: greedy (temperature=0)
         let mut cached_tok = usize::MAX;
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |tok| { cached_tok = tok; });
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |tok| {
+            cached_tok = tok;
+        });
 
-        assert_eq!(uncached, cached_tok,
-            "cached first token {} must match non-cached {}", cached_tok, uncached);
+        assert_eq!(
+            uncached, cached_tok,
+            "cached first token {} must match non-cached {}",
+            cached_tok, uncached
+        );
     }
 
     #[test]
