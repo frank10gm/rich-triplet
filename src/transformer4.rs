@@ -908,6 +908,25 @@ impl Gemma3Block {
 }
 
 impl Gemma3Model {
+    /// Quantize all large projection weights to INT4 and free float storage.
+    ///
+    /// Call once after all weights are loaded. Converts BF16 (or f32) weights
+    /// to Q4 block-wise quantization (block size 32), freeing ~4× the RAM.
+    /// Safe for inference-only use — do not call if you need backward passes.
+    pub fn quantize_all_weights(&mut self) {
+        for layer in &mut self.layers {
+            layer.self_attn.q_proj.quantize_bf16_and_free();
+            layer.self_attn.k_proj.quantize_bf16_and_free();
+            layer.self_attn.v_proj.quantize_bf16_and_free();
+            layer.self_attn.o_proj.quantize_bf16_and_free();
+            layer.mlp.gate_proj.quantize_bf16_and_free();
+            layer.mlp.up_proj.quantize_bf16_and_free();
+            layer.mlp.down_proj.quantize_bf16_and_free();
+        }
+    }
+}
+
+impl Gemma3Model {
     /// Generate `max_new` tokens using a KV cache.
     ///
     /// Each decode step runs only 1 token through the model, reducing

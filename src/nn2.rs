@@ -174,6 +174,22 @@ impl Linear2 {
         self.weight.set_data(Mat::zeros(0, 0));
     }
 
+    /// Quantize BF16 weight to INT4 and free all float storage (inference-only).
+    ///
+    /// Use this when the weight was loaded via `load_bf16`. Dequantizes BF16→f32
+    /// in one pass, then quantizes to Q4, then frees both the BF16 and f32 copies.
+    /// Falls back to `quantize_and_free_f32` if no BF16 weight is present.
+    pub fn quantize_bf16_and_free(&mut self) {
+        if let Some(ref bf16) = self.bf16_weight {
+            let f32_mat = bf16.to_f32();
+            self.q4_weight = Some(Q4Mat::quantize(&f32_mat));
+            self.bf16_weight = None;
+            self.weight.set_data(Mat::zeros(0, 0));
+        } else {
+            self.quantize_and_free_f32();
+        }
+    }
+
     /// input: [T, in_features]  →  output: [T, out_features]
     pub fn forward(&self, input: &TensorNode) -> TensorNode {
         self.fused_linear(input)
@@ -202,6 +218,9 @@ impl Linear2 {
         let out_data = if let Some(ref q4) = self.q4_weight {
             assert_eq!(x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
+            #[cfg(feature = "metal")]
+            let mut o = crate::metal_ops::metal_matmul_q4_t(&x, q4);
+            #[cfg(not(feature = "metal"))]
             let mut o = q4.matmul_q4_t(&x);
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o

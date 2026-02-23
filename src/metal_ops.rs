@@ -175,6 +175,74 @@ kernel void matmul_tiled_batched(
 "#;
 
     // -------------------------------------------------------------------------
+    // MSL source — Q4 fused dequantize + matmul
+    //
+    // Computes C[M,N] = A[M,K] @ dequant(B_q4[N,K])^T
+    // where B_q4 is stored as block-wise 4-bit symmetric quantization:
+    //   - packed[]: 2 nibbles per byte, row-major over [N, K]
+    //   - scales[]: one f32 per BLOCK_SIZE elements (flat index)
+    //
+    // Each thread computes one output element C[row,col].
+    // Uses threadgroup shared memory to cache a tile of A.
+    // The B (Q4) tile is dequantized on-the-fly from nibbles.
+    // -------------------------------------------------------------------------
+    const MATMUL_Q4_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define Q4_TS         16u
+#define Q4_BLOCK_SIZE 32u
+
+kernel void matmul_q4_t(
+    device const float* A       [[ buffer(0) ]],   // [M, K]
+    device const uchar* packed  [[ buffer(1) ]],   // nibble-packed Q4 weights [N, K] → ceil(N*K/2) bytes
+    device const float* scales  [[ buffer(2) ]],   // one scale per Q4_BLOCK_SIZE elems (flat index)
+    device       float* C       [[ buffer(3) ]],   // [M, N]
+    constant     uint&  M       [[ buffer(4) ]],
+    constant     uint&  K       [[ buffer(5) ]],
+    constant     uint&  N       [[ buffer(6) ]],
+    uint2 tgid [[ threadgroup_position_in_grid ]],
+    uint2 tid  [[ thread_position_in_threadgroup ]])
+{
+    uint row = tgid.y * Q4_TS + tid.y;   // output row  (index into A rows)
+    uint col = tgid.x * Q4_TS + tid.x;   // output col  (index into B/Q4 rows)
+
+    // Shared tile for a strip of A
+    threadgroup float As[Q4_TS][Q4_TS];
+
+    float acc = 0.0f;
+    uint n_tiles = (K + Q4_TS - 1u) / Q4_TS;
+
+    for (uint t = 0u; t < n_tiles; t++) {
+        // Load tile of A into shared memory
+        uint a_col = t * Q4_TS + tid.x;
+        As[tid.y][tid.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate dot product, dequantizing Q4 nibbles on the fly
+        for (uint k = 0u; k < Q4_TS; k++) {
+            uint global_k = t * Q4_TS + k;
+            if (col < N && global_k < K) {
+                uint flat = col * K + global_k;
+                // Unpack nibble
+                uchar byte = packed[flat / 2u];
+                uchar nibble = (flat % 2u == 0u) ? (byte & 0x0Fu) : ((byte >> 4u) & 0x0Fu);
+                // Sign-extend 4-bit two's complement
+                int q = (nibble >= 8u) ? (int(nibble) - 16) : int(nibble);
+                float scale = scales[flat / Q4_BLOCK_SIZE];
+                float w = float(q) * scale;
+                acc += As[tid.y][k] * w;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = acc;
+}
+"#;
+
+    // -------------------------------------------------------------------------
     // Cached Metal objects — one per thread
     // -------------------------------------------------------------------------
     pub struct MetalContext {
@@ -182,6 +250,7 @@ kernel void matmul_tiled_batched(
         pub queue:             Retained<ProtocolObject<dyn MTLCommandQueue>>,
         pub pipeline:          Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pub pipeline_batched:  Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pub pipeline_q4:       Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     thread_local! {
@@ -196,13 +265,11 @@ kernel void matmul_tiled_batched(
             .newCommandQueue()
             .expect("Metal: could not create command queue");
 
-        // Compile both kernels from the same source string.
-        let source = NSString::from_str(MATMUL_MSL);
-        let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .expect("Metal: MSL compilation failed");
-
-        let make_pipeline = |name: &str| {
+        let make_pipeline_from_src = |src: &str, name: &str| {
+            let source = NSString::from_str(src);
+            let library = device
+                .newLibraryWithSource_options_error(&source, None)
+                .unwrap_or_else(|_| panic!("Metal: MSL compilation failed for '{}'", name));
             let fn_name = NSString::from_str(name);
             let func: Retained<ProtocolObject<dyn MTLFunction>> = library
                 .newFunctionWithName(&fn_name)
@@ -212,10 +279,11 @@ kernel void matmul_tiled_batched(
                 .unwrap_or_else(|_| panic!("Metal: could not create pipeline for '{}'", name))
         };
 
-        let pipeline         = make_pipeline("matmul_tiled");
-        let pipeline_batched = make_pipeline("matmul_tiled_batched");
+        let pipeline         = make_pipeline_from_src(MATMUL_MSL, "matmul_tiled");
+        let pipeline_batched = make_pipeline_from_src(MATMUL_MSL, "matmul_tiled_batched");
+        let pipeline_q4      = make_pipeline_from_src(MATMUL_Q4_MSL, "matmul_q4_t");
 
-        MetalContext { device, queue, pipeline, pipeline_batched }
+        MetalContext { device, queue, pipeline, pipeline_batched, pipeline_q4 }
     }
 
     // -------------------------------------------------------------------------
@@ -265,6 +333,22 @@ kernel void matmul_tiled_batched(
                     MTLResourceOptions::StorageModeShared,
                 )
                 .expect("Metal: constant buffer allocation failed")
+        }
+    }
+
+    /// Upload a &[u8] slice to a new MTLBuffer.
+    fn upload_bytes(device: &ProtocolObject<dyn MTLDevice>, data: &[u8])
+        -> Retained<ProtocolObject<dyn MTLBuffer>>
+    {
+        let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();
+        unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    data.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("Metal: buffer allocation failed")
         }
     }
 
@@ -447,6 +531,73 @@ kernel void matmul_tiled_batched(
     }
 
     // -------------------------------------------------------------------------
+    // Q4 matmul entry point
+    // -------------------------------------------------------------------------
+
+    /// GPU-accelerated `C = A @ dequant(Q4)^T`  ([M,K] × [N,K] → [M,N]).
+    ///
+    /// `q4` is stored row-major as [N, K] with nibble-packed weights.
+    /// Falls back to CPU `matmul_q4_t` when the problem is too small.
+    pub fn metal_matmul_q4_t(a: &Mat, q4: &crate::autograd2::Q4Mat) -> Mat {
+        let (m, k, n) = (a.rows, a.cols, q4.rows);
+        assert_eq!(k, q4.cols,
+            "metal_matmul_q4_t: a.cols {} != q4.cols {}", k, q4.cols);
+
+        if m * k * n < METAL_THRESHOLD {
+            return q4.matmul_q4_t(a);
+        }
+
+        METAL_CTX.with(|cell| {
+            let ctx = cell.get_or_init(init_context);
+
+            let buf_a      = upload(&ctx.device, &a.data);
+            let buf_packed = upload_bytes(&ctx.device, &q4.packed);
+            let buf_scales = upload(&ctx.device, &q4.scales);
+            let buf_c      = alloc_output(&ctx.device, m * n);
+            let buf_m      = upload_u32(&ctx.device, m as u32);
+            let buf_k      = upload_u32(&ctx.device, k as u32);
+            let buf_n      = upload_u32(&ctx.device, n as u32);
+
+            let cmd_buf = ctx.queue
+                .commandBuffer()
+                .expect("Metal: commandBuffer() failed");
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .expect("Metal: computeCommandEncoder() failed");
+
+            encoder.setComputePipelineState(&ctx.pipeline_q4);
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&buf_a),      0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&buf_packed),  0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&buf_scales),  0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&buf_c),       0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&buf_m),       0, 4);
+                encoder.setBuffer_offset_atIndex(Some(&buf_k),       0, 5);
+                encoder.setBuffer_offset_atIndex(Some(&buf_n),       0, 6);
+            }
+
+            let tg_size  = MTLSize { width: 16, height: 16, depth: 1 };
+            let grid_size = MTLSize {
+                width:  (n + 15) / 16,
+                height: (m + 15) / 16,
+                depth: 1,
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
+            encoder.endEncoding();
+
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+
+            let ptr = buf_c.contents().as_ptr() as *const f32;
+            let out_data: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(ptr, m * n).to_vec()
+            };
+            Mat::new(out_data, m, n)
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------------
     #[cfg(test)]
@@ -605,4 +756,4 @@ kernel void matmul_tiled_batched(
 }
 
 #[cfg(feature = "metal")]
-pub use inner::{metal_matmul, metal_matmul_batched};
+pub use inner::{metal_matmul, metal_matmul_batched, metal_matmul_q4_t};

@@ -278,6 +278,9 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     model.load_weights_from_dir(weights_dir)
         .expect("failed to load weights");
 
+    eprintln!("[ Gemma3 ] Quantizing weights to INT4...");
+    model.quantize_all_weights();
+
     // Gemma 3-IT requires the chat template:
     //   <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
     // Special token ids: bos=2, start_of_turn=105, end_of_turn=106, \n=107, user=2364
