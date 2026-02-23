@@ -353,10 +353,13 @@ impl Module2 for Gemma3Block {
 
 /// The full Gemma 3 model.
 pub struct Gemma3Model {
-    pub embed_tokens: TensorNode,     // [vocab_size, hidden_size]
+    pub embed_tokens: TensorNode,     // [vocab_size, hidden_size] — small f32 placeholder; real data in embed_bf16
+    /// BF16 embedding table (vocab_size × hidden_size). Populated by load_weights_from_dir.
+    /// Used for fast row lookups without a 2.7 GB f32 allocation.
+    pub embed_bf16:   Option<crate::autograd2::MatBf16>,
     pub layers:       Vec<Gemma3Block>,
     pub norm:         RmsNorm2,       // final layer norm
-    pub lm_head:      Linear2,        // [hidden_size, vocab_size] — tied with embed_tokens
+    pub lm_head:      Linear2,        // [hidden_size, vocab_size] — weight-tied with embed_tokens
     pub config:       Config4,
 }
 
@@ -383,7 +386,7 @@ impl Gemma3Model {
             bf16_weight: None,
         };
 
-        Gemma3Model { embed_tokens: embed, layers, norm, lm_head, config: cfg }
+        Gemma3Model { embed_tokens: embed, embed_bf16: None, layers, norm, lm_head, config: cfg }
     }
 
     // -------------------------------------------------------------------------
@@ -642,9 +645,20 @@ fn apply_tensor_inner(
     // Strip optional "language_model." prefix (present in vision-language model checkpoints)
     let name = t.name.strip_prefix("language_model.").unwrap_or(t.name.as_str());
 
-    // Global tensors — embeddings and norms stay as f32 (they are small
-    // and used differently from projection weights).
+    // Global tensors
     if name == "model.embed_tokens.weight" {
+        // Store as BF16 to avoid a 2.7 GB f32 allocation for the 262K×2560 table.
+        if let Some(ref bits) = t.bf16_data {
+            if bits.len() == t.shape[0] * t.shape[1] {
+                use crate::autograd2::MatBf16;
+                model.embed_bf16 = Some(MatBf16 { data: bits.clone(), rows: t.shape[0], cols: t.shape[1] });
+                // Keep a tiny f32 placeholder so the TensorNode shape is consistent.
+                model.embed_tokens.set_data(crate::autograd2::Mat::zeros(t.shape[0], t.shape[1]));
+                // Also store as bf16 in lm_head so the vocab projection is fast.
+                model.lm_head.load_bf16(bits.clone(), t.shape[0], t.shape[1]);
+                return Some(true);
+            }
+        }
         return Some(set_node(&model.embed_tokens, &t.data, t.shape[0], t.shape[1]));
     }
     if name == "model.norm.weight" {
@@ -932,55 +946,39 @@ impl Gemma3Model {
         let cache  = Gemma3KvCache::new(&self.config);
         let h      = self.config.hidden_size;
         let scale  = (h as f32).sqrt();
-        let te     = self.embed_tokens.data().clone();
         let mut rng  = LcgRng::new(seed);
         let mut seen: Vec<usize> = token_ids.to_vec();
 
+        // Helper: look up one embedding row from BF16 table (preferred) or f32.
+        let embed_row = |tok: usize| -> Vec<f32> {
+            if let Some(ref bf16) = self.embed_bf16 {
+                use crate::autograd2::MatBf16;
+                (0..h).map(|c| MatBf16::bf16_to_f32(bf16.data[tok * h + c]) * scale).collect()
+            } else {
+                let te = self.embed_tokens.data();
+                (0..h).map(|c| te.at(tok, c) * scale).collect()
+            }
+        };
+
         // ----- Prefill -----
         let t_prompt = token_ids.len();
-        let x_data = Mat::from_fn(t_prompt, h, |row, col| {
-            te.at(token_ids[row], col) * scale
-        });
+        let x_data = Mat {
+            data: token_ids.iter().flat_map(|&tok| embed_row(tok)).collect(),
+            rows: t_prompt,
+            cols: h,
+        };
         let mut x = TensorNode::leaf(x_data);
-        {
-            let xd = x.data();
-            let vals: Vec<f32> = (0..5.min(xd.cols)).map(|c| xd.at(0, c)).collect();
-            eprintln!("[DBG] embed[tok0, 0..5]: {:?}", vals);
-        }
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
-            if i == 0 || i == 5 || i == 11 || i == 17 || i == 23 || i == 33 {
-                let xd = x.data();
-                let row = t_prompt - 1;
-                let rms: f32 = ((0..xd.cols).map(|c| xd.at(row, c).powi(2)).sum::<f32>() / xd.cols as f32).sqrt();
-                eprintln!("[DBG] after_layer{}[last_tok] RMS: {:.4}", i, rms);
-            }
         }
-        let normed_final = self.norm.forward_gemma3(&x);
-        {
-            let nd = normed_final.data();
-            let row = t_prompt - 1;
-            let norm_vals: Vec<f32> = (0..5.min(nd.cols)).map(|c| nd.at(row, c)).collect();
-            eprintln!("[DBG] final normed[last_tok, 0..5]: {:?}", norm_vals);
-            let rms: f32 = (0..nd.cols).map(|c| nd.at(row, c).powi(2)).sum::<f32>() / nd.cols as f32;
-            eprintln!("[DBG] final normed RMS: {:.4}", rms.sqrt());
-        }
+        // Only run lm_head on the last token row — avoids a T×vocab matmul.
+        let last_row = {
+            let xd = x.data();
+            Mat::from_fn(1, h, |_, c| xd.at(t_prompt - 1, c))
+        };
+        let normed_final = self.norm.forward_gemma3(&TensorNode::leaf(last_row));
         let logits_node = self.lm_head.forward(&normed_final);
-        {
-            let ld = logits_node.data();
-            let row = t_prompt - 1;
-            let v = ld.cols;
-            let mut top: Vec<(usize, f32)> = (0..v).map(|c| (c, ld.at(row, c))).collect();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            eprintln!("[DBG] prefill top-5 logits: {:?}", &top[..5.min(top.len())]);
-            // Find ranks of specific tokens
-            for (tok_name, tok_id) in [("▁The(669)", 669usize), ("▁Rome(13706)", 13706), ("▁Italy(11702)", 11702), ("\n(107)", 107)] {
-                let rank = top.iter().position(|(id, _)| *id == tok_id).unwrap_or(999999);
-                let score = if tok_id < v { ld.at(row, tok_id) } else { f32::NAN };
-                eprintln!("[DBG] rank of {} = {} (score={:.3})", tok_name, rank, score);
-            }
-        }
-        let first = sample_token(&logits_node.data(), t_prompt - 1, &params, &seen, &mut rng);
+        let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);
         if is_eos(first) { return; }
@@ -988,7 +986,11 @@ impl Gemma3Model {
         // ----- Decode loop -----
         let mut prev = first;
         for _ in 1..max_new {
-            let x_data = Mat::from_fn(1, h, |_, col| te.at(prev, col) * scale);
+            let x_data = Mat {
+                data: embed_row(prev),
+                rows: 1,
+                cols: h,
+            };
             let mut x = TensorNode::leaf(x_data);
             for (i, layer) in self.layers.iter().enumerate() {
                 x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());

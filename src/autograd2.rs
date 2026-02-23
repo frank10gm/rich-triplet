@@ -212,6 +212,34 @@ impl Mat {
         out
     }
 
+    /// BLAS matmul where B is used transposed: computes `self @ b^T`.
+    ///
+    /// Equivalent to `self.matmul(&b.transpose())` but avoids the transpose
+    /// allocation. Used by `fused_linear` with BF16 weights where the weight
+    /// is stored as [out, in] and we need x @ W^T.
+    #[cfg(feature = "blas")]
+    pub fn matmul_bt(&self, b: &Mat) -> Mat {
+        // self: [M, K],  b: [N, K]  →  out: [M, N]
+        let (m, k, n) = (self.rows, self.cols, b.rows);
+        assert_eq!(k, b.cols, "matmul_bt: [{},{}] × [{},{}]^T shape mismatch",
+            self.rows, self.cols, b.rows, b.cols);
+        let mut out = Mat::zeros(m, n);
+        unsafe {
+            cblas::sgemm(
+                cblas::Layout::RowMajor,
+                cblas::Transpose::None,
+                cblas::Transpose::Ordinary,
+                m as i32, n as i32, k as i32,
+                1.0_f32,
+                &self.data, k as i32,
+                &b.data,    k as i32,  // ldb = K (B is [N,K] row-major)
+                0.0_f32,
+                &mut out.data, n as i32,
+            );
+        }
+        out
+    }
+
     /// A.T — transpose: [M,N] → [N,M]
     pub fn transpose(&self) -> Mat {
         Mat::from_fn(self.cols, self.rows, |r, c| self.at(c, r))

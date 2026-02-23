@@ -14,7 +14,8 @@
       "Bash(python3:*)",
       "Bash(curl:*)",
       "Bash(wc:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cargo tree:*)"
     ]
   }
 }

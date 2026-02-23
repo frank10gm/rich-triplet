@@ -210,8 +210,11 @@ impl Linear2 {
             let w = bf16.to_f32();
             assert_eq!(x.cols, w.cols,
                 "Linear (bf16): input cols {} != weight cols {}", x.cols, w.cols);
-            let wt = w.transpose();
-            let mut o = x.matmul(&wt);
+            // Use BLAS transB to avoid allocating the [in, out] transpose matrix.
+            #[cfg(feature = "blas")]
+            let mut o = x.matmul_bt(&w);
+            #[cfg(not(feature = "blas"))]
+            let mut o = x.matmul(&w.transpose());
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
             o
         } else {

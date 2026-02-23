@@ -23,4 +23,11 @@ blas = ["cblas", "blas-src"]
 parallel = []
 metal = ["dep:objc2-metal", "dep:objc2-foundation", "dep:objc2"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+
 [dev-dependencies]
