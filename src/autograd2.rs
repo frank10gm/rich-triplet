@@ -837,6 +837,61 @@ impl Q4Mat {
         out
     }
 
+    /// Dequantize row `j` of this Q4Mat into the provided f32 buffer.
+    /// `buf` must have length >= self.cols.
+    #[inline]
+    fn dequantize_row_into(&self, j: usize, buf: &mut [f32]) {
+        let k = self.cols;
+        let row_start = j * k;
+        let mut block = row_start / Q4_BLOCK_SIZE;
+        let mut block_end = (block + 1) * Q4_BLOCK_SIZE;
+
+        for p in 0..k {
+            let flat = row_start + p;
+            if flat >= block_end {
+                block += 1;
+                block_end += Q4_BLOCK_SIZE;
+            }
+            let nibble = if flat & 1 == 0 {
+                self.packed[flat >> 1] & 0x0F
+            } else {
+                (self.packed[flat >> 1] >> 4) & 0x0F
+            };
+            let q = if nibble >= 8 { nibble as i8 - 16 } else { nibble as i8 };
+            buf[p] = q as f32 * self.scales[block];
+        }
+    }
+
+    /// BLAS-accelerated matmul: A [M,K] @ Q4^T [N,K] → [M,N].
+    ///
+    /// Dequantizes one row of Q4 at a time into a K-element scratch buffer,
+    /// then uses cblas_sdot to compute each output element.
+    /// Allocates only K floats of scratch regardless of N.
+    #[cfg(feature = "blas")]
+    pub fn matmul_q4_t_blas(&self, a: &Mat) -> Mat {
+        let (m, k, n) = (a.rows, a.cols, self.rows);
+        assert_eq!(k, self.cols,
+            "matmul_q4_t_blas: a.cols {} != q4.cols {}", k, self.cols);
+
+        let mut out = Mat::zeros(m, n);
+        let mut row_buf = vec![0.0f32; k];
+
+        for j in 0..n {
+            self.dequantize_row_into(j, &mut row_buf);
+            for i in 0..m {
+                let dot = unsafe {
+                    cblas::sdot(
+                        k as i32,
+                        &a.data[i * k..], 1,
+                        &row_buf,         1,
+                    )
+                };
+                *out.at_mut(i, j) = dot;
+            }
+        }
+        out
+    }
+
     /// Memory usage in bytes (excluding struct overhead).
     pub fn size_bytes(&self) -> usize {
         self.packed.len() + self.scales.len() * 4

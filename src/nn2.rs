@@ -219,14 +219,12 @@ impl Linear2 {
             assert_eq!(x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
             // Strategy by feature:
-            // - blas: dequantize Q4→f32 once, then use BLAS matmul_bt (AMX/NEON, fast for any M)
-            // - metal (no blas): use Metal GPU kernel for M>1 (prefill), scalar loop for M=1 (decode)
+            // - blas: dequantize one Q4 row at a time into a K-float scratch buffer,
+            //         use cblas_sdot per output element — no full f32 matrix allocation
+            // - metal (no blas): GPU kernel for M>1 (prefill), scalar loop for M=1 (decode)
             // - neither: scalar Q4 loop
             #[cfg(feature = "blas")]
-            let mut o = {
-                let w = q4.dequantize();
-                x.matmul_bt(&w)
-            };
+            let mut o = q4.matmul_q4_t_blas(&x);
             #[cfg(all(feature = "metal", not(feature = "blas")))]
             let mut o = if x.rows > 1 {
                 crate::metal_ops::metal_matmul_q4_t(&x, q4)
