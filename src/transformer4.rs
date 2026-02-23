@@ -580,9 +580,9 @@ impl Gemma3Model {
     /// - `token_embd.weight`           → embed_tokens
     /// - `output_norm.weight`          → model.norm
     /// - `blk.{i}.attn_norm.weight`    → input_layernorm
-    /// - `blk.{i}.post_attn_norm.weight` → post_attention_layernorm
-    /// - `blk.{i}.ffn_pre_norm.weight` → pre_feedforward_layernorm
-    /// - `blk.{i}.ffn_post_norm.weight`→ post_feedforward_layernorm
+    /// - `blk.{i}.post_attn_norm.weight` or `post_attention_norm.weight` → post_attention_layernorm
+    /// - `blk.{i}.ffn_pre_norm.weight` or `ffn_norm.weight` → pre_feedforward_layernorm
+    /// - `blk.{i}.ffn_post_norm.weight` or `post_ffw_norm.weight` → post_feedforward_layernorm
     /// - `blk.{i}.attn_q_norm.weight`  → self_attn.q_norm
     /// - `blk.{i}.attn_k_norm.weight`  → self_attn.k_norm
     /// - `blk.{i}.attn_q.weight`       → self_attn.q_proj
@@ -632,6 +632,7 @@ impl Gemma3Model {
                 } else {
                     (shape[0], 1)
                 };
+                eprintln!("[ GGUF ] token_embd: type={:?} vocab={} hidden={}", gtype, vocab, hidden);
                 match gtype {
                     GgufType::Bf16 => {
                         let bits = gguf.decode_bf16(idx)?;
@@ -651,6 +652,15 @@ impl Gemma3Model {
                             .collect();
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
+                    GgufType::Q4_0 => {
+                        // Dequantize Q4_0 embedding to f32, then convert to BF16 for storage.
+                        // Memory order: flat[tok * hidden + col] — no transpose needed.
+                        let f32s = gguf.decode_q4_0_to_f32(idx)?;
+                        let bits: Vec<u16> = f32s.iter()
+                            .map(|&f| MatBf16::f32_to_bf16(f))
+                            .collect();
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
                     _ => {
                         eprintln!("[ GGUF ] Warning: token_embd type {:?} not supported, skipping", gtype);
                     }
@@ -663,6 +673,7 @@ impl Gemma3Model {
             if name == "output_norm.weight" {
                 let f32s = load_f32(&gguf, idx)?;
                 let n = f32s.len();
+                eprintln!("[ DBG ] output_norm first 8: {:?}", &f32s[..8.min(n)]);
                 self.norm.gamma.set_data(crate::autograd2::Mat::new(f32s, 1, n));
                 loaded += 1;
                 continue;
@@ -684,25 +695,31 @@ impl Gemma3Model {
                         "attn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
+                            if layer_idx == 0 {
+                                eprintln!("[ DBG ] blk.0.attn_norm first 8: {:?}", &f32s[..8.min(n)]);
+                            }
                             layer.input_layernorm.gamma.set_data(
                                 crate::autograd2::Mat::new(f32s, 1, n));
                             loaded += 1;
                         }
-                        "post_attn_norm.weight" => {
+                        // post_attention_layernorm
+                        "post_attn_norm.weight" | "post_attention_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
                             layer.post_attention_layernorm.gamma.set_data(
                                 crate::autograd2::Mat::new(f32s, 1, n));
                             loaded += 1;
                         }
-                        "ffn_pre_norm.weight" => {
+                        // pre_feedforward_layernorm
+                        "ffn_pre_norm.weight" | "ffn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
                             layer.pre_feedforward_layernorm.gamma.set_data(
                                 crate::autograd2::Mat::new(f32s, 1, n));
                             loaded += 1;
                         }
-                        "ffn_post_norm.weight" => {
+                        // post_feedforward_layernorm
+                        "ffn_post_norm.weight" | "post_ffw_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
                             layer.post_feedforward_layernorm.gamma.set_data(
@@ -726,6 +743,15 @@ impl Gemma3Model {
                         // ---- projection weights ----
                         "attn_q.weight" => {
                             load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.q_proj)?;
+                            // Debug: print first 8 dequantized values of layer 0's q_proj
+                            if layer_idx == 0 {
+                                if let Some(ref q4) = layer.self_attn.q_proj.q4_weight {
+                                    let deq = q4.dequantize();
+                                    eprint!("[ GGUF debug ] blk.0.attn_q first 8 values: ");
+                                    for i in 0..8 { eprint!("{:.4} ", deq.data[i]); }
+                                    eprintln!("  shape={}x{}", q4.rows, q4.cols);
+                                }
+                            }
                             loaded += 1;
                         }
                         "attn_k.weight" => {
@@ -752,11 +778,13 @@ impl Gemma3Model {
                             load_linear_from_gguf(&gguf, idx, &mut layer.mlp.down_proj)?;
                             loaded += 1;
                         }
-                        _ => {
-                            // unknown sub-tensor, skip
+                        other => {
+                            eprintln!("[ GGUF ] Unknown blk tensor: blk.{}.{}", layer_idx, other);
                         }
                     }
                 }
+            } else if name != "token_embd.weight" && name != "output_norm.weight" {
+                eprintln!("[ GGUF ] Skipping unknown top-level tensor: {}", name);
             }
 
             if loaded % 50 == 0 && loaded > 0 {
@@ -767,7 +795,10 @@ impl Gemma3Model {
         // Gemma 3 uses weight tying: lm_head shares embed_tokens weights.
         // Copy embed_bf16 to lm_head.
         if let Some(ref e) = self.embed_bf16 {
+            eprintln!("[ GGUF ] embed_bf16 set: {}×{}", e.rows, e.cols);
             self.lm_head.load_bf16(e.data.clone(), e.rows, e.cols);
+        } else {
+            eprintln!("[ GGUF ] WARNING: embed_bf16 is None — token embeddings not loaded!");
         }
 
         eprintln!("[ GGUF ] Done. Loaded {} tensors.", loaded);
@@ -1127,8 +1158,22 @@ fn apply_tensor_inner(
             Some(set_node(&layer.self_attn.k_norm.gamma, &t.data, 1, t.data.len())),
 
         // Large projection weights: store as BF16 when available (lossless, 2× RAM).
-        "self_attn.q_proj.weight" =>
-            Some(set_linear(&mut layer.self_attn.q_proj, t, t.shape[0], t.shape[1])),
+        "self_attn.q_proj.weight" => {
+            let r = set_linear(&mut layer.self_attn.q_proj, t, t.shape[0], t.shape[1]);
+            // Debug: print first 8 values of layer 0's q_proj for comparison with GGUF
+            if layer_idx == 0 {
+                let vals: Vec<f32> = if let Some(ref bf16) = layer.self_attn.q_proj.bf16_weight {
+                    bf16.to_f32().data[..8.min(bf16.data.len())].to_vec()
+                } else {
+                    let d = layer.self_attn.q_proj.weight.data();
+                    d.data[..8.min(d.data.len())].to_vec()
+                };
+                eprint!("[ ST  debug ] model.layers.0.self_attn.q_proj first 8 values: ");
+                for v in &vals { eprint!("{:.4} ", v); }
+                eprintln!("  shape={}x{}", t.shape[0], t.shape[1]);
+            }
+            Some(r)
+        }
         "self_attn.k_proj.weight" =>
             Some(set_linear(&mut layer.self_attn.k_proj, t, t.shape[0], t.shape[1])),
         "self_attn.v_proj.weight" =>
@@ -1416,14 +1461,25 @@ impl Gemma3Model {
 
         // ----- Prefill -----
         let t_prompt = token_ids.len();
+        let embed_data: Vec<f32> = token_ids.iter().flat_map(|&tok| embed_row(tok)).collect();
+        // Diagnostic: print first token embedding (first 8 values)
+        {
+            let e = &embed_data[..8.min(embed_data.len())];
+            eprintln!("[ DBG ] embed[0] first 8 (scaled): {:?}", e);
+        }
         let x_data = Mat {
-            data: token_ids.iter().flat_map(|&tok| embed_row(tok)).collect(),
+            data: embed_data,
             rows: t_prompt,
             cols: h,
         };
         let mut x = TensorNode::leaf(x_data);
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+            if i == 0 {
+                let xd = x.data();
+                let vals: Vec<f32> = (0..8.min(xd.cols)).map(|c| xd.at(xd.rows-1, c)).collect();
+                eprintln!("[ DBG ] after layer 0, last tok first 8: {:?}", vals);
+            }
         }
         // Only run lm_head on the last token row — avoids a T×vocab matmul.
         let last_row = {
@@ -1431,7 +1487,15 @@ impl Gemma3Model {
             Mat::from_fn(1, h, |_, c| xd.at(t_prompt - 1, c))
         };
         let normed_final = self.norm.forward_gemma3(&TensorNode::leaf(last_row));
+        // Diagnostic: top-5 logit indices before sampling
         let logits_node = self.lm_head.forward(&normed_final);
+        {
+            let ld = logits_node.data();
+            let mut pairs: Vec<(f32, usize)> = (0..ld.cols).map(|c| (ld.at(0, c), c)).collect();
+            pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let top5: Vec<(usize, f32)> = pairs[..5].iter().map(|&(v, i)| (i, v)).collect();
+            eprintln!("[ DBG ] top-5 logits: {:?}", top5);
+        }
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);

@@ -381,6 +381,54 @@ impl GgufFile {
         }
         Ok(out)
     }
+
+    /// Decode a Q4_0 tensor directly into a flat Vec<f32>.
+    ///
+    /// Elements are dequantized in GGUF memory order (row-major with
+    /// GGUF's dimension convention, i.e. shape[0] is the fastest dimension).
+    /// The output Vec has length == n_elements.
+    ///
+    /// Use this for tensors where you need plain f32 values rather than
+    /// the packed Q4Mat format (e.g. embedding tables).
+    pub fn decode_q4_0_to_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q4_0,
+            "decode_q4_0_to_f32 called on non-Q4_0 tensor");
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem = info.n_elements();
+        let n_blocks = (n_elem + 31) / 32;
+        let mut out = vec![0.0f32; n_elem];
+
+        for b in 0..n_blocks {
+            let block_off = b * 18;
+            let scale_bits = u16::from_le_bytes([bytes[block_off], bytes[block_off + 1]]);
+            let scale = f16_to_f32(scale_bits);
+
+            let nibble_off = block_off + 2;
+            let start_elem = b * 32;
+            let end_elem = (start_elem + 32).min(n_elem);
+
+            // GGUF split layout: qs[k] low=elem(start+k), high=elem(start+k+16)
+            for k in 0..16 {
+                let src = bytes[nibble_off + k];
+
+                let e0 = start_elem + k;
+                if e0 < end_elem {
+                    let v = (src & 0x0F) as i8 - 8;
+                    out[e0] = v as f32 * scale;
+                }
+
+                let e1 = start_elem + k + 16;
+                if e1 < end_elem {
+                    let v = ((src >> 4) & 0x0F) as i8 - 8;
+                    out[e1] = v as f32 * scale;
+                }
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
