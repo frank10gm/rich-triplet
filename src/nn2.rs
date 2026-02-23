@@ -219,18 +219,14 @@ impl Linear2 {
             assert_eq!(x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}", x.cols, q4.cols);
             // Strategy by feature:
-            // - blas: dequantize one Q4 row at a time into a K-float scratch buffer,
-            //         use cblas_sdot per output element — no full f32 matrix allocation
-            // - metal (no blas): GPU kernel for M>1 (prefill), scalar loop for M=1 (decode)
-            // - neither: scalar Q4 loop
-            #[cfg(feature = "blas")]
+            // - metal: GEMV kernel — one threadgroup per output neuron, simd_sum over K.
+            //          Correct and fast for any M (optimised for M=1 decode).
+            // - blas: row-by-row dequant + cblas_sdot (no full matrix allocation)
+            // - neither: scalar loop
+            #[cfg(feature = "metal")]
+            let mut o = crate::metal_ops::metal_matmul_q4_t(&x, q4);
+            #[cfg(all(feature = "blas", not(feature = "metal")))]
             let mut o = q4.matmul_q4_t_blas(&x);
-            #[cfg(all(feature = "metal", not(feature = "blas")))]
-            let mut o = if x.rows > 1 {
-                crate::metal_ops::metal_matmul_q4_t(&x, q4)
-            } else {
-                q4.matmul_q4_t(&x)
-            };
             #[cfg(not(any(feature = "blas", feature = "metal")))]
             let mut o = q4.matmul_q4_t(&x);
             for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }

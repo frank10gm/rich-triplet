@@ -186,59 +186,60 @@ kernel void matmul_tiled_batched(
     // Uses threadgroup shared memory to cache a tile of A.
     // The B (Q4) tile is dequantized on-the-fly from nibbles.
     // -------------------------------------------------------------------------
+    // Q4 GEMV kernel — optimised for M=1 (single-token decode).
+    //
+    // Grid: one threadgroup per output element (row i, col j).
+    //   tgid.x = j  (which weight row / output neuron)
+    //   tgid.y = i  (which input row; usually 0 for decode)
+    // Threadgroup: TG_K threads, each handling K/TG_K elements of the dot product.
+    // A simd_sum reduction collapses the partial sums to a single value.
+    //
+    // For M=1, K=2560, N=10240 (gate_proj):
+    //   - 10240 threadgroups × 128 threads = 1.3M threads dispatched
+    //   - Each thread reads K/128 = 20 nibble pairs → very low register pressure
+    //   - Full GPU utilisation even for batch size 1
+    // TG_K must equal SIMD_SIZE (32) so that simd_sum covers the whole threadgroup.
+    // One threadgroup per output element; 32 threads stride over K.
     const MATMUL_Q4_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-#define Q4_TS         16u
 #define Q4_BLOCK_SIZE 32u
+#define TG_K          32u    // must equal simd_size (32 on all Apple GPUs)
 
 kernel void matmul_q4_t(
-    device const float* A       [[ buffer(0) ]],   // [M, K]
-    device const uchar* packed  [[ buffer(1) ]],   // nibble-packed Q4 weights [N, K] → ceil(N*K/2) bytes
-    device const float* scales  [[ buffer(2) ]],   // one scale per Q4_BLOCK_SIZE elems (flat index)
-    device       float* C       [[ buffer(3) ]],   // [M, N]
+    device const float* A       [[ buffer(0) ]],
+    device const uchar* packed  [[ buffer(1) ]],
+    device const float* scales  [[ buffer(2) ]],
+    device       float* C       [[ buffer(3) ]],
     constant     uint&  M       [[ buffer(4) ]],
     constant     uint&  K       [[ buffer(5) ]],
     constant     uint&  N       [[ buffer(6) ]],
-    uint2 tgid [[ threadgroup_position_in_grid ]],
-    uint2 tid  [[ thread_position_in_threadgroup ]])
+    uint3 tgid   [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
 {
-    uint row = tgid.y * Q4_TS + tid.y;   // output row  (index into A rows)
-    uint col = tgid.x * Q4_TS + tid.x;   // output col  (index into B/Q4 rows)
-
-    // Shared tile for a strip of A
-    threadgroup float As[Q4_TS][Q4_TS];
+    uint j = tgid.x;   // output neuron (weight row)
+    uint i = tgid.y;   // input row (0 for single-token decode)
+    if (j >= N || i >= M) return;
 
     float acc = 0.0f;
-    uint n_tiles = (K + Q4_TS - 1u) / Q4_TS;
+    uint row_start = j * K;
 
-    for (uint t = 0u; t < n_tiles; t++) {
-        // Load tile of A into shared memory
-        uint a_col = t * Q4_TS + tid.x;
-        As[tid.y][tid.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Accumulate dot product, dequantizing Q4 nibbles on the fly
-        for (uint k = 0u; k < Q4_TS; k++) {
-            uint global_k = t * Q4_TS + k;
-            if (col < N && global_k < K) {
-                uint flat = col * K + global_k;
-                // Unpack nibble
-                uchar byte = packed[flat / 2u];
-                uchar nibble = (flat % 2u == 0u) ? (byte & 0x0Fu) : ((byte >> 4u) & 0x0Fu);
-                // Sign-extend 4-bit two's complement
-                int q = (nibble >= 8u) ? (int(nibble) - 16) : int(nibble);
-                float scale = scales[flat / Q4_BLOCK_SIZE];
-                float w = float(q) * scale;
-                acc += As[tid.y][k] * w;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each of the 32 threads covers K/32 elements, strided
+    for (uint p = lid; p < K; p += TG_K) {
+        uint  flat   = row_start + p;
+        uchar byte_v = packed[flat >> 1u];
+        uchar nibble = (flat & 1u) == 0u ? (byte_v & 0x0Fu) : ((byte_v >> 4u) & 0x0Fu);
+        int   q      = (nibble >= 8u) ? (int(nibble) - 16) : int(nibble);
+        float w      = float(q) * scales[flat / Q4_BLOCK_SIZE];
+        acc += A[i * K + p] * w;
     }
 
-    if (row < M && col < N)
-        C[row * N + col] = acc;
+    // simd_sum reduces all 32 lanes (one full SIMD group = one threadgroup)
+    acc = simd_sum(acc);
+
+    if (lid == 0)
+        C[i * N + j] = acc;
 }
 "#;
 
@@ -577,12 +578,9 @@ kernel void matmul_q4_t(
                 encoder.setBuffer_offset_atIndex(Some(&buf_n),       0, 6);
             }
 
-            let tg_size  = MTLSize { width: 16, height: 16, depth: 1 };
-            let grid_size = MTLSize {
-                width:  (n + 15) / 16,
-                height: (m + 15) / 16,
-                depth: 1,
-            };
+            // One threadgroup per output element; 32 threads = one SIMD group.
+            let tg_size   = MTLSize { width: 32, height: 1, depth: 1 };
+            let grid_size = MTLSize { width: n,  height: m, depth: 1 };
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
             encoder.endEncoding();
 

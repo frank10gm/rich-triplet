@@ -15,7 +15,8 @@
       "Bash(curl:*)",
       "Bash(wc:*)",
       "Bash(ls:*)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "WebFetch(domain:medium.com)"
     ]
   }
 }
