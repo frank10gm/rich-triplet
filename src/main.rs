@@ -469,9 +469,21 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         eprintln!("Error: prompt encodes to zero tokens");
         std::process::exit(1);
     }
+
+    // Diagnostic: show prompt token IDs and their text
+    eprintln!(
+        "[ Gemma3-dbg ] Prompt token IDs ({} tokens):",
+        token_ids.len()
+    );
+    for (i, &tid) in token_ids.iter().enumerate() {
+        let text = tok.decode(&[tid as u32]);
+        eprintln!("  [{}] id={} text={:?}", i, tid, text);
+    }
+
     print!("{}", prompt);
     std::io::stdout().flush().ok();
 
+    let mut step_count = 0usize;
     model.generate_cached_streaming(
         &token_ids,
         args.max_new,
@@ -482,6 +494,14 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         args.seed,
         |tok_id| {
             let text = tok.decode(&[tok_id as u32]);
+            // Print first 15 generated tokens with their IDs for debugging
+            if step_count < 15 {
+                eprintln!(
+                    "[ Gemma3-dbg ] gen[{}] id={} text={:?}",
+                    step_count, tok_id, text
+                );
+            }
+            step_count += 1;
             print!("{}", text);
             std::io::stdout().flush().ok();
         },
