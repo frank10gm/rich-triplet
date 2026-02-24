@@ -633,6 +633,9 @@ impl Gemma3Model {
 
         let n_tensors = gguf.tensor_info.len();
         let mut loaded = 0usize;
+        // Track whether an explicit output.weight was found in the file.
+        // If so, we skip the default weight-tying from token_embd at the end.
+        let mut lm_head_explicitly_loaded = false;
 
         for idx in 0..n_tensors {
             let name = gguf.tensor_info[idx].name.clone();
@@ -699,6 +702,19 @@ impl Gemma3Model {
                         );
                     }
                 }
+                loaded += 1;
+                continue;
+            }
+
+            // ---- lm_head output projection (some GGUF files include this
+            //      separately even for weight-tied models) ----
+            if name == "output.weight" {
+                eprintln!(
+                    "[ GGUF ] Loading explicit output.weight for lm_head (type={:?})",
+                    gtype
+                );
+                load_linear_from_gguf(&gguf, idx, &mut self.lm_head)?;
+                lm_head_explicitly_loaded = true;
                 loaded += 1;
                 continue;
             }
@@ -848,10 +864,17 @@ impl Gemma3Model {
             }
         }
 
-        // Gemma 3 uses weight tying: lm_head shares embed_tokens weights.
-        // Copy embed_bf16 to lm_head.
-        if let Some(ref e) = self.embed_bf16 {
-            eprintln!("[ GGUF ] embed_bf16 set: {}×{}", e.rows, e.cols);
+        // Weight tying: lm_head shares embed_tokens weights *unless* the file
+        // contained an explicit output.weight tensor (non-tied variant).
+        if lm_head_explicitly_loaded {
+            eprintln!(
+                "[ GGUF ] lm_head loaded from explicit output.weight — skipping weight tying."
+            );
+        } else if let Some(ref e) = self.embed_bf16 {
+            eprintln!(
+                "[ GGUF ] embed_bf16 set: {}×{} — applying weight tying to lm_head.",
+                e.rows, e.cols
+            );
             self.lm_head.load_bf16(e.data.clone(), e.rows, e.cols);
         } else {
             eprintln!("[ GGUF ] WARNING: embed_bf16 is None — token embeddings not loaded!");
@@ -1618,14 +1641,26 @@ impl Gemma3Attention {
         // 4. Append to cache
         cache.append(&k.data().clone(), &v.data().clone());
 
-        // 5. Select context window
-        let (k_ctx, v_ctx) = match self.sliding_window {
-            Some(w) => (cache.k_last(w), cache.v_last(w)),
-            None => (cache.k_filled(), cache.v_filled()),
+        // 5. Select context window: compute bounds without copying the cache.
+        //    k_start..k_end indexes rows of cache.k / cache.v to attend over.
+        let k_end = cache.seq_len;
+        let k_start = match self.sliding_window {
+            Some(w) => k_end.saturating_sub(w),
+            None => 0,
         };
 
-        // 6. GQA attention
-        let attn_out = gqa_attention_cached(&q.data(), &k_ctx, &v_ctx, nq, nkv, d, self.attn_scale);
+        // 6. GQA attention (no per-layer copy of the KV cache)
+        let attn_out = gqa_attention_cached(
+            &q.data(),
+            &cache.k,
+            &cache.v,
+            k_start,
+            k_end,
+            nq,
+            nkv,
+            d,
+            self.attn_scale,
+        );
 
         // 7. Output projection
         self.o_proj.forward(&TensorNode::leaf(attn_out))
@@ -1711,7 +1746,14 @@ impl Gemma3Model {
         let h = self.config.hidden_size;
         let scale = (h as f32).sqrt();
         let mut rng = LcgRng::new(seed);
-        let mut seen: Vec<usize> = token_ids.to_vec();
+
+        // IMPORTANT: `seen` tracks only *generated* tokens for the repetition
+        // penalty — NOT prompt tokens.  If we included prompt tokens, the
+        // EOS / end-of-turn token (106) that appears in the chat template
+        // would be penalised from the very first decode step, making the
+        // model much less likely to stop naturally and causing it to keep
+        // generating garbage until max_new is reached.
+        let mut seen: Vec<usize> = Vec::new();
 
         // Helper: look up one embedding row from BF16 table (preferred) or f32.
         let embed_row = |tok: usize| -> Vec<f32> {
@@ -1728,8 +1770,9 @@ impl Gemma3Model {
 
         // ----- Prefill -----
         let t_prompt = token_ids.len();
+        let prefill_start = std::time::Instant::now();
+
         let embed_data: Vec<f32> = token_ids.iter().flat_map(|&tok| embed_row(tok)).collect();
-        // Diagnostic: print first token embedding (first 8 values)
 
         let x_data = Mat {
             data: embed_data,
@@ -1746,30 +1789,28 @@ impl Gemma3Model {
             Mat::from_fn(1, h, |_, c| xd.at(t_prompt - 1, c))
         };
         let normed_final = self.norm.forward_gemma3(&TensorNode::leaf(last_row));
-        // Diagnostic: top-5 logit indices before sampling
         let logits_node = self.lm_head.forward(&normed_final);
 
-        // Debug helper: print top-k logit token IDs and scores
-        let debug_top5 = |logits: &Mat, step: usize| {
-            let v = logits.cols;
-            let mut scores: Vec<(usize, f32)> = (0..v).map(|c| (c, logits.at(0, c))).collect();
-            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top5: Vec<(usize, f32)> = scores.into_iter().take(5).collect();
-            eprintln!("[DBG step {:>2}] top-5 token ids: {:?}", step, top5);
-        };
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        let prefill_tps = t_prompt as f64 / prefill_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[ Gemma3 ] Prefill: {} tokens in {:.0} ms ({:.1} tok/s)",
+            t_prompt, prefill_ms, prefill_tps
+        );
 
-        debug_top5(&logits_node.data(), 0);
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
-        eprintln!("[DBG step  0] sampled: {} (seen_len={})", first, seen.len());
         callback(first);
         seen.push(first);
         if is_eos(first) {
+            eprintln!("[ Gemma3 ] EOS after first token — generation complete.");
             return;
         }
 
         // ----- Decode loop -----
+        let decode_start = std::time::Instant::now();
         let mut prev = first;
-        for step in 1..max_new {
+        let mut n_decoded = 1usize;
+        for _step in 1..max_new {
             let x_data = Mat {
                 data: embed_row(prev),
                 rows: 1,
@@ -1780,24 +1821,23 @@ impl Gemma3Model {
                 x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
             }
             let logits_node = self.lm_head.forward(&self.norm.forward_gemma3(&x));
-            if step <= 6 {
-                debug_top5(&logits_node.data(), step);
-            }
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
-            if step <= 6 {
-                eprintln!(
-                    "[DBG step {:>2}] sampled: {} (seen_len={})",
-                    step,
-                    prev,
-                    seen.len()
-                );
-            }
             callback(prev);
             seen.push(prev);
+            n_decoded += 1;
             if is_eos(prev) {
                 break;
             }
         }
+
+        let decode_secs = decode_start.elapsed().as_secs_f64();
+        let decode_tps = n_decoded as f64 / decode_secs.max(1e-9);
+        eprintln!(
+            "[ Gemma3 ] Decode:  {} tokens in {:.0} ms ({:.1} tok/s)",
+            n_decoded,
+            decode_secs * 1000.0,
+            decode_tps
+        );
     }
 }
 
@@ -2097,46 +2137,153 @@ fn apply_rope_at_offset(
     TensorNode::leaf(out)
 }
 
-/// GQA attention for the cached decode path (no causal mask needed).
+/// GQA attention for the cached decode path.
 ///
-/// q [n_new, nq*d]  vs  k_ctx [T', nkv*d], v_ctx [T', nkv*d]
-/// → output Mat [n_new, nq*d]
+/// `q_data` is [t_q, n_q_heads * d_head].
+/// `k_cache` / `v_cache` are the full pre-allocated cache mats
+/// [max_seq_len, n_kv_heads * d_head]; only rows `k_start..k_end` are used,
+/// so the caller never needs to copy a window slice into a temporary Mat.
 ///
-/// The cache already contains only past tokens, so no causal masking is
-/// required.  Uses the caller-supplied `scale` (Gemma 3's
-/// `1/sqrt(query_pre_attn_scalar)`, not the default `1/sqrt(d_head)`).
+/// **Decode path (t_q == 1)** — fully zero-alloc: scores and weighted sum are
+/// computed with direct index arithmetic (+ BLAS sdot / saxpy when available).
+///
+/// **Prefill path (t_q > 1)** — per-head Mat copies are still made (same as
+/// before) because sgemm needs contiguous data; this path only runs once per
+/// generation (during prompt processing), so the cost is acceptable.
 fn gqa_attention_cached(
     q_data: &Mat,
-    k_ctx: &Mat,
-    v_ctx: &Mat,
+    k_cache: &Mat,
+    v_cache: &Mat,
+    k_start: usize,
+    k_end: usize,
     n_q_heads: usize,
     n_kv_heads: usize,
     d_head: usize,
     scale: f32,
 ) -> Mat {
     let t_q = q_data.rows;
-    let t_kv = k_ctx.rows;
+    let t_kv = k_end - k_start; // number of context tokens
+    let kv_stride = k_cache.cols; // n_kv_heads * d_head
     let group = n_q_heads / n_kv_heads;
     let mut out = Mat::zeros(t_q, n_q_heads * d_head);
 
+    // ── Decode path (single query token) ────────────────────────────────────
+    // Avoids all per-head temporary matrix allocations.
+    if t_q == 1 {
+        let mut scores = vec![0.0f32; t_kv];
+
+        for qh in 0..n_q_heads {
+            let kvh = qh / group;
+            let q_off = qh * d_head; // offset into q_data row 0
+            let kv_off = kvh * d_head; // offset into each k/v cache row
+            let out_off = qh * d_head; // offset into out row 0
+
+            // Step 1: scores[c] = dot(q_h, k_h[c]) * scale
+            for (ci, cache_row) in (k_start..k_end).enumerate() {
+                let k_base = cache_row * kv_stride + kv_off;
+
+                #[cfg(feature = "blas")]
+                {
+                    scores[ci] = unsafe {
+                        cblas::sdot(
+                            d_head as i32,
+                            &q_data.data[q_off..],
+                            1,
+                            &k_cache.data[k_base..],
+                            1,
+                        )
+                    } * scale;
+                }
+                #[cfg(not(feature = "blas"))]
+                {
+                    let mut dot = 0.0f32;
+                    for di in 0..d_head {
+                        dot += q_data.data[q_off + di] * k_cache.data[k_base + di];
+                    }
+                    scores[ci] = dot * scale;
+                }
+            }
+
+            // Step 2: softmax
+            let max_s = scores[..t_kv]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for s in &mut scores[..t_kv] {
+                *s = (*s - max_s).exp();
+                sum_exp += *s;
+            }
+            if sum_exp > 0.0 {
+                for s in &mut scores[..t_kv] {
+                    *s /= sum_exp;
+                }
+            }
+
+            // Step 3: out_h = sum_c(scores[c] * v_h[c])
+            for (ci, cache_row) in (k_start..k_end).enumerate() {
+                let v_base = cache_row * kv_stride + kv_off;
+                let w = scores[ci];
+
+                #[cfg(feature = "blas")]
+                unsafe {
+                    cblas::saxpy(
+                        d_head as i32,
+                        w,
+                        &v_cache.data[v_base..],
+                        1,
+                        &mut out.data[out_off..],
+                        1,
+                    );
+                }
+                #[cfg(not(feature = "blas"))]
+                for di in 0..d_head {
+                    out.data[out_off + di] += w * v_cache.data[v_base + di];
+                }
+            }
+        }
+        return out;
+    }
+
+    // ── Prefill path (multiple query tokens) ────────────────────────────────
+    // Per-head copies are necessary to form contiguous mats for sgemm.
+    // (causal_offset removed — we use k_start-relative indexing instead)
+
     for qh in 0..n_q_heads {
         let kvh = qh / group;
+        let kv_off = kvh * d_head;
 
         let q_h = Mat::from_fn(t_q, d_head, |r, c| q_data.at(r, qh * d_head + c));
-        let k_h = Mat::from_fn(t_kv, d_head, |r, c| k_ctx.at(r, kvh * d_head + c));
-        let v_h = Mat::from_fn(t_kv, d_head, |r, c| v_ctx.at(r, kvh * d_head + c));
+        let k_h = Mat::from_fn(t_kv, d_head, |r, c| {
+            k_cache.data[(k_start + r) * kv_stride + kv_off + c]
+        });
+        let v_h = Mat::from_fn(t_kv, d_head, |r, c| {
+            v_cache.data[(k_start + r) * kv_stride + kv_off + c]
+        });
 
-        // scores [t_q, t_kv] scaled
+        // Scores [t_q, t_kv] with causal mask
         let raw_scores = q_h.matmul(&k_h.transpose()).scale(scale);
 
-        // Causal mask: query at absolute position (t_kv - t_q + r) may only
-        // attend to keys at positions 0..=(t_kv - t_q + r).
-        // During decode t_q==1 so this is a no-op; during prefill it masks
-        // the upper triangle so tokens cannot attend to future positions.
-        let causal_offset = t_kv - t_q; // absolute position of query row 0
+        // Causal masking accounting for k_start offset.
+        //
+        // Key at window index c has absolute sequence position (k_start + c).
+        // Query at row r has absolute position r (fresh prefill, seq_offset=0)
+        // or (seq_offset + r) in general — but seq_offset=0 during prefill.
+        //
+        // A key is causally valid for query r iff: k_start + c <= r
+        //                                     iff: c <= r - k_start
+        //
+        // When r < k_start the query precedes all windowed keys; the row
+        // stays all-zero (the output for that position is the zero vector).
+        // This happens when the prompt is longer than the window.
         let mut w = Mat::zeros(t_q, t_kv);
         for r in 0..t_q {
-            let max_kv = causal_offset + r; // last valid key index for this query
+            if r < k_start {
+                // All windowed keys are causally after this query — attend to nothing.
+                continue;
+            }
+            // max_kv: largest window index the query may attend to (clamped).
+            let max_kv = (r - k_start).min(t_kv - 1);
             let row_max = (0..=max_kv)
                 .map(|c| raw_scores.at(r, c))
                 .fold(f32::NEG_INFINITY, f32::max);
@@ -2157,7 +2304,6 @@ fn gqa_attention_cached(
             }
         }
 
-        // Output [t_q, d_head]
         let out_h = w.matmul(&v_h);
         for r in 0..t_q {
             for c in 0..d_head {
@@ -2257,8 +2403,42 @@ fn sample_token(
             probs[indexed[i].0] = 0.0;
         }
         let sum: f32 = probs.iter().sum();
-        for p in &mut probs {
-            *p /= sum;
+        if sum > 0.0 {
+            for p in &mut probs {
+                *p /= sum;
+            }
+        }
+    }
+
+    // Top-p (nucleus sampling): keep the smallest set of tokens whose
+    // cumulative probability exceeds top_p.  Applied after top-k so we
+    // work on an already-truncated distribution.
+    if params.top_p > 0.0 && params.top_p < 1.0 {
+        let mut indexed: Vec<(usize, f32)> = probs
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|&(_, p)| p > 0.0)
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cumulative = 0.0f32;
+        let mut cutoff = indexed.len(); // index after which we zero out
+        for (i, &(_, p)) in indexed.iter().enumerate() {
+            cumulative += p;
+            if cumulative >= params.top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        // Zero out tokens outside nucleus
+        for i in cutoff..indexed.len() {
+            probs[indexed[i].0] = 0.0;
+        }
+        let sum: f32 = probs.iter().sum();
+        if sum > 0.0 {
+            for p in &mut probs {
+                *p /= sum;
+            }
         }
     }
 

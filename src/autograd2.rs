@@ -592,6 +592,70 @@ impl MatBf16 {
     pub fn at(&self, r: usize, c: usize) -> f32 {
         Self::bf16_to_f32(self.data[r * self.cols + c])
     }
+
+    /// Compute `a [M, K] @ self^T` where `self` is [N, K] BF16.
+    ///
+    /// **Decode path (M ≤ 4)** — dequantises one row of the BF16 weight at a
+    /// time into a K-element f32 scratch buffer, then dots it with each row of
+    /// `a`.  Allocates only K floats regardless of N.  This is critical for
+    /// large-vocab projections such as `lm_head`: naively calling `to_f32()`
+    /// first allocates N×K f32 bytes every token (1–3 GB for Gemma3).
+    ///
+    /// **Prefill path (M > 4)** — dequantises the full N×K matrix once and
+    /// delegates to an accelerated sgemm, which amortises the cost across M
+    /// query rows.
+    pub fn matmul_by_t(&self, a: &Mat) -> Mat {
+        let m = a.rows;
+        let k = a.cols;
+        let n = self.rows;
+        assert_eq!(
+            k, self.cols,
+            "matmul_by_t BF16: input cols {} != weight cols {}",
+            k, self.cols
+        );
+
+        // Prefill: full dequant then an accelerated GEMM.
+        if m > 4 {
+            let w = self.to_f32(); // [N, K] f32
+
+            #[cfg(feature = "blas")]
+            {
+                return a.matmul_bt(&w);
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                return a.matmul(&w.transpose());
+            }
+        }
+
+        // Decode (M ≤ 4): dequantise one BF16 row at a time → O(K) scratch.
+        let mut out = Mat::zeros(m, n);
+        let mut row_f32 = vec![0.0f32; k];
+
+        for j in 0..n {
+            let base = j * k;
+            for c in 0..k {
+                row_f32[c] = Self::bf16_to_f32(self.data[base + c]);
+            }
+
+            for i in 0..m {
+                #[cfg(feature = "blas")]
+                {
+                    *out.at_mut(i, j) =
+                        unsafe { cblas::sdot(k as i32, &a.data[i * k..], 1, &row_f32, 1) };
+                }
+                #[cfg(not(feature = "blas"))]
+                {
+                    let mut dot = 0.0f32;
+                    for c in 0..k {
+                        dot += a.data[i * k + c] * row_f32[c];
+                    }
+                    *out.at_mut(i, j) = dot;
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Mat {
@@ -4224,6 +4288,73 @@ mod tests {
         let bf = m.to_bf16();
         assert_eq!(bf.compression_ratio(), 2.0);
         assert_eq!(bf.size_bytes(), m.numel() * 2);
+    }
+
+    #[test]
+    fn test_bf16_matmul_by_t_decode_matches_reference() {
+        // Decode path: M=1, N large (simulates lm_head with small batch).
+        // matmul_by_t must give the same result as to_f32() + matmul — the
+        // reference uses bf16_w.to_f32() (not the original f32 weights) so
+        // that any BF16 quantisation error is shared and only the matmul
+        // algorithm is being tested.
+        let n = 128; // vocab-like dimension
+        let k = 16; // hidden-like dimension
+        let weight_f32 = Mat::from_fn(n, k, |r, c| ((r * k + c) as f32) * 0.01 - 0.3);
+        let bf16_w = weight_f32.to_bf16();
+        let input = Mat::from_fn(1, k, |_, c| c as f32 * 0.05 - 0.1);
+
+        // Reference: naive path using the same BF16-dequantised weights.
+        let w_f32 = bf16_w.to_f32();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&w_f32);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&w_f32.transpose());
+
+        // Fast decode path via matmul_by_t (should be numerically identical).
+        let result = bf16_w.matmul_by_t(&input);
+
+        assert_eq!((result.rows, result.cols), (1, n));
+        for j in 0..n {
+            assert!(
+                (result.at(0, j) - reference.at(0, j)).abs() < 1e-4,
+                "matmul_by_t decode [{j}]: got {:.6} expected {:.6}",
+                result.at(0, j),
+                reference.at(0, j),
+            );
+        }
+    }
+
+    #[test]
+    fn test_bf16_matmul_by_t_prefill_matches_reference() {
+        // Prefill path: M>4.  Output must match the naive to_f32() + sgemm path.
+        // Again use bf16_w.to_f32() as the reference so that BF16 rounding is
+        // shared and only the matmul dispatch is tested.
+        let n = 32;
+        let k = 16;
+        let m = 8; // multiple query rows → triggers the sgemm branch
+        let weight_f32 = Mat::from_fn(n, k, |r, c| ((r + c) as f32) * 0.05 - 0.5);
+        let bf16_w = weight_f32.to_bf16();
+        let input = Mat::from_fn(m, k, |r, c| (r as f32 - 0.5) * (c as f32 * 0.1 + 0.1));
+
+        let w_f32 = bf16_w.to_f32();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&w_f32);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&w_f32.transpose());
+
+        let result = bf16_w.matmul_by_t(&input);
+
+        assert_eq!((result.rows, result.cols), (m, n));
+        for r in 0..m {
+            for c in 0..n {
+                assert!(
+                    (result.at(r, c) - reference.at(r, c)).abs() < 1e-4,
+                    "matmul_by_t prefill [{r},{c}]: got {:.6} expected {:.6}",
+                    result.at(r, c),
+                    reference.at(r, c),
+                );
+            }
+        }
     }
 
     #[test]

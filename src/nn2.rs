@@ -248,19 +248,21 @@ impl Linear2 {
             }
             o
         } else if let Some(ref bf16) = self.bf16_weight {
-            // BF16 path: dequantize on the fly.  The weight matrix is at most a
-            // few MB (BF16 = 2 bytes/element), so the allocation is acceptable.
-            // Using matmul_bt (BLAS transB) avoids an extra transpose allocation.
-            let w = bf16.to_f32();
+            // BF16 path: use matmul_by_t which dispatches on M.
+            //
+            // For decode (M ≤ 4): dequantises one BF16 row at a time into a
+            // K-element scratch buffer and dots it against each input row.
+            // Allocates only K floats — critical for lm_head with vocab ~262K
+            // where naively calling to_f32() would allocate 1–3 GB per token.
+            //
+            // For prefill (M > 4): dequantises all to f32 and calls sgemm,
+            // which amortises the allocation cost across all M query rows.
             assert_eq!(
-                x.cols, w.cols,
+                x.cols, bf16.cols,
                 "Linear (bf16): input cols {} != weight cols {}",
-                x.cols, w.cols
+                x.cols, bf16.cols
             );
-            #[cfg(feature = "blas")]
-            let mut o = x.matmul_bt(&w);
-            #[cfg(not(feature = "blas"))]
-            let mut o = x.matmul(&w.transpose());
+            let mut o = bf16.matmul_by_t(&x);
             for r in 0..o.rows {
                 for c in 0..o.cols {
                     *o.at_mut(r, c) += b.at(0, c);
