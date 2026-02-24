@@ -225,13 +225,8 @@ impl Linear2 {
 
         // Forward matmul priority: Q4 > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
-            // Q4_0 path: avoid materialising the full f32 weight matrix on every
-            // forward call (that would be a ~100 MB alloc per MLP layer per token).
-            //
-            // With BLAS: for small M (decode, M=1) use row-by-row dequant + sdot,
-            //   which needs only K floats of scratch.  For larger M (prefill) the
-            //   full dequant + sgemm path is faster due to cache reuse in sgemm.
-            // Without BLAS: always use the fused row-by-row loop (matmul_q4_t).
+            // Q4_0 path: chunked SGEMM decode or full-dequant sgemm for prefill.
+            // See Q4Mat::matmul_q4_t_blas for the dispatch strategy.
             assert_eq!(
                 x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}",
@@ -248,15 +243,8 @@ impl Linear2 {
             }
             o
         } else if let Some(ref bf16) = self.bf16_weight {
-            // BF16 path: use matmul_by_t which dispatches on M.
-            //
-            // For decode (M ≤ 4): dequantises one BF16 row at a time into a
-            // K-element scratch buffer and dots it against each input row.
-            // Allocates only K floats — critical for lm_head with vocab ~262K
-            // where naively calling to_f32() would allocate 1–3 GB per token.
-            //
-            // For prefill (M > 4): dequantises all to f32 and calls sgemm,
-            // which amortises the allocation cost across all M query rows.
+            // BF16 path: chunked SGEMM decode or full-dequant sgemm for prefill.
+            // See MatBf16::matmul_by_t for the dispatch strategy.
             assert_eq!(
                 x.cols, bf16.cols,
                 "Linear (bf16): input cols {} != weight cols {}",
@@ -288,6 +276,18 @@ impl Linear2 {
 
         let out = TensorNode::leaf(out_data);
 
+        // Q4 and BF16 weights are inference-only: they cannot carry gradients
+        // because (a) the f32 weight tensor is freed and (b) quantised weights
+        // are not differentiable through the quantisation step.  Skipping the
+        // backward-closure allocation for these paths eliminates one Box<dyn Fn>
+        // heap allocation plus four Arc increments per linear-layer call — a
+        // meaningful reduction in allocator pressure during token generation
+        // (the inference hot-path calls ~180+ linear layers per decode step).
+        if self.q4_weight.is_some() || self.bf16_weight.is_some() {
+            return out;
+        }
+
+        // f32 weight path: set up the backward graph for training.
         let input_c = input.clone();
         let weight_c = self.weight.clone();
         let bias_c = self.bias.clone();

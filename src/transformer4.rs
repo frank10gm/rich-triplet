@@ -1810,21 +1810,50 @@ impl Gemma3Model {
         let decode_start = std::time::Instant::now();
         let mut prev = first;
         let mut n_decoded = 1usize;
-        for _step in 1..max_new {
+
+        // Timing accumulators for first-step profiling (printed after step 1).
+        let mut t_embed_us = 0u128;
+        let mut t_layers_us = 0u128;
+        let mut t_lmhead_us = 0u128;
+        let mut profile_printed = false;
+
+        for step in 1..max_new {
+            let t0 = std::time::Instant::now();
             let x_data = Mat {
                 data: embed_row(prev),
                 rows: 1,
                 cols: h,
             };
             let mut x = TensorNode::leaf(x_data);
+            t_embed_us += t0.elapsed().as_micros();
+
+            let t1 = std::time::Instant::now();
             for (i, layer) in self.layers.iter().enumerate() {
                 x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
             }
+            t_layers_us += t1.elapsed().as_micros();
+
+            let t2 = std::time::Instant::now();
             let logits_node = self.lm_head.forward(&self.norm.forward_gemma3(&x));
+            t_lmhead_us += t2.elapsed().as_micros();
+
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
             callback(prev);
             seen.push(prev);
             n_decoded += 1;
+
+            // After the first decode step, print a breakdown so the user can
+            // see where time is actually being spent.
+            if step == 1 && !profile_printed {
+                profile_printed = true;
+                eprintln!(
+                    "[ Gemma3 ] Step-1 breakdown: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
+                    t_embed_us as f64 / 1000.0,
+                    t_layers_us as f64 / 1000.0,
+                    t_lmhead_us as f64 / 1000.0,
+                );
+            }
+
             if is_eos(prev) {
                 break;
             }
@@ -1838,6 +1867,15 @@ impl Gemma3Model {
             decode_secs * 1000.0,
             decode_tps
         );
+        // Print averaged breakdown if we ran more than one decode step.
+        if n_decoded > 1 {
+            eprintln!(
+                "[ Gemma3 ] Avg/step: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
+                t_embed_us as f64 / (n_decoded as f64 * 1000.0),
+                t_layers_us as f64 / (n_decoded as f64 * 1000.0),
+                t_lmhead_us as f64 / (n_decoded as f64 * 1000.0),
+            );
+        }
     }
 }
 

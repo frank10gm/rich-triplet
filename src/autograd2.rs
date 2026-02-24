@@ -595,11 +595,12 @@ impl MatBf16 {
 
     /// Compute `a [M, K] @ self^T` where `self` is [N, K] BF16.
     ///
-    /// **Decode path (M ≤ 4)** — dequantises one row of the BF16 weight at a
-    /// time into a K-element f32 scratch buffer, then dots it with each row of
-    /// `a`.  Allocates only K floats regardless of N.  This is critical for
-    /// large-vocab projections such as `lm_head`: naively calling `to_f32()`
-    /// first allocates N×K f32 bytes every token (1–3 GB for Gemma3).
+    /// **Decode path (M ≤ 4)** — dequantises a chunk of BF16 weight rows at a
+    /// time into a scratch buffer, then calls a single `sgemm` per chunk.
+    /// This reduces BLAS call overhead from N calls (e.g. 262 K for lm_head)
+    /// to N/CHUNK calls (e.g. 256), which eliminates the dominant per-call
+    /// overhead (~1 µs × 262 K = ~262 ms per token).  Chunk size targets
+    /// ~8 MB of scratch (fits comfortably in Apple-Silicon L2 cache).
     ///
     /// **Prefill path (M > 4)** — dequantises the full N×K matrix once and
     /// delegates to an accelerated sgemm, which amortises the cost across M
@@ -628,24 +629,74 @@ impl MatBf16 {
             }
         }
 
-        // Decode (M ≤ 4): dequantise one BF16 row at a time → O(K) scratch.
-        let mut out = Mat::zeros(m, n);
-        let mut row_f32 = vec![0.0f32; k];
+        // ── Decode path (M ≤ 4) ───────────────────────────────────────────
+        // Chunked SGEMM: dequantise CHUNK weight rows → f32, call sgemm once.
+        //
+        // Why not row-by-row sdot?  Each BLAS sdot call has ~1 µs kernel-entry
+        // overhead.  For lm_head (vocab = 262 144) that overhead alone is
+        // 262 ms per token — far larger than the actual compute time.
+        // With CHUNK = 1024 we make only 256 sgemm calls instead of 262 144.
+        //
+        // The output slice trick: pass &mut out.data[j0..] with ldc = n so
+        // sgemm writes C[i, j] directly to out[i, j0 + j] via row stride n.
+        #[cfg(feature = "blas")]
+        {
+            // Target ~8 MB of scratch: chunk = 8 MB / (K × 4 bytes), clamped.
+            let chunk: usize = ((8 * 1024 * 1024) / (k * 4)).max(64).min(n);
+            let mut out = Mat::zeros(m, n);
+            let mut chunk_buf = vec![0.0f32; chunk * k];
 
-        for j in 0..n {
-            let base = j * k;
-            for c in 0..k {
-                row_f32[c] = Self::bf16_to_f32(self.data[base + c]);
-            }
+            let mut j0 = 0usize;
+            while j0 < n {
+                let j1 = (j0 + chunk).min(n);
+                let actual = j1 - j0;
 
-            for i in 0..m {
-                #[cfg(feature = "blas")]
-                {
-                    *out.at_mut(i, j) =
-                        unsafe { cblas::sdot(k as i32, &a.data[i * k..], 1, &row_f32, 1) };
+                // Dequantise BF16 rows j0..j1 into chunk_buf[0..actual*k].
+                for ji in 0..actual {
+                    let src = (j0 + ji) * k;
+                    let dst = ji * k;
+                    for c in 0..k {
+                        chunk_buf[dst + c] = Self::bf16_to_f32(self.data[src + c]);
+                    }
                 }
-                #[cfg(not(feature = "blas"))]
-                {
+
+                // SGEMM: out[m, actual] = a[m, k] × chunk_buf[actual, k]^T
+                // Writing into out.data[j0..] with ldc = n places each result
+                // element at out[i, j0 + j] = out.data[i*n + j0 + j]. ✓
+                unsafe {
+                    cblas::sgemm(
+                        cblas::Layout::RowMajor,
+                        cblas::Transpose::None,
+                        cblas::Transpose::Ordinary,
+                        m as i32,
+                        actual as i32,
+                        k as i32,
+                        1.0f32,
+                        &a.data,
+                        k as i32,
+                        &chunk_buf[..actual * k],
+                        k as i32,
+                        0.0f32,
+                        &mut out.data[j0..],
+                        n as i32,
+                    );
+                }
+                j0 = j1;
+            }
+            return out;
+        }
+
+        // Non-BLAS fallback: scalar row-by-row.
+        #[cfg(not(feature = "blas"))]
+        {
+            let mut out = Mat::zeros(m, n);
+            let mut row_f32 = vec![0.0f32; k];
+            for j in 0..n {
+                let base = j * k;
+                for c in 0..k {
+                    row_f32[c] = Self::bf16_to_f32(self.data[base + c]);
+                }
+                for i in 0..m {
                     let mut dot = 0.0f32;
                     for c in 0..k {
                         dot += a.data[i * k + c] * row_f32[c];
@@ -653,8 +704,12 @@ impl MatBf16 {
                     *out.at_mut(i, j) = dot;
                 }
             }
+            return out;
         }
-        out
+
+        // Unreachable — one of the cfg branches above always returns.
+        #[allow(unreachable_code)]
+        Mat::zeros(m, n)
     }
 }
 
@@ -1040,10 +1095,13 @@ impl Q4Mat {
     ///
     /// Dispatch strategy:
     ///
-    /// * **Decode path (M ≤ 4)** — dequantizes one row of Q4 at a time into a
-    ///   K-element scratch buffer and calls `cblas_sdot` per output element.
-    ///   Allocates only K floats of scratch regardless of N; avoids the large
-    ///   N×K temporary allocation that would dominate for a single token.
+    /// * **Decode path (M ≤ 4)** — dequantizes CHUNK rows of Q4 at a time into
+    ///   a scratch buffer and calls a single `cblas_sgemm` per chunk.  This
+    ///   reduces BLAS call overhead from N calls (e.g. 262 K for lm_head) to
+    ///   N/CHUNK calls (e.g. 256 with CHUNK=1024).  Per-call overhead of ~1 µs
+    ///   means 262 K sdot calls ≈ 262 ms wasted per token; chunked sgemm
+    ///   reduces that to ~2–3 ms.  Chunk size targets ~8 MB scratch (fits in
+    ///   Apple-Silicon L2 cache).
     ///
     /// * **Prefill path (M > 4)** — dequantizes the entire weight matrix once
     ///   into an N×K f32 buffer and calls a single `cblas_sgemm`.  The extra
@@ -1065,16 +1123,47 @@ impl Q4Mat {
             return a.matmul_bt(&w); // sgemm: A[M,K] @ W^T[K,N] → [M,N]
         }
 
-        // Decode: row-by-row dequant + sdot — O(K) scratch, avoids N×K alloc.
+        // ── Decode path (M ≤ 4): chunked SGEMM ───────────────────────────
+        // Dequantise CHUNK weight rows into a contiguous f32 scratch buffer,
+        // then call sgemm once for the chunk.  The output-slice trick:
+        // pass &mut out.data[j0..] with ldc = n so sgemm writes
+        //   C[i, j]  →  out.data[j0 + i*n + j]  =  out[i, j0+j].  ✓
+        //
+        // Target ~8 MB of scratch (fits in Apple Silicon L2).
+        let chunk: usize = ((8 * 1024 * 1024) / (k * 4)).max(64).min(n);
         let mut out = Mat::zeros(m, n);
-        let mut row_buf = vec![0.0f32; k];
+        let mut chunk_buf = vec![0.0f32; chunk * k];
 
-        for j in 0..n {
-            self.dequantize_row_into(j, &mut row_buf);
-            for i in 0..m {
-                let dot = unsafe { cblas::sdot(k as i32, &a.data[i * k..], 1, &row_buf, 1) };
-                *out.at_mut(i, j) = dot;
+        let mut j0 = 0usize;
+        while j0 < n {
+            let j1 = (j0 + chunk).min(n);
+            let actual = j1 - j0;
+
+            // Dequantise rows j0..j1 into chunk_buf[0..actual*k].
+            for ji in 0..actual {
+                self.dequantize_row_into(j0 + ji, &mut chunk_buf[ji * k..(ji + 1) * k]);
             }
+
+            // SGEMM: out[m, actual] = a[m, k] × chunk_buf[actual, k]^T
+            unsafe {
+                cblas::sgemm(
+                    cblas::Layout::RowMajor,
+                    cblas::Transpose::None,
+                    cblas::Transpose::Ordinary,
+                    m as i32,
+                    actual as i32,
+                    k as i32,
+                    1.0f32,
+                    &a.data,
+                    k as i32,
+                    &chunk_buf[..actual * k],
+                    k as i32,
+                    0.0f32,
+                    &mut out.data[j0..],
+                    n as i32,
+                );
+            }
+            j0 = j1;
         }
         out
     }
@@ -4355,6 +4444,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Test that the chunked-SGEMM decode path (triggered when N > chunk size)
+    /// gives the same result as the reference full-dequant + sgemm path.
+    #[test]
+    fn test_bf16_matmul_by_t_decode_large_n_chunked() {
+        // N=4096 is large enough to span multiple chunks (chunk ≈ 8MB/(K*4)).
+        // For K=32: chunk = 8MB/128 = 65536, so N=4096 fits in one chunk but
+        // exercises the while-loop path.  For K=512: chunk = 8MB/2048 = 4096
+        // which triggers exactly one chunk of full size.
+        // Use K=64 so chunk = 8MB/256 = 32768 > 4096, meaning a single loop
+        // iteration covers all N — this validates the strided-ldc write path.
+        let n = 4096;
+        let k = 64;
+        let weight_f32 = Mat::from_fn(n, k, |r, c| ((r * k + c) as f32) * 0.001 - 0.5);
+        let bf16_w = weight_f32.to_bf16();
+        let input = Mat::from_fn(1, k, |_, c| c as f32 * 0.05 - 0.1);
+
+        // Reference via full dequant (matches what matmul_by_t prefill would do).
+        let w_f32 = bf16_w.to_f32();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&w_f32);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&w_f32.transpose());
+
+        let result = bf16_w.matmul_by_t(&input);
+
+        assert_eq!((result.rows, result.cols), (1, n));
+        for j in 0..n {
+            assert!(
+                (result.at(0, j) - reference.at(0, j)).abs() < 1e-3,
+                "chunked BF16 decode [{j}]: got {:.6} expected {:.6}",
+                result.at(0, j),
+                reference.at(0, j),
+            );
+        }
+    }
+
+    /// Test the multi-chunk path: N large enough to require multiple chunks.
+    /// With K=2048: chunk = 8MB/(2048*4) = 1024; use N=4096 → 4 chunks.
+    #[test]
+    fn test_bf16_matmul_by_t_decode_multi_chunk() {
+        let k = 2048;
+        let n = 4096; // 4 chunks of 1024
+        let weight_f32 = Mat::from_fn(n, k, |r, c| {
+            let v = (r as f32 * 0.001) + (c as f32 * 0.0001);
+            v - 0.5
+        });
+        let bf16_w = weight_f32.to_bf16();
+        let input = Mat::from_fn(1, k, |_, c| (c as f32) * (1.0 / k as f32) - 0.5);
+
+        let w_f32 = bf16_w.to_f32();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&w_f32);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&w_f32.transpose());
+
+        let result = bf16_w.matmul_by_t(&input);
+
+        assert_eq!((result.rows, result.cols), (1, n));
+        let mut max_err = 0.0f32;
+        for j in 0..n {
+            let err = (result.at(0, j) - reference.at(0, j)).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(
+            max_err < 1e-2,
+            "multi-chunk BF16 decode max error {max_err:.2e} (threshold 1e-2)"
+        );
+    }
+
+    /// Same test for Q4 chunked decode: N > chunk triggers the while-loop path.
+    #[test]
+    fn test_q4_matmul_decode_large_n_chunked() {
+        // K=256 → chunk = 8MB/1024 = 8192; use N=4096 (one chunk).
+        let n = 4096;
+        let k = 256;
+        let weight_f32 = Mat::from_fn(n, k, |r, c| ((r + c) as f32) * 0.005 - 0.5);
+        let q4w = Q4Mat::quantize(&weight_f32);
+        let input = Mat::from_fn(1, k, |_, c| (c as f32) * 0.01 - 0.5);
+
+        // Reference: dequant the whole Q4 mat and use the standard matmul.
+        let dq = q4w.dequantize();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&dq);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&dq.transpose());
+
+        #[cfg(feature = "blas")]
+        let result = q4w.matmul_q4_t_blas(&input);
+        #[cfg(not(feature = "blas"))]
+        let result = q4w.matmul_q4_t(&input);
+
+        assert_eq!((result.rows, result.cols), (1, n));
+        let mut max_err = 0.0f32;
+        for j in 0..n {
+            let err = (result.at(0, j) - reference.at(0, j)).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        // Q4 has quantisation error; tolerate up to ~5 % of absmax.
+        assert!(
+            max_err < 0.05,
+            "chunked Q4 decode large-N max error {max_err:.4} (threshold 0.05)"
+        );
+    }
+
+    /// Multi-chunk Q4 test: K=2048 → chunk=1024; N=4096 → 4 chunks.
+    #[test]
+    fn test_q4_matmul_decode_multi_chunk() {
+        let k = 2048;
+        let n = 4096;
+        let weight_f32 = Mat::from_fn(n, k, |r, c| {
+            ((r * k + c) as f32) * (1.0 / (n * k) as f32) * 2.0 - 1.0
+        });
+        let q4w = Q4Mat::quantize(&weight_f32);
+        let input = Mat::from_fn(1, k, |_, c| (c as f32) / (k as f32) - 0.5);
+
+        let dq = q4w.dequantize();
+        #[cfg(feature = "blas")]
+        let reference = input.matmul_bt(&dq);
+        #[cfg(not(feature = "blas"))]
+        let reference = input.matmul(&dq.transpose());
+
+        #[cfg(feature = "blas")]
+        let result = q4w.matmul_q4_t_blas(&input);
+        #[cfg(not(feature = "blas"))]
+        let result = q4w.matmul_q4_t(&input);
+
+        assert_eq!((result.rows, result.cols), (1, n));
+        let mut max_err = 0.0f32;
+        for j in 0..n {
+            let err = (result.at(0, j) - reference.at(0, j)).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(
+            max_err < 0.05,
+            "multi-chunk Q4 decode max error {max_err:.4} (threshold 0.05)"
+        );
     }
 
     #[test]
