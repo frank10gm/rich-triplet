@@ -22,8 +22,7 @@
 /// Each parameter is a `TensorNode::leaf` — no backward function, just
 /// raw data and a gradient accumulator. The optimizer reads `.grad()` and
 /// writes `.set_data()` directly on these leaf nodes.
-
-use crate::autograd2::{TensorNode, Mat, MatBf16, Q4Mat};
+use crate::autograd2::{Mat, MatBf16, Q4Mat, TensorNode};
 use crate::nn::InitRng; // reuse the RNG from Phase 2
 
 // =============================================================================
@@ -122,12 +121,15 @@ pub struct Linear2 {
 
 impl Linear2 {
     pub fn new(in_features: usize, out_features: usize, rng: &mut InitRng) -> Self {
-        let w_data = Mat::new(rng.normal_vec(out_features * in_features, 0.02),
-                              out_features, in_features);
+        let w_data = Mat::new(
+            rng.normal_vec(out_features * in_features, 0.02),
+            out_features,
+            in_features,
+        );
         let b_data = Mat::zeros(1, out_features);
         Linear2 {
             weight: TensorNode::leaf(w_data),
-            bias:   TensorNode::leaf(b_data),
+            bias: TensorNode::leaf(b_data),
             in_features,
             out_features,
             q4_weight: None,
@@ -139,12 +141,15 @@ impl Linear2 {
     ///
     /// Used by architectures like Gemma 3 that have no bias in projection layers.
     pub fn new_no_bias(in_features: usize, out_features: usize, rng: &mut InitRng) -> Self {
-        let w_data = Mat::new(rng.normal_vec(out_features * in_features, 0.02),
-                              out_features, in_features);
+        let w_data = Mat::new(
+            rng.normal_vec(out_features * in_features, 0.02),
+            out_features,
+            in_features,
+        );
         let b_data = Mat::zeros(1, out_features);
         Linear2 {
             weight: TensorNode::leaf(w_data),
-            bias:   TensorNode::leaf(b_data),
+            bias: TensorNode::leaf(b_data),
             in_features,
             out_features,
             q4_weight: None,
@@ -201,7 +206,11 @@ impl Linear2 {
     /// Clears the f32 TensorNode weight so it doesn't consume memory.
     /// Do NOT call this if you need backward passes.
     pub fn load_bf16(&mut self, bits: Vec<u16>, rows: usize, cols: usize) {
-        self.bf16_weight = Some(MatBf16 { data: bits, rows, cols });
+        self.bf16_weight = Some(MatBf16 {
+            data: bits,
+            rows,
+            cols,
+        });
         self.weight.set_data(Mat::zeros(0, 0));
     }
 
@@ -216,51 +225,77 @@ impl Linear2 {
 
         // Forward matmul priority: Q4 > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
-            // Q4_0: dequantize to f32 then BLAS matmul.
-            // This is the path used when weights are loaded from GGUF Q4_0 files.
-            let w = q4.dequantize();
-            assert_eq!(x.cols, w.cols,
-                "Linear (q4): input cols {} != weight cols {}", x.cols, w.cols);
+            // Q4_0 path: avoid materialising the full f32 weight matrix on every
+            // forward call (that would be a ~100 MB alloc per MLP layer per token).
+            //
+            // With BLAS: for small M (decode, M=1) use row-by-row dequant + sdot,
+            //   which needs only K floats of scratch.  For larger M (prefill) the
+            //   full dequant + sgemm path is faster due to cache reuse in sgemm.
+            // Without BLAS: always use the fused row-by-row loop (matmul_q4_t).
+            assert_eq!(
+                x.cols, q4.cols,
+                "Linear (q4): input cols {} != weight cols {}",
+                x.cols, q4.cols
+            );
             #[cfg(feature = "blas")]
-            let mut o = x.matmul_bt(&w);
+            let mut o = q4.matmul_q4_t_blas(&x);
             #[cfg(not(feature = "blas"))]
-            let mut o = x.matmul(&w.transpose());
-            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
+            let mut o = q4.matmul_q4_t(&x);
+            for r in 0..o.rows {
+                for c in 0..o.cols {
+                    *o.at_mut(r, c) += b.at(0, c);
+                }
+            }
             o
         } else if let Some(ref bf16) = self.bf16_weight {
-            // Dequantize BF16 → f32 on the fly (one bit-shift per element).
+            // BF16 path: dequantize on the fly.  The weight matrix is at most a
+            // few MB (BF16 = 2 bytes/element), so the allocation is acceptable.
+            // Using matmul_bt (BLAS transB) avoids an extra transpose allocation.
             let w = bf16.to_f32();
-            assert_eq!(x.cols, w.cols,
-                "Linear (bf16): input cols {} != weight cols {}", x.cols, w.cols);
-            // Use BLAS transB to avoid allocating the [in, out] transpose matrix.
+            assert_eq!(
+                x.cols, w.cols,
+                "Linear (bf16): input cols {} != weight cols {}",
+                x.cols, w.cols
+            );
             #[cfg(feature = "blas")]
             let mut o = x.matmul_bt(&w);
             #[cfg(not(feature = "blas"))]
             let mut o = x.matmul(&w.transpose());
-            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
+            for r in 0..o.rows {
+                for c in 0..o.cols {
+                    *o.at_mut(r, c) += b.at(0, c);
+                }
+            }
             o
         } else {
             let w = self.weight.data().clone();
-            assert_eq!(x.cols, w.cols,
-                "Linear: input cols {} != weight cols {}", x.cols, w.cols);
+            assert_eq!(
+                x.cols, w.cols,
+                "Linear: input cols {} != weight cols {}",
+                x.cols, w.cols
+            );
             let wt = w.transpose();
             let mut o = x.matmul(&wt);
-            for r in 0..o.rows { for c in 0..o.cols { *o.at_mut(r, c) += b.at(0, c); } }
+            for r in 0..o.rows {
+                for c in 0..o.cols {
+                    *o.at_mut(r, c) += b.at(0, c);
+                }
+            }
             o
         };
 
         let out = TensorNode::leaf(out_data);
 
-        let input_c  = input.clone();
+        let input_c = input.clone();
         let weight_c = self.weight.clone();
-        let bias_c   = self.bias.clone();
-        let out_c    = out.clone();
+        let bias_c = self.bias.clone();
+        let out_c = out.clone();
 
         out.set_backward(
             Box::new(move || {
-                let dout = out_c.grad().clone();    // [T, out] — clone drops the Ref
-                let x    = input_c.data().clone();  // [T, in]
-                let w    = weight_c.data().clone();  // [out, in]
+                let dout = out_c.grad().clone(); // [T, out] — clone drops the Ref
+                let x = input_c.data().clone(); // [T, in]
+                let w = weight_c.data().clone(); // [out, in]
 
                 // dInput = dOut @ W         : [T, in]
                 let dinput = dout.matmul(&w);
@@ -294,16 +329,16 @@ impl Module2 for Linear2 {
 // =============================================================================
 
 pub struct LayerNorm2 {
-    pub gamma: TensorNode,   // [1, d_model]
-    pub beta:  TensorNode,   // [1, d_model]
+    pub gamma: TensorNode, // [1, d_model]
+    pub beta: TensorNode,  // [1, d_model]
     pub d_model: usize,
 }
 
 impl LayerNorm2 {
     pub fn new(d_model: usize) -> Self {
         LayerNorm2 {
-            gamma:   TensorNode::leaf(Mat::ones(1, d_model)),
-            beta:    TensorNode::leaf(Mat::zeros(1, d_model)),
+            gamma: TensorNode::leaf(Mat::ones(1, d_model)),
+            beta: TensorNode::leaf(Mat::zeros(1, d_model)),
             d_model,
         }
     }
@@ -368,7 +403,7 @@ impl Module2 for Mlp2 {
 // Empirically just as effective, slightly faster.
 
 pub struct RmsNorm2 {
-    pub gamma: TensorNode,  // [1, d_model]  — initialized to ones
+    pub gamma: TensorNode, // [1, d_model]  — initialized to ones
     pub d_model: usize,
     pub eps: f32,
 }
@@ -428,9 +463,9 @@ impl Module2 for RmsNorm2 {
 // only for attention, not for FFN).
 
 pub struct SwiGluMlp2 {
-    pub gate_proj: Linear2,   // d_model → intermediate_size
-    pub up_proj:   Linear2,   // d_model → intermediate_size
-    pub down_proj: Linear2,   // intermediate_size → d_model
+    pub gate_proj: Linear2, // d_model → intermediate_size
+    pub up_proj: Linear2,   // d_model → intermediate_size
+    pub down_proj: Linear2, // intermediate_size → d_model
     /// Clamp the gate pre-activation to [-clamp, clamp] before SiLU.
     /// GPT-OSS uses 7.0; set to f32::INFINITY to disable (default).
     pub swiglu_clamp: f32,
@@ -440,13 +475,18 @@ impl SwiGluMlp2 {
     pub fn new(d_model: usize, intermediate_size: usize, rng: &mut InitRng) -> Self {
         SwiGluMlp2 {
             gate_proj: Linear2::new(d_model, intermediate_size, rng),
-            up_proj:   Linear2::new(d_model, intermediate_size, rng),
+            up_proj: Linear2::new(d_model, intermediate_size, rng),
             down_proj: Linear2::new(intermediate_size, d_model, rng),
             swiglu_clamp: f32::INFINITY,
         }
     }
 
-    pub fn new_with_clamp(d_model: usize, intermediate_size: usize, clamp: f32, rng: &mut InitRng) -> Self {
+    pub fn new_with_clamp(
+        d_model: usize,
+        intermediate_size: usize,
+        clamp: f32,
+        rng: &mut InitRng,
+    ) -> Self {
         let mut mlp = Self::new(d_model, intermediate_size, rng);
         mlp.swiglu_clamp = clamp;
         mlp
@@ -461,7 +501,7 @@ impl SwiGluMlp2 {
         } else {
             gate_pre.silu()
         };
-        let up     = self.up_proj.forward(x);
+        let up = self.up_proj.forward(x);
         let hidden = gate.mul_elem_node(&up);
         self.down_proj.forward(&hidden)
     }
@@ -525,7 +565,10 @@ pub struct Dropout2 {
 impl Dropout2 {
     pub fn new(p: f32) -> Self {
         assert!(p >= 0.0 && p < 1.0, "dropout p must be in [0, 1)");
-        Dropout2 { p, seed: std::sync::atomic::AtomicU64::new(12345) }
+        Dropout2 {
+            p,
+            seed: std::sync::atomic::AtomicU64::new(12345),
+        }
     }
 
     /// x: [T, D]  →  output: [T, D]
@@ -561,16 +604,19 @@ impl Dropout2 {
         let out_c = out.clone();
         let mask_c = mask;
 
-        out.set_backward(Box::new(move || {
-            // dx = dout * mask (same mask as forward)
-            let dout = out_c.grad().clone();
-            let mut dx = x_c.grad().clone();
-            for i in 0..dx.data.len() {
-                dx.data[i] += dout.data[i] * mask_c.data[i];
-            }
-            x_c.set_grad(dx);
-            x_c.call_backward_fn();
-        }), vec![x.clone()]);
+        out.set_backward(
+            Box::new(move || {
+                // dx = dout * mask (same mask as forward)
+                let dout = out_c.grad().clone();
+                let mut dx = x_c.grad().clone();
+                for i in 0..dx.data.len() {
+                    dx.data[i] += dout.data[i] * mask_c.data[i];
+                }
+                x_c.set_grad(dx);
+                x_c.call_backward_fn();
+            }),
+            vec![x.clone()],
+        );
 
         out
     }
@@ -578,7 +624,9 @@ impl Dropout2 {
 
 impl Module2 for Dropout2 {
     /// Dropout has no learnable parameters.
-    fn parameters(&self) -> Vec<TensorNode> { vec![] }
+    fn parameters(&self) -> Vec<TensorNode> {
+        vec![]
+    }
 }
 
 // =============================================================================
@@ -590,12 +638,15 @@ mod tests {
     use super::*;
     use crate::nn::InitRng;
 
-    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-3 }
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
 
     // Numerical gradient helper — perturb element [r,c] of `param` and measure loss change
     fn numerical_grad_param<F: Fn() -> f32>(
         param: &TensorNode,
-        r: usize, c: usize,
+        r: usize,
+        c: usize,
         loss_fn: &F,
     ) -> f32 {
         let h = 1e-3f32;
@@ -663,8 +714,12 @@ mod tests {
             out.data().data.iter().sum::<f32>()
         });
 
-        assert!(approx(analytical.at(0, 0), num),
-            "dW[0,0]: analytical={:.4} numerical={:.4}", analytical.at(0,0), num);
+        assert!(
+            approx(analytical.at(0, 0), num),
+            "dW[0,0]: analytical={:.4} numerical={:.4}",
+            analytical.at(0, 0),
+            num
+        );
     }
 
     #[test]
@@ -680,7 +735,7 @@ mod tests {
     #[test]
     fn test_layernorm2_output_mean_zero() {
         let ln = LayerNorm2::new(4);
-        let x = TensorNode::leaf(Mat::new(vec![1.,2.,3.,4.], 1, 4));
+        let x = TensorNode::leaf(Mat::new(vec![1., 2., 3., 4.], 1, 4));
         let out = ln.forward(&x);
         let mean = out.data().data.iter().sum::<f32>() / 4.0;
         assert!(mean.abs() < 1e-5, "LN mean should be 0, got {}", mean);
@@ -689,11 +744,11 @@ mod tests {
     #[test]
     fn test_layernorm2_output_std_one() {
         let ln = LayerNorm2::new(4);
-        let x = TensorNode::leaf(Mat::new(vec![1.,2.,3.,4.], 1, 4));
+        let x = TensorNode::leaf(Mat::new(vec![1., 2., 3., 4.], 1, 4));
         let out = ln.forward(&x);
         let vals: Vec<f32> = out.data().data.clone();
         let mean = vals.iter().sum::<f32>() / 4.0;
-        let std = (vals.iter().map(|&v| (v-mean).powi(2)).sum::<f32>() / 4.0).sqrt();
+        let std = (vals.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / 4.0).sqrt();
         assert!((std - 1.0).abs() < 1e-4, "LN std should be 1, got {}", std);
     }
 
@@ -706,9 +761,15 @@ mod tests {
         let out = drop.forward(&x, false);
         let xd = x.data();
         let od = out.data();
-        for r in 0..4 { for c in 0..8 {
-            assert_eq!(xd.at(r, c), od.at(r, c), "inference dropout must be identity");
-        }}
+        for r in 0..4 {
+            for c in 0..8 {
+                assert_eq!(
+                    xd.at(r, c),
+                    od.at(r, c),
+                    "inference dropout must be identity"
+                );
+            }
+        }
     }
 
     #[test]
@@ -719,8 +780,11 @@ mod tests {
         let zeros = out.data().data.iter().filter(|&&v| v == 0.0).count();
         // With p=0.5 and 128 elements, expect roughly 64 zeros.
         // Accept anything in [20, 108] — very wide to avoid flakiness.
-        assert!(zeros > 20 && zeros < 108,
-            "expected ~50% zeros with p=0.5, got {}/128", zeros);
+        assert!(
+            zeros > 20 && zeros < 108,
+            "expected ~50% zeros with p=0.5, got {}/128",
+            zeros
+        );
     }
 
     #[test]
@@ -728,10 +792,13 @@ mod tests {
         let drop = Dropout2::new(0.0);
         let x = TensorNode::leaf(Mat::from_fn(3, 4, |r, c| (r * 4 + c) as f32 * 0.1));
         let out = drop.forward(&x, true); // even in training, p=0 → identity
-        let xd = x.data(); let od = out.data();
-        for r in 0..3 { for c in 0..4 {
-            assert_eq!(xd.at(r, c), od.at(r, c));
-        }}
+        let xd = x.data();
+        let od = out.data();
+        for r in 0..3 {
+            for c in 0..4 {
+                assert_eq!(xd.at(r, c), od.at(r, c));
+            }
+        }
     }
 
     #[test]
@@ -741,8 +808,11 @@ mod tests {
         let x = TensorNode::leaf(Mat::from_fn(4, 4, |_, _| 1.0));
         let out = drop.forward(&x, true);
         for &v in &out.data().data {
-            assert!(v == 0.0 || (v - 2.0).abs() < 1e-5,
-                "dropout output should be 0 or 2 (scale=1/(1-0.5)), got {}", v);
+            assert!(
+                v == 0.0 || (v - 2.0).abs() < 1e-5,
+                "dropout output should be 0 or 2 (scale=1/(1-0.5)), got {}",
+                v
+            );
         }
     }
 
@@ -754,14 +824,19 @@ mod tests {
         let sum_val: f32 = out.data().data.iter().sum();
         let loss = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
         let out_c = out.clone();
-        loss.set_backward(Box::new(move || {
-            let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
-            out_c.set_grad(ones);
-            out_c.call_backward_fn();
-        }), vec![out]);
+        loss.set_backward(
+            Box::new(move || {
+                let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
+                out_c.set_grad(ones);
+                out_c.call_backward_fn();
+            }),
+            vec![out],
+        );
         loss.backward();
-        assert!(x.grad().data.iter().all(|v| v.is_finite()),
-            "dropout backward should produce finite gradients");
+        assert!(
+            x.grad().data.iter().all(|v| v.is_finite()),
+            "dropout backward should produce finite gradients"
+        );
     }
 
     // --- Mlp2 ---
@@ -780,9 +855,7 @@ mod tests {
         // Check that backward runs and all gradients are finite
         let mut rng = InitRng::new(3);
         let mlp = Mlp2::new(4, &mut rng);
-        let x = TensorNode::leaf(Mat::new(
-            vec![0.5, -0.3, 1.2, -0.8], 1, 4
-        ));
+        let x = TensorNode::leaf(Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4));
 
         let out = mlp.forward(&x);
 
@@ -790,7 +863,10 @@ mod tests {
         let sum_val = out.data().sum();
         let loss = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
         let out_c = out.clone();
-        let (or, oc) = { let d = out.data(); (d.rows, d.cols) };
+        let (or, oc) = {
+            let d = out.data();
+            (d.rows, d.cols)
+        };
         loss.set_backward(
             Box::new(move || {
                 let new_g = out_c.grad().clone().add(&Mat::ones(or, oc));
@@ -802,8 +878,10 @@ mod tests {
 
         for p in mlp.parameters() {
             let g = p.grad();
-            assert!(g.data.iter().all(|x| x.is_finite()),
-                "gradient should be finite");
+            assert!(
+                g.data.iter().all(|x| x.is_finite()),
+                "gradient should be finite"
+            );
         }
     }
 }

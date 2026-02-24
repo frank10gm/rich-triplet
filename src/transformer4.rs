@@ -707,7 +707,6 @@ impl Gemma3Model {
             if name == "output_norm.weight" {
                 let f32s = load_f32(&gguf, idx)?;
                 let n = f32s.len();
-                eprintln!("[ DBG ] output_norm first 8 (raw): {:?}", &f32s[..8.min(n)]);
                 // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but forward_gemma3
                 // applies (1 + gamma).  Subtract 1 so the net result is (1 + w) * x_norm.
                 let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
@@ -736,12 +735,6 @@ impl Gemma3Model {
                         "attn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            if layer_idx == 0 {
-                                eprintln!(
-                                    "[ DBG ] blk.0.attn_norm first 8 (raw): {:?}",
-                                    &f32s[..8.min(n)]
-                                );
-                            }
                             // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but
                             // forward_gemma3 already applies (1 + gamma).  Subtract 1
                             // so the net effect is the correct (1 + w) * x_norm.
@@ -815,17 +808,6 @@ impl Gemma3Model {
                         // ---- projection weights ----
                         "attn_q.weight" => {
                             load_linear_from_gguf(&gguf, idx, &mut layer.self_attn.q_proj)?;
-                            // Debug: print first 8 dequantized values of layer 0's q_proj
-                            if layer_idx == 0 {
-                                if let Some(ref q4) = layer.self_attn.q_proj.q4_weight {
-                                    let deq = q4.dequantize();
-                                    eprint!("[ GGUF debug ] blk.0.attn_q first 8 values: ");
-                                    for i in 0..8 {
-                                        eprint!("{:.4} ", deq.data[i]);
-                                    }
-                                    eprintln!("  shape={}x{}", q4.rows, q4.cols);
-                                }
-                            }
                             loaded += 1;
                         }
                         "attn_k.weight" => {
@@ -875,6 +857,28 @@ impl Gemma3Model {
             eprintln!("[ GGUF ] WARNING: embed_bf16 is None — token embeddings not loaded!");
         }
 
+        // ── Diagnostics: print first few gamma values of layer-0 norms ──────
+        eprintln!("[ GGUF ] Norm gamma diagnostics (layer 0, first 5 values):");
+        {
+            let g = self.layers[0].input_layernorm.gamma.data();
+            let vals: Vec<f32> = (0..5.min(g.cols)).map(|c| g.at(0, c)).collect();
+            eprintln!("  input_layernorm gamma (stored, after -1 fix): {:?}", vals);
+            let effective: Vec<f32> = vals.iter().map(|&v| 1.0 + v).collect();
+            eprintln!(
+                "  input_layernorm effective scale (1+gamma):    {:?}",
+                effective
+            );
+        }
+        {
+            let g = self.layers[0].post_attention_layernorm.gamma.data();
+            let vals: Vec<f32> = (0..5.min(g.cols)).map(|c| g.at(0, c)).collect();
+            eprintln!("  post_attn_layernorm gamma (stored):           {:?}", vals);
+        }
+        {
+            let g = self.layers[0].self_attn.q_norm.gamma.data();
+            let vals: Vec<f32> = (0..5.min(g.cols)).map(|c| g.at(0, c)).collect();
+            eprintln!("  q_norm gamma (stored):                        {:?}", vals);
+        }
         eprintln!("[ GGUF ] Done. Loaded {} tensors.", loaded);
         Ok(())
     }
@@ -1682,6 +1686,8 @@ impl Gemma3Model {
         max_new: usize,
         temperature: f32,
         top_k: usize,
+        top_p: f32,
+        repetition_penalty: f32,
         seed: u64,
         mut callback: impl FnMut(usize),
     ) {
@@ -1690,8 +1696,8 @@ impl Gemma3Model {
         let params = SamplingParams {
             temperature,
             top_k,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
+            top_p,
+            repetition_penalty,
             seed,
             eos_token_id: Some(self.config.eos_token_id),
             frequency_penalty: 0.0,
@@ -1724,10 +1730,7 @@ impl Gemma3Model {
         let t_prompt = token_ids.len();
         let embed_data: Vec<f32> = token_ids.iter().flat_map(|&tok| embed_row(tok)).collect();
         // Diagnostic: print first token embedding (first 8 values)
-        {
-            let e = &embed_data[..8.min(embed_data.len())];
-            eprintln!("[ DBG ] embed[0] first 8 (scaled): {:?}", e);
-        }
+
         let x_data = Mat {
             data: embed_data,
             rows: t_prompt,
@@ -1736,11 +1739,6 @@ impl Gemma3Model {
         let mut x = TensorNode::leaf(x_data);
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
-            if i == 0 {
-                let xd = x.data();
-                let vals: Vec<f32> = (0..8.min(xd.cols)).map(|c| xd.at(xd.rows - 1, c)).collect();
-                eprintln!("[ DBG ] after layer 0, last tok first 8: {:?}", vals);
-            }
         }
         // Only run lm_head on the last token row — avoids a T×vocab matmul.
         let last_row = {
@@ -1750,14 +1748,19 @@ impl Gemma3Model {
         let normed_final = self.norm.forward_gemma3(&TensorNode::leaf(last_row));
         // Diagnostic: top-5 logit indices before sampling
         let logits_node = self.lm_head.forward(&normed_final);
-        {
-            let ld = logits_node.data();
-            let mut pairs: Vec<(f32, usize)> = (0..ld.cols).map(|c| (ld.at(0, c), c)).collect();
-            pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            let top5: Vec<(usize, f32)> = pairs[..5].iter().map(|&(v, i)| (i, v)).collect();
-            eprintln!("[ DBG ] top-5 logits: {:?}", top5);
-        }
+
+        // Debug helper: print top-k logit token IDs and scores
+        let debug_top5 = |logits: &Mat, step: usize| {
+            let v = logits.cols;
+            let mut scores: Vec<(usize, f32)> = (0..v).map(|c| (c, logits.at(0, c))).collect();
+            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<(usize, f32)> = scores.into_iter().take(5).collect();
+            eprintln!("[DBG step {:>2}] top-5 token ids: {:?}", step, top5);
+        };
+
+        debug_top5(&logits_node.data(), 0);
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
+        eprintln!("[DBG step  0] sampled: {} (seen_len={})", first, seen.len());
         callback(first);
         seen.push(first);
         if is_eos(first) {
@@ -1766,7 +1769,7 @@ impl Gemma3Model {
 
         // ----- Decode loop -----
         let mut prev = first;
-        for _ in 1..max_new {
+        for step in 1..max_new {
             let x_data = Mat {
                 data: embed_row(prev),
                 rows: 1,
@@ -1777,7 +1780,18 @@ impl Gemma3Model {
                 x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
             }
             let logits_node = self.lm_head.forward(&self.norm.forward_gemma3(&x));
+            if step <= 6 {
+                debug_top5(&logits_node.data(), step);
+            }
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
+            if step <= 6 {
+                eprintln!(
+                    "[DBG step {:>2}] sampled: {} (seen_len={})",
+                    step,
+                    prev,
+                    seen.len()
+                );
+            }
             callback(prev);
             seen.push(prev);
             if is_eos(prev) {
@@ -2567,7 +2581,7 @@ mod tests {
         let mut rng = InitRng::new(7);
         let model = Gemma3Model::new(cfg, &mut rng);
         let mut generated = Vec::new();
-        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 42, |tok| {
+        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, |tok| {
             generated.push(tok);
         });
         assert!(!generated.is_empty());
@@ -2594,7 +2608,7 @@ mod tests {
 
         // Cached: greedy (temperature=0)
         let mut cached_tok = usize::MAX;
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |tok| {
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, |tok| {
             cached_tok = tok;
         });
 
@@ -2614,7 +2628,7 @@ mod tests {
         let model = Gemma3Model::new(cfg.clone(), &mut rng);
         let prompt: Vec<usize> = (0..20).map(|i| i % cfg.vocab_size).collect();
         let mut toks = Vec::new();
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 0, |t| toks.push(t));
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, |t| toks.push(t));
         assert_eq!(toks.len(), 1);
         assert!(toks[0] < cfg.vocab_size);
     }

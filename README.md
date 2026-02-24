@@ -189,10 +189,54 @@ eprintln!("Compressed to {:.1}GB ({:.1}x)", stats.q4_bytes as f64 / 1e9, stats.c
 | `--max-new N` | 200 | Tokens to generate |
 | `--temp T` | 0.8 | Sampling temperature |
 | `--top-k K` | 40 | Top-K cutoff (0 = disabled) |
-| `--top-p P` | 1.0 | Nucleus probability (1.0 = disabled) |
+| `--top-p P` | 0.95 | Nucleus probability (1.0 = disabled) |
+| `--rep-penalty R` | 1.1 | Repetition penalty (1.0 = disabled) |
 | `--seed S` | 42 | RNG seed |
 | `--train-steps N` | 200 | Training steps (no-weights mode) |
 | `--checkpoint PATH` | — | Load saved `.ckpt` instead of training |
+
+---
+
+## Running Gemma 3 inference (GGUF)
+
+Download a GGUF weight file (e.g. from HuggingFace) and a copy of the tokenizer:
+
+```bash
+# Example with the 4B QAT Q4_0 GGUF
+cargo run --release -- \
+  --prompt "What is the capital of France?" \
+  --weights ./models/gemma-3-4b-it-q4_0.gguf \
+  --tokenizer-dir ./models/gemma-3-4b-it/ \
+  --model gemma3-4b \
+  --max-new 200 \
+  --temp 0.8 \
+  --top-k 40 \
+  --top-p 0.95 \
+  --rep-penalty 1.1
+```
+
+### Performance tips
+
+The project uses **Apple Accelerate (BLAS)** by default, which gives 4–8× faster matrix
+multiplications vs the pure-Rust fallback:
+
+```bash
+# Default build already includes BLAS on macOS:
+cargo build --release
+
+# To disable BLAS (e.g. for a non-Apple platform):
+cargo build --release --no-default-features
+```
+
+On Apple Silicon, the `.cargo/config.toml` already sets `-C target-cpu=native` so NEON/AMX
+instructions are used automatically.
+
+### GGUF RMSNorm convention
+
+GGUF-converted Gemma 3 weights store RMSNorm scale factors as `(1 + w)` (i.e. the final
+effective multiplier), while the `forward_gemma3` implementation applies `(1 + γ) × x̂`.
+The GGUF loader therefore subtracts 1 from every loaded norm weight so the math works out
+to the correct `(1 + w) × x̂`. The safetensors loader is unaffected.
 
 ---
 

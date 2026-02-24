@@ -1,30 +1,30 @@
-mod tensor;
-mod tokenizer;
-mod dataset;
-mod ndarray;
 mod autograd;
-mod nn;
-mod transformer;
-mod train;
 mod autograd2;
-mod nn2;
-mod transformer2;
-mod train2;
-mod transformer3;
-mod transformer4;
+mod dataset;
 mod gguf_loader;
 #[cfg(feature = "metal")]
 mod metal_ops;
+mod ndarray;
+mod nn;
+mod nn2;
+mod tensor;
+mod tokenizer;
+mod train;
+mod train2;
+mod transformer;
+mod transformer2;
+mod transformer3;
+mod transformer4;
 
-use tokenizer::{CharTokenizer, BpeTokenizer, Tokenizer};
-use dataset::TextDataset;
-use transformer::{Config, Gpt};
-use train::{TrainConfig, train, generate};
-use transformer2::Gpt2;
-use train2::{TrainConfig2, train2};
 use autograd2::restore_checkpoint;
-use transformer3::{GptOssModel, Config3, SamplingParams};
+use dataset::TextDataset;
 use nn::InitRng;
+use tokenizer::{BpeTokenizer, CharTokenizer, Tokenizer};
+use train::{TrainConfig, generate, train};
+use train2::{TrainConfig2, train2};
+use transformer::{Config, Gpt};
+use transformer2::Gpt2;
+use transformer3::{Config3, GptOssModel, SamplingParams};
 
 // =============================================================================
 // Bilingual training corpus — Italian and English
@@ -85,29 +85,31 @@ today yesterday tomorrow now always never often rarely
 
 struct CliArgs {
     /// --prompt TEXT     : text to complete (triggers generation mode)
-    prompt:      Option<String>,
+    prompt: Option<String>,
     /// --weights DIR     : directory with .safetensors shards (GPT-OSS or Gemma 3)
-    weights:     Option<String>,
+    weights: Option<String>,
     /// --vocab PATH      : BPE vocab.json (required with --weights for GPT-OSS)
-    vocab:       Option<String>,
+    vocab: Option<String>,
     /// --merges PATH     : BPE merges.txt (required with --weights for GPT-OSS)
-    merges:      Option<String>,
+    merges: Option<String>,
     /// --tokenizer-model PATH : SentencePiece .model file (required with --weights for Gemma 3)
     tokenizer_model: Option<String>,
     /// --tokenizer-dir DIR   : directory containing tokenizer.json (for GGUF, where tokenizer is separate)
     tokenizer_dir: Option<String>,
     /// --model NAME      : which architecture to use (gpt-oss | gemma3-1b | gemma3-4b)
-    model:       Option<String>,
+    model: Option<String>,
     /// --max-new N       : tokens to generate (default 200)
-    max_new:     usize,
+    max_new: usize,
     /// --temp T          : sampling temperature (default 0.8)
     temperature: f32,
     /// --top-k K         : top-k cutoff (default 40, 0 = disabled)
-    top_k:       usize,
-    /// --top-p P         : nucleus probability (default 1.0 = disabled)
-    top_p:       f32,
+    top_k: usize,
+    /// --top-p P         : nucleus probability (default 0.95)
+    top_p: f32,
+    /// --rep-penalty R   : repetition penalty (default 1.1, 1.0 = disabled)
+    rep_penalty: f32,
     /// --seed S          : RNG seed (default 42)
-    seed:        u64,
+    seed: u64,
     /// --train-steps N   : steps for on-the-fly training (default 200)
     train_steps: usize,
     /// --checkpoint PATH : load a previously saved .ckpt before generating (skips training)
@@ -122,37 +124,144 @@ impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut a = CliArgs {
-            prompt: None, weights: None, vocab: None, merges: None,
-            tokenizer_model: None, tokenizer_dir: None, model: None,
-            max_new: 200, temperature: 0.8, top_k: 40, top_p: 1.0,
-            seed: 42, train_steps: 200, checkpoint: None,
-            pretokenize: None, benchmark: false,
+            prompt: None,
+            weights: None,
+            vocab: None,
+            merges: None,
+            tokenizer_model: None,
+            tokenizer_dir: None,
+            model: None,
+            max_new: 200,
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            rep_penalty: 1.1,
+            seed: 42,
+            train_steps: 200,
+            checkpoint: None,
+            pretokenize: None,
+            benchmark: false,
         };
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
-                "--prompt"      => { i += 1; if i < args.len() { a.prompt      = Some(args[i].clone()); } }
-                "--weights"     => { i += 1; if i < args.len() { a.weights     = Some(args[i].clone()); } }
-                "--vocab"       => { i += 1; if i < args.len() { a.vocab       = Some(args[i].clone()); } }
-                "--merges"           => { i += 1; if i < args.len() { a.merges           = Some(args[i].clone()); } }
-                "--tokenizer-model"  => { i += 1; if i < args.len() { a.tokenizer_model  = Some(args[i].clone()); } }
-                "--tokenizer-dir"    => { i += 1; if i < args.len() { a.tokenizer_dir    = Some(args[i].clone()); } }
-                "--model"            => { i += 1; if i < args.len() { a.model            = Some(args[i].clone()); } }
-                "--max-new"     => { i += 1; if i < args.len() { a.max_new     = args[i].parse().unwrap_or(200); } }
-                "--temp"        => { i += 1; if i < args.len() { a.temperature = args[i].parse().unwrap_or(0.8); } }
-                "--top-k"       => { i += 1; if i < args.len() { a.top_k       = args[i].parse().unwrap_or(40); } }
-                "--top-p"       => { i += 1; if i < args.len() { a.top_p       = args[i].parse().unwrap_or(1.0); } }
-                "--seed"        => { i += 1; if i < args.len() { a.seed        = args[i].parse().unwrap_or(42); } }
-                "--train-steps"  => { i += 1; if i < args.len() { a.train_steps = args[i].parse().unwrap_or(200); } }
-                "--checkpoint"   => { i += 1; if i < args.len() { a.checkpoint  = Some(args[i].clone()); } }
-                "--pretokenize"  => {
-                    i += 1; let src = if i < args.len() { args[i].clone() } else { String::new() };
-                    i += 1; let dst = if i < args.len() { args[i].clone() } else { String::new() };
+                "--prompt" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.prompt = Some(args[i].clone());
+                    }
+                }
+                "--weights" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.weights = Some(args[i].clone());
+                    }
+                }
+                "--vocab" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.vocab = Some(args[i].clone());
+                    }
+                }
+                "--merges" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.merges = Some(args[i].clone());
+                    }
+                }
+                "--tokenizer-model" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.tokenizer_model = Some(args[i].clone());
+                    }
+                }
+                "--tokenizer-dir" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.tokenizer_dir = Some(args[i].clone());
+                    }
+                }
+                "--model" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.model = Some(args[i].clone());
+                    }
+                }
+                "--max-new" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.max_new = args[i].parse().unwrap_or(200);
+                    }
+                }
+                "--temp" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.temperature = args[i].parse().unwrap_or(0.8);
+                    }
+                }
+                "--top-k" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.top_k = args[i].parse().unwrap_or(40);
+                    }
+                }
+                "--top-p" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.top_p = args[i].parse().unwrap_or(0.95);
+                    }
+                }
+                "--rep-penalty" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.rep_penalty = args[i].parse().unwrap_or(1.1);
+                    }
+                }
+                "--seed" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.seed = args[i].parse().unwrap_or(42);
+                    }
+                }
+                "--train-steps" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.train_steps = args[i].parse().unwrap_or(200);
+                    }
+                }
+                "--checkpoint" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.checkpoint = Some(args[i].clone());
+                    }
+                }
+                "--pretokenize" => {
+                    i += 1;
+                    let src = if i < args.len() {
+                        args[i].clone()
+                    } else {
+                        String::new()
+                    };
+                    i += 1;
+                    let dst = if i < args.len() {
+                        args[i].clone()
+                    } else {
+                        String::new()
+                    };
                     a.pretokenize = Some((src, dst));
                 }
-                "--benchmark"    => { a.benchmark = true; }
-                "--help" | "-h"  => { print_help(); std::process::exit(0); }
-                other => { eprintln!("Unknown argument: {other}"); print_help(); std::process::exit(1); }
+                "--benchmark" => {
+                    a.benchmark = true;
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    eprintln!("Unknown argument: {other}");
+                    print_help();
+                    std::process::exit(1);
+                }
             }
             i += 1;
         }
@@ -182,12 +291,15 @@ fn print_help() {
     println!("  --vocab PATH             BPE vocab.json      (GPT-OSS)");
     println!("  --merges PATH            BPE merges.txt      (GPT-OSS)");
     println!("  --tokenizer-model PATH   SentencePiece .model (Gemma 3)");
-    println!("  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is separate)");
+    println!(
+        "  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is separate)"
+    );
     println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b");
     println!("  --max-new N              Tokens to generate          [default: 200]");
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
     println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
-    println!("  --top-p P                Nucleus probability         [default: 1.0]");
+    println!("  --top-p P                Nucleus probability         [default: 0.95]");
+    println!("  --rep-penalty R          Repetition penalty          [default: 1.1]");
     println!("  --seed S                 RNG seed                    [default: 42]");
     println!("  --train-steps N          Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");
@@ -205,14 +317,18 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
     use std::io::Write;
 
     let weights_dir = args.weights.as_deref().unwrap();
-    let vocab_path  = args.vocab.as_deref()
+    let vocab_path = args
+        .vocab
+        .as_deref()
         .expect("--vocab required with --weights (path to vocab.json)");
-    let merges_path = args.merges.as_deref()
+    let merges_path = args
+        .merges
+        .as_deref()
         .expect("--merges required with --weights (path to merges.txt)");
 
     eprintln!("[ GPT-OSS ] Loading tokenizer...");
-    let tok = BpeTokenizer::from_files(vocab_path, merges_path)
-        .expect("failed to load BPE tokenizer");
+    let tok =
+        BpeTokenizer::from_files(vocab_path, merges_path).expect("failed to load BPE tokenizer");
 
     eprintln!("[ GPT-OSS ] Building model (gpt-oss-20b config)...");
     let config = Config3::gpt_oss_20b();
@@ -220,7 +336,8 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
     let mut model = GptOssModel::new(config, &mut rng);
 
     eprintln!("[ GPT-OSS ] Loading weights from {}...", weights_dir);
-    model.load_weights_from_dir(weights_dir)
+    model
+        .load_weights_from_dir(weights_dir)
         .expect("failed to load weights");
 
     let raw_ids = tok.encode(prompt);
@@ -232,9 +349,9 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
 
     let params = SamplingParams {
         temperature: args.temperature,
-        top_k:       args.top_k,
-        top_p:       args.top_p,
-        seed:        args.seed,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        seed: args.seed,
         ..SamplingParams::creative(args.seed)
     };
 
@@ -257,7 +374,7 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
 fn run_gemma3(args: &CliArgs, prompt: &str) {
     use std::io::Write;
     use tokenizer::HfBpeTokenizer;
-    use transformer4::{Gemma3Model, Config4};
+    use transformer4::{Config4, Gemma3Model};
 
     let weights_path = args.weights.as_deref().unwrap();
     let model_name = args.model.as_deref().unwrap_or("gemma3-1b");
@@ -279,31 +396,37 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     };
 
     // Tokenizer directory: explicit --tokenizer-dir overrides, then weights_dir
-    let tok_dir = args.tokenizer_dir.as_deref()
+    let tok_dir = args
+        .tokenizer_dir
+        .as_deref()
         .unwrap_or(&weights_dir)
         .trim_end_matches('/');
 
     // Try tokenizer.json (BPE) first, then fall back to tokenizer.model (SentencePiece)
     let tok_json_path = format!("{}/tokenizer.json", tok_dir);
     eprintln!("[ Gemma3 ] Loading tokenizer from {}...", tok_json_path);
-    let tok = HfBpeTokenizer::from_json_file(&tok_json_path)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to load tokenizer from {}: {}", tok_json_path, e);
-            if is_gguf && args.tokenizer_dir.is_none() {
-                eprintln!("Hint: GGUF files do not include a tokenizer.");
-                eprintln!("      Pass --tokenizer-dir pointing to your safetensors directory,");
-                eprintln!("      e.g.: --tokenizer-dir /path/to/gemma-3-4b-it/");
-            }
-            std::process::exit(1);
-        });
+    let tok = HfBpeTokenizer::from_json_file(&tok_json_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: failed to load tokenizer from {}: {}",
+            tok_json_path, e
+        );
+        if is_gguf && args.tokenizer_dir.is_none() {
+            eprintln!("Hint: GGUF files do not include a tokenizer.");
+            eprintln!("      Pass --tokenizer-dir pointing to your safetensors directory,");
+            eprintln!("      e.g.: --tokenizer-dir /path/to/gemma-3-4b-it/");
+        }
+        std::process::exit(1);
+    });
     eprintln!("[ Gemma3 ] Vocab size: {}", tok.vocab_size());
 
     let config = match model_name {
         "gemma3-4b" => Config4::gemma3_4b(),
-        _           => Config4::gemma3_1b(),  // default
+        _ => Config4::gemma3_1b(), // default
     };
-    eprintln!("[ Gemma3 ] Building {} model ({} layers, hidden={})...",
-        model_name, config.num_hidden_layers, config.hidden_size);
+    eprintln!(
+        "[ Gemma3 ] Building {} model ({} layers, hidden={})...",
+        model_name, config.num_hidden_layers, config.hidden_size
+    );
 
     let mut rng = InitRng::new(0);
     let mut model = Gemma3Model::new(config, &mut rng);
@@ -311,7 +434,8 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     if is_gguf {
         // --- GGUF path: load directly from .gguf file ---
         eprintln!("[ Gemma3 ] Loading weights from GGUF: {}...", weights_path);
-        model.load_weights_from_gguf(weights_path)
+        model
+            .load_weights_from_gguf(weights_path)
             .expect("failed to load GGUF weights");
     } else {
         // --- Safetensors path: try cache first, then load + save cache ---
@@ -322,11 +446,11 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
             eprintln!("[ Gemma3 ] Loaded weights from cache ({}).", cache_path);
         } else {
             eprintln!("[ Gemma3 ] Loading weights from {}...", weights_dir);
-            model.load_weights_from_dir(&weights_dir)
+            model
+                .load_weights_from_dir(&weights_dir)
                 .expect("failed to load weights");
             eprintln!("[ Gemma3 ] Saving weight cache to {}...", cache_path);
-            model.save_cache(&cache_path)
-                .expect("failed to save cache");
+            model.save_cache(&cache_path).expect("failed to save cache");
             eprintln!("[ Gemma3 ] Cache saved.");
         }
     }
@@ -348,11 +472,20 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     print!("{}", prompt);
     std::io::stdout().flush().ok();
 
-    model.generate_cached_streaming(&token_ids, args.max_new, args.temperature, args.top_k, args.seed, |tok_id| {
-        let text = tok.decode(&[tok_id as u32]);
-        print!("{}", text);
-        std::io::stdout().flush().ok();
-    });
+    model.generate_cached_streaming(
+        &token_ids,
+        args.max_new,
+        args.temperature,
+        args.top_k,
+        args.top_p,
+        args.rep_penalty,
+        args.seed,
+        |tok_id| {
+            let text = tok.decode(&[tok_id as u32]);
+            print!("{}", text);
+            std::io::stdout().flush().ok();
+        },
+    );
     println!();
 }
 
@@ -367,8 +500,7 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
     let vocab_size = tokenizer.vocab_size();
     let context_length = 64;
 
-    let (train_data, val_data) =
-        TextDataset::train_val_split(CORPUS, &tokenizer, context_length);
+    let (train_data, val_data) = TextDataset::train_val_split(CORPUS, &tokenizer, context_length);
 
     let model_config = Config {
         vocab_size,
@@ -384,29 +516,45 @@ fn run_gpt2_generate(args: &CliArgs, prompt: &str) {
     if let Some(ref ckpt_path) = args.checkpoint {
         eprintln!("[ Load ] Restoring from checkpoint: {}", ckpt_path);
         use nn2::Module2;
-        restore_checkpoint(ckpt_path, &model.parameters())
-            .expect("failed to restore checkpoint");
+        restore_checkpoint(ckpt_path, &model.parameters()).expect("failed to restore checkpoint");
     } else {
-        eprintln!("[ Train ] vocab={} context={} steps={}", vocab_size, context_length, args.train_steps);
+        eprintln!(
+            "[ Train ] vocab={} context={} steps={}",
+            vocab_size, context_length, args.train_steps
+        );
         let cfg = TrainConfig2 {
-            max_steps:     args.train_steps,
+            max_steps: args.train_steps,
             eval_interval: args.train_steps / 5,
             learning_rate: 3e-3,
-            grad_clip:     1.0,
+            grad_clip: 1.0,
             ..TrainConfig2::default()
         };
         train2(&model, &train_data, &val_data, &cfg);
     }
 
     // Stream tokens using the KV cache (O(T) per step instead of O(T²)).
-    let token_ids: Vec<usize> = tokenizer.encode(prompt).iter().map(|&x| x as usize).collect();
-    let token_ids = if token_ids.is_empty() { vec![0usize] } else { token_ids };
+    let token_ids: Vec<usize> = tokenizer
+        .encode(prompt)
+        .iter()
+        .map(|&x| x as usize)
+        .collect();
+    let token_ids = if token_ids.is_empty() {
+        vec![0usize]
+    } else {
+        token_ids
+    };
     print!("{}", prompt);
     std::io::stdout().flush().ok();
-    model.generate_cached_streaming(&token_ids, args.max_new, args.temperature, args.top_k, |tok_id| {
-        print!("{}", tokenizer.decode(&[tok_id as u32]));
-        std::io::stdout().flush().ok();
-    });
+    model.generate_cached_streaming(
+        &token_ids,
+        args.max_new,
+        args.temperature,
+        args.top_k,
+        |tok_id| {
+            print!("{}", tokenizer.decode(&[tok_id as u32]));
+            std::io::stdout().flush().ok();
+        },
+    );
     println!();
 }
 
@@ -426,17 +574,15 @@ fn main() {
             let tok = BpeTokenizer::from_files(
                 args.vocab.as_deref().unwrap(),
                 args.merges.as_deref().unwrap(),
-            ).expect("failed to load BPE tokenizer");
-            TokenizedDataset::write_bin_from_file(dst, src, &tok)
-                .expect("pretokenize failed")
+            )
+            .expect("failed to load BPE tokenizer");
+            TokenizedDataset::write_bin_from_file(dst, src, &tok).expect("pretokenize failed")
         } else {
             // Char tokenizer — read full file to build vocab, then re-tokenize line-by-line
-            let text = std::fs::read_to_string(src)
-                .expect("cannot read source file");
+            let text = std::fs::read_to_string(src).expect("cannot read source file");
             let tok = CharTokenizer::from_text(&text);
             eprintln!("[pretokenize] Char vocab size: {}", tok.vocab_size());
-            TokenizedDataset::write_bin(dst, &text, &tok)
-                .expect("pretokenize failed")
+            TokenizedDataset::write_bin(dst, &text, &tok).expect("pretokenize failed")
         };
 
         eprintln!("[pretokenize] Done: {} tokens → {}", n_tokens, dst);
@@ -448,7 +594,10 @@ fn main() {
     // -------------------------------------------------------------------------
     if let Some(ref prompt) = args.prompt.clone() {
         let is_gemma3 = args.tokenizer_model.is_some()
-            || args.model.as_deref().map_or(false, |m| m.starts_with("gemma3"));
+            || args
+                .model
+                .as_deref()
+                .map_or(false, |m| m.starts_with("gemma3"));
         if is_gemma3 {
             run_gemma3(&args, prompt);
         } else if args.weights.is_some() {
@@ -492,7 +641,8 @@ fn run_benchmark(train_steps: usize) {
     println!("         Context window: {} tokens", context_length);
     println!(
         "         Random loss:    {:.4}  (= ln({}))",
-        (vocab_size as f32).ln(), vocab_size
+        (vocab_size as f32).ln(),
+        vocab_size
     );
 
     let model_config = Config {
@@ -518,8 +668,12 @@ fn run_benchmark(train_steps: usize) {
     {
         use nn::Module;
         let n = scalar_model.parameters().len();
-        println!(" Model:  {:.1}K scalar nodes  ({} param matrices × ~{} elements avg)",
-            n as f32 / 1000.0, 0, n);
+        println!(
+            " Model:  {:.1}K scalar nodes  ({} param matrices × ~{} elements avg)",
+            n as f32 / 1000.0,
+            0,
+            n
+        );
     }
 
     let scalar_cfg = TrainConfig {
@@ -530,7 +684,13 @@ fn run_benchmark(train_steps: usize) {
     };
 
     let t_scalar_start = std::time::Instant::now();
-    train(&scalar_model, &tokenizer, &train_data, &val_data, &scalar_cfg);
+    train(
+        &scalar_model,
+        &tokenizer,
+        &train_data,
+        &val_data,
+        &scalar_cfg,
+    );
     let t_scalar = t_scalar_start.elapsed();
 
     println!("\n[ Generation — scalar model ]");
@@ -550,11 +710,12 @@ fn run_benchmark(train_steps: usize) {
     {
         use nn2::Module2;
         let params = tensor_model.parameters();
-        let total_elems: usize = params.iter()
-            .map(|p| p.data().rows * p.data().cols)
-            .sum();
-        println!(" Model:  {} tensor nodes  ({} elements total)",
-            params.len(), total_elems);
+        let total_elems: usize = params.iter().map(|p| p.data().rows * p.data().cols).sum();
+        println!(
+            " Model:  {} tensor nodes  ({} elements total)",
+            params.len(),
+            total_elems
+        );
     }
 
     let tensor_cfg = TrainConfig2 {
@@ -572,7 +733,11 @@ fn run_benchmark(train_steps: usize) {
     println!("\n[ Generation — tensor model ]");
     for prompt_str in &["Il ", "The "] {
         use std::io::Write;
-        let ids: Vec<usize> = tokenizer.encode(prompt_str).iter().map(|&x| x as usize).collect();
+        let ids: Vec<usize> = tokenizer
+            .encode(prompt_str)
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
         print!("{}", prompt_str);
         tensor_model.generate_cached_streaming(&ids, 80, 0.8, 5, |tok_id| {
             print!("{}", tokenizer.decode(&[tok_id as u32]));
@@ -587,18 +752,28 @@ fn run_benchmark(train_steps: usize) {
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║                   Benchmark Summary                         ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Steps: {:4}                                                ║", train_steps);
+    println!(
+        "║  Steps: {:4}                                                ║",
+        train_steps
+    );
     println!("║                                                              ║");
-    println!("║  Scalar autograd:   {:>8.2}s   ({:>5.0} ms/step)           ║",
+    println!(
+        "║  Scalar autograd:   {:>8.2}s   ({:>5.0} ms/step)           ║",
         t_scalar.as_secs_f64(),
-        t_scalar.as_millis() as f64 / train_steps as f64);
-    println!("║  Tensor autodiff:   {:>8.2}s   ({:>5.0} ms/step)           ║",
+        t_scalar.as_millis() as f64 / train_steps as f64
+    );
+    println!(
+        "║  Tensor autodiff:   {:>8.2}s   ({:>5.0} ms/step)           ║",
         t_tensor.as_secs_f64(),
-        t_tensor.as_millis() as f64 / train_steps as f64);
+        t_tensor.as_millis() as f64 / train_steps as f64
+    );
 
     let speedup = t_scalar.as_secs_f64() / t_tensor.as_secs_f64();
     println!("║                                                              ║");
-    println!("║  Speedup:           {:>7.1}x                                ║", speedup);
+    println!(
+        "║  Speedup:           {:>7.1}x                                ║",
+        speedup
+    );
     println!("║                                                              ║");
     println!("║  Why faster?                                                 ║");
     println!("║  • Scalar: ~400K nodes in graph → 400K backward visits      ║");

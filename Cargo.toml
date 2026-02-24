@@ -17,6 +17,7 @@ objc2-foundation = { version = "0.3.2", optional = true }
 objc2 = { version = "0.6.1", optional = true }
 
 [features]
+default = ["blas"]
 weight-loading = ["safetensors"]
 mmap-loading = ["memmap2"]
 blas = ["cblas", "blas-src"]

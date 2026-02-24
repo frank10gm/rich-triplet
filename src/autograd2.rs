@@ -1,3 +1,4 @@
+use crate::ndarray::NDArray;
 /// # Tensor-Level Automatic Differentiation
 ///
 /// ## Why the scalar engine is slow
@@ -65,11 +66,9 @@
 /// ### cross-entropy loss: L = mean(-log(softmax(logits)[targets]))
 ///   Combined with softmax for numerical stability:
 ///   d(logits)[t, v] = (softmax(logits)[t, v] - one_hot(targets[t], v)) / T
-
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::collections::HashSet;
-use crate::ndarray::NDArray;
+use std::rc::Rc;
 
 // =============================================================================
 // The Tensor type — re-exported from tensor.rs but with grad operations added
@@ -89,29 +88,56 @@ pub struct Mat {
 
 impl Mat {
     pub fn new(data: Vec<f32>, rows: usize, cols: usize) -> Self {
-        assert_eq!(data.len(), rows * cols,
-            "Mat::new: data len {} != rows*cols {}*{}={}", data.len(), rows, cols, rows*cols);
+        assert_eq!(
+            data.len(),
+            rows * cols,
+            "Mat::new: data len {} != rows*cols {}*{}={}",
+            data.len(),
+            rows,
+            cols,
+            rows * cols
+        );
         Mat { data, rows, cols }
     }
 
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Mat { data: vec![0.0; rows * cols], rows, cols }
+        Mat {
+            data: vec![0.0; rows * cols],
+            rows,
+            cols,
+        }
     }
 
     pub fn ones(rows: usize, cols: usize) -> Self {
-        Mat { data: vec![1.0; rows * cols], rows, cols }
+        Mat {
+            data: vec![1.0; rows * cols],
+            rows,
+            cols,
+        }
     }
 
     pub fn from_fn<F: Fn(usize, usize) -> f32>(rows: usize, cols: usize, f: F) -> Self {
         let mut data = Vec::with_capacity(rows * cols);
-        for r in 0..rows { for c in 0..cols { data.push(f(r, c)); } }
+        for r in 0..rows {
+            for c in 0..cols {
+                data.push(f(r, c));
+            }
+        }
         Mat { data, rows, cols }
     }
 
-    #[inline] pub fn at(&self, r: usize, c: usize) -> f32 { self.data[r * self.cols + c] }
-    #[inline] pub fn at_mut(&mut self, r: usize, c: usize) -> &mut f32 { &mut self.data[r * self.cols + c] }
+    #[inline]
+    pub fn at(&self, r: usize, c: usize) -> f32 {
+        self.data[r * self.cols + c]
+    }
+    #[inline]
+    pub fn at_mut(&mut self, r: usize, c: usize) -> &mut f32 {
+        &mut self.data[r * self.cols + c]
+    }
 
-    pub fn numel(&self) -> usize { self.rows * self.cols }
+    pub fn numel(&self) -> usize {
+        self.rows * self.cols
+    }
 
     // -------------------------------------------------------------------------
     // Core linear algebra — these are the hot paths
@@ -133,8 +159,11 @@ impl Mat {
     /// Apple Accelerate / OpenBLAS installed).  When both `blas` and `parallel`
     /// are active, `blas` wins because BLAS is already multi-threaded internally.
     pub fn matmul(&self, b: &Mat) -> Mat {
-        assert_eq!(self.cols, b.rows,
-            "matmul shape mismatch: [{},{}] × [{},{}]", self.rows, self.cols, b.rows, b.cols);
+        assert_eq!(
+            self.cols, b.rows,
+            "matmul shape mismatch: [{},{}] × [{},{}]",
+            self.rows, self.cols, b.rows, b.cols
+        );
 
         #[cfg(feature = "blas")]
         {
@@ -201,12 +230,17 @@ impl Mat {
                 cblas::Layout::RowMajor,
                 cblas::Transpose::None,
                 cblas::Transpose::None,
-                m as i32, n as i32, k as i32,
-                1.0_f32,                    // alpha
-                &self.data, k as i32,       // A, lda
-                &b.data,    n as i32,       // B, ldb
-                0.0_f32,                    // beta
-                &mut out.data, n as i32,    // C, ldc
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0_f32, // alpha
+                &self.data,
+                k as i32, // A, lda
+                &b.data,
+                n as i32, // B, ldb
+                0.0_f32,  // beta
+                &mut out.data,
+                n as i32, // C, ldc
             );
         }
         out
@@ -221,20 +255,28 @@ impl Mat {
     pub fn matmul_bt(&self, b: &Mat) -> Mat {
         // self: [M, K],  b: [N, K]  →  out: [M, N]
         let (m, k, n) = (self.rows, self.cols, b.rows);
-        assert_eq!(k, b.cols, "matmul_bt: [{},{}] × [{},{}]^T shape mismatch",
-            self.rows, self.cols, b.rows, b.cols);
+        assert_eq!(
+            k, b.cols,
+            "matmul_bt: [{},{}] × [{},{}]^T shape mismatch",
+            self.rows, self.cols, b.rows, b.cols
+        );
         let mut out = Mat::zeros(m, n);
         unsafe {
             cblas::sgemm(
                 cblas::Layout::RowMajor,
                 cblas::Transpose::None,
                 cblas::Transpose::Ordinary,
-                m as i32, n as i32, k as i32,
+                m as i32,
+                n as i32,
+                k as i32,
                 1.0_f32,
-                &self.data, k as i32,
-                &b.data,    k as i32,  // ldb = K (B is [N,K] row-major)
+                &self.data,
+                k as i32,
+                &b.data,
+                k as i32, // ldb = K (B is [N,K] row-major)
                 0.0_f32,
-                &mut out.data, n as i32,
+                &mut out.data,
+                n as i32,
             );
         }
         out
@@ -248,35 +290,61 @@ impl Mat {
     /// Element-wise addition (same shape).
     pub fn add(&self, other: &Mat) -> Mat {
         assert_eq!((self.rows, self.cols), (other.rows, other.cols));
-        Mat::new(self.data.iter().zip(&other.data).map(|(a,b)| a+b).collect(),
-                 self.rows, self.cols)
+        Mat::new(
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(a, b)| a + b)
+                .collect(),
+            self.rows,
+            self.cols,
+        )
     }
 
     /// In-place element-wise addition: self += other
     pub fn add_assign(&mut self, other: &Mat) {
         assert_eq!(self.data.len(), other.data.len());
-        for (a, b) in self.data.iter_mut().zip(&other.data) { *a += b; }
+        for (a, b) in self.data.iter_mut().zip(&other.data) {
+            *a += b;
+        }
     }
 
     /// Element-wise multiplication (same shape).
     pub fn mul_elem(&self, other: &Mat) -> Mat {
         assert_eq!((self.rows, self.cols), (other.rows, other.cols));
-        Mat::new(self.data.iter().zip(&other.data).map(|(a,b)| a*b).collect(),
-                 self.rows, self.cols)
+        Mat::new(
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(a, b)| a * b)
+                .collect(),
+            self.rows,
+            self.cols,
+        )
     }
 
     /// Scale every element by a scalar.
     pub fn scale(&self, s: f32) -> Mat {
-        Mat::new(self.data.iter().map(|x| x * s).collect(), self.rows, self.cols)
+        Mat::new(
+            self.data.iter().map(|x| x * s).collect(),
+            self.rows,
+            self.cols,
+        )
     }
 
     /// Element-wise map.
     pub fn map<F: Fn(f32) -> f32>(&self, f: F) -> Mat {
-        Mat::new(self.data.iter().map(|&x| f(x)).collect(), self.rows, self.cols)
+        Mat::new(
+            self.data.iter().map(|&x| f(x)).collect(),
+            self.rows,
+            self.cols,
+        )
     }
 
     /// Sum all elements.
-    pub fn sum(&self) -> f32 { self.data.iter().sum() }
+    pub fn sum(&self) -> f32 {
+        self.data.iter().sum()
+    }
 
     /// Sum along rows → shape [1, cols].
     /// out[c] = sum_r self[r,c]
@@ -294,7 +362,10 @@ impl Mat {
     pub fn row_mean(&self) -> Mat {
         let inv_n = 1.0 / self.cols as f32;
         Mat::from_fn(self.rows, 1, |r, _| {
-            self.data[r * self.cols..(r+1) * self.cols].iter().sum::<f32>() * inv_n
+            self.data[r * self.cols..(r + 1) * self.cols]
+                .iter()
+                .sum::<f32>()
+                * inv_n
         })
     }
 
@@ -366,9 +437,11 @@ impl Mat {
     /// Equivalent to `self.matmul(b)` but uses `n_threads` threads.
     /// Pass `n_threads = 0` to use the number of logical CPUs.
     pub fn matmul_parallel(&self, b: &Mat, n_threads: usize) -> Mat {
-        assert_eq!(self.cols, b.rows,
+        assert_eq!(
+            self.cols, b.rows,
             "matmul_parallel shape mismatch: [{},{}] × [{},{}]",
-            self.rows, self.cols, b.rows, b.cols);
+            self.rows, self.cols, b.rows, b.cols
+        );
         let (m, k, n) = (self.rows, self.cols, b.cols);
 
         let n_threads = if n_threads == 0 {
@@ -391,22 +464,19 @@ impl Mat {
             let chunk = (m + n_threads - 1) / n_threads; // rows per thread (ceiling)
             for thread_id in 0..n_threads {
                 let row_start = thread_id * chunk;
-                let row_end   = (row_start + chunk).min(m);
-                if row_start >= row_end { break; }
+                let row_end = (row_start + chunk).min(m);
+                if row_start >= row_end {
+                    break;
+                }
 
                 // SAFETY: each thread writes to a disjoint range of rows.
                 // `a_ptr`, `b_ptr` are read-only; `out_ptr` range is unique per thread.
-                let slice_len  = (row_end - row_start) * n;
+                let slice_len = (row_end - row_start) * n;
                 let slice_start = row_start * n;
-                let out_slice: &mut [f32] = unsafe {
-                    std::slice::from_raw_parts_mut(out_ptr.add(slice_start), slice_len)
-                };
-                let a_slice: &[f32] = unsafe {
-                    std::slice::from_raw_parts(a_ptr, m * k)
-                };
-                let b_slice: &[f32] = unsafe {
-                    std::slice::from_raw_parts(b_ptr, k * n)
-                };
+                let out_slice: &mut [f32] =
+                    unsafe { std::slice::from_raw_parts_mut(out_ptr.add(slice_start), slice_len) };
+                let a_slice: &[f32] = unsafe { std::slice::from_raw_parts(a_ptr, m * k) };
+                let b_slice: &[f32] = unsafe { std::slice::from_raw_parts(b_ptr, k * n) };
 
                 s.spawn(move || {
                     for i in 0..(row_end - row_start) {
@@ -467,7 +537,7 @@ impl Mat {
 /// Use `Mat::to_bf16` to convert an f32 `Mat` back to `MatBf16`.
 #[derive(Clone)]
 pub struct MatBf16 {
-    pub data: Vec<u16>,  // bf16 bits, one u16 per element
+    pub data: Vec<u16>, // bf16 bits, one u16 per element
     pub rows: usize,
     pub cols: usize,
 }
@@ -509,10 +579,14 @@ impl MatBf16 {
     }
 
     /// Size in bytes (2 bytes per element).
-    pub fn size_bytes(&self) -> usize { self.data.len() * 2 }
+    pub fn size_bytes(&self) -> usize {
+        self.data.len() * 2
+    }
 
     /// Compression ratio vs f32 (always 2.0×).
-    pub fn compression_ratio(&self) -> f32 { 2.0 }
+    pub fn compression_ratio(&self) -> f32 {
+        2.0
+    }
 
     #[inline]
     pub fn at(&self, r: usize, c: usize) -> f32 {
@@ -539,12 +613,20 @@ impl Mat {
     ///
     /// `bytes` must be `rows * cols * 2` bytes, little-endian BF16.
     pub fn from_bf16_bytes(bytes: &[u8], rows: usize, cols: usize) -> Self {
-        assert_eq!(bytes.len(), rows * cols * 2,
-            "from_bf16_bytes: expected {} bytes, got {}", rows * cols * 2, bytes.len());
-        let data: Vec<f32> = bytes.chunks_exact(2).map(|c| {
-            let bits = u16::from_le_bytes([c[0], c[1]]);
-            MatBf16::bf16_to_f32(bits)
-        }).collect();
+        assert_eq!(
+            bytes.len(),
+            rows * cols * 2,
+            "from_bf16_bytes: expected {} bytes, got {}",
+            rows * cols * 2,
+            bytes.len()
+        );
+        let data: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                MatBf16::bf16_to_f32(bits)
+            })
+            .collect();
         Mat { data, rows, cols }
     }
 }
@@ -609,15 +691,19 @@ use std::sync::Arc;
 /// Only the input is stored; the forward pass is re-run during backward
 /// to recover intermediate activations.
 pub struct Checkpoint<F>
-where F: Fn(&TensorNode) -> TensorNode,
+where
+    F: Fn(&TensorNode) -> TensorNode,
 {
     f: Arc<F>,
 }
 
 impl<F> Checkpoint<F>
-where F: Fn(&TensorNode) -> TensorNode + 'static,
+where
+    F: Fn(&TensorNode) -> TensorNode + 'static,
 {
-    pub fn new(f: F) -> Self { Checkpoint { f: Arc::new(f) } }
+    pub fn new(f: F) -> Self {
+        Checkpoint { f: Arc::new(f) }
+    }
 
     /// Run `f(x)`, but register a backward that re-computes the forward
     /// before propagating gradients.
@@ -638,19 +724,22 @@ where F: Fn(&TensorNode) -> TensorNode + 'static,
         let f_c = Arc::clone(&self.f);
         let out_c = out.clone();
 
-        out.set_backward(Box::new(move || {
-            // Re-run forward to rebuild the intermediate graph
-            // Zero the re-created input's grad so we accumulate correctly
-            x_c.zero_grad();
-            let recomputed = f_c(&x_c);
+        out.set_backward(
+            Box::new(move || {
+                // Re-run forward to rebuild the intermediate graph
+                // Zero the re-created input's grad so we accumulate correctly
+                x_c.zero_grad();
+                let recomputed = f_c(&x_c);
 
-            // Seed with the gradient that flowed back to `out`
-            recomputed.set_grad(out_c.grad().clone());
-            // Run backward through the recomputed graph
-            recomputed.call_backward_fn();
+                // Seed with the gradient that flowed back to `out`
+                recomputed.set_grad(out_c.grad().clone());
+                // Run backward through the recomputed graph
+                recomputed.call_backward_fn();
 
-            // The gradient now lives in x_c.grad (accumulated by recomputed backward)
-        }), vec![x.clone()]);
+                // The gradient now lives in x_c.grad (accumulated by recomputed backward)
+            }),
+            vec![x.clone()],
+        );
 
         out
     }
@@ -743,7 +832,7 @@ impl Q4Mat {
 
         for block in 0..n_blocks {
             let start = block * Q4_BLOCK_SIZE;
-            let end   = (start + Q4_BLOCK_SIZE).min(n);
+            let end = (start + Q4_BLOCK_SIZE).min(n);
 
             // Find absmax for this block
             let absmax = mat.data[start..end]
@@ -760,14 +849,19 @@ impl Q4Mat {
                 // Pack as nibble (4-bit two's complement)
                 let nibble = (q & 0x0F) as u8; // low 4 bits preserve the sign bit for i4
                 if k % 2 == 0 {
-                    packed[k / 2] |= nibble;          // low nibble
+                    packed[k / 2] |= nibble; // low nibble
                 } else {
-                    packed[k / 2] |= nibble << 4;     // high nibble
+                    packed[k / 2] |= nibble << 4; // high nibble
                 }
             }
         }
 
-        Q4Mat { rows: mat.rows, cols: mat.cols, packed, scales }
+        Q4Mat {
+            rows: mat.rows,
+            cols: mat.cols,
+            packed,
+            scales,
+        }
     }
 
     /// Dequantize: recover an approximate `Mat` from the 4-bit representation.
@@ -781,12 +875,16 @@ impl Q4Mat {
 
         for k in 0..n {
             let nibble = if k % 2 == 0 {
-                self.packed[k / 2] & 0x0F          // low nibble
+                self.packed[k / 2] & 0x0F // low nibble
             } else {
-                (self.packed[k / 2] >> 4) & 0x0F   // high nibble
+                (self.packed[k / 2] >> 4) & 0x0F // high nibble
             };
             // Sign-extend from 4-bit two's complement
-            let q = if nibble >= 8 { nibble as i8 - 16 } else { nibble as i8 };
+            let q = if nibble >= 8 {
+                nibble as i8 - 16
+            } else {
+                nibble as i8
+            };
             let block = k / Q4_BLOCK_SIZE;
             data[k] = q as f32 * self.scales[block];
         }
@@ -808,12 +906,16 @@ impl Q4Mat {
         // a    is [M, K]
         // out  is [M, N]
         let (m, k, nn) = (a.rows, a.cols, self.rows);
-        assert_eq!(k, self.cols,
-            "matmul_q4_t: a.cols {} != q4.cols {}", k, self.cols);
+        assert_eq!(
+            k, self.cols,
+            "matmul_q4_t: a.cols {} != q4.cols {}",
+            k, self.cols
+        );
 
         let mut out = Mat::zeros(m, nn);
 
-        for j in 0..nn {  // output column = B row
+        for j in 0..nn {
+            // output column = B row
             // Dequantize row j of B on the fly
             let row_start_elem = j * k;
             for i in 0..m {
@@ -825,7 +927,11 @@ impl Q4Mat {
                     } else {
                         (self.packed[flat_idx / 2] >> 4) & 0x0F
                     };
-                    let q = if nibble >= 8 { nibble as i8 - 16 } else { nibble as i8 };
+                    let q = if nibble >= 8 {
+                        nibble as i8 - 16
+                    } else {
+                        nibble as i8
+                    };
                     let block = flat_idx / Q4_BLOCK_SIZE;
                     let w = q as f32 * self.scales[block];
                     acc += a.at(i, p) * w;
@@ -857,35 +963,52 @@ impl Q4Mat {
             } else {
                 (self.packed[flat >> 1] >> 4) & 0x0F
             };
-            let q = if nibble >= 8 { nibble as i8 - 16 } else { nibble as i8 };
+            let q = if nibble >= 8 {
+                nibble as i8 - 16
+            } else {
+                nibble as i8
+            };
             buf[p] = q as f32 * self.scales[block];
         }
     }
 
     /// BLAS-accelerated matmul: A [M,K] @ Q4^T [N,K] → [M,N].
     ///
-    /// Dequantizes one row of Q4 at a time into a K-element scratch buffer,
-    /// then uses cblas_sdot to compute each output element.
-    /// Allocates only K floats of scratch regardless of N.
+    /// Dispatch strategy:
+    ///
+    /// * **Decode path (M ≤ 4)** — dequantizes one row of Q4 at a time into a
+    ///   K-element scratch buffer and calls `cblas_sdot` per output element.
+    ///   Allocates only K floats of scratch regardless of N; avoids the large
+    ///   N×K temporary allocation that would dominate for a single token.
+    ///
+    /// * **Prefill path (M > 4)** — dequantizes the entire weight matrix once
+    ///   into an N×K f32 buffer and calls a single `cblas_sgemm`.  The extra
+    ///   N×K allocation is justified because `sgemm` can exploit multi-level
+    ///   cache blocking across both M and N, giving far better throughput than
+    ///   M×N individual `sdot` calls when M is large.
     #[cfg(feature = "blas")]
     pub fn matmul_q4_t_blas(&self, a: &Mat) -> Mat {
         let (m, k, n) = (a.rows, a.cols, self.rows);
-        assert_eq!(k, self.cols,
-            "matmul_q4_t_blas: a.cols {} != q4.cols {}", k, self.cols);
+        assert_eq!(
+            k, self.cols,
+            "matmul_q4_t_blas: a.cols {} != q4.cols {}",
+            k, self.cols
+        );
 
+        // Prefill: dequantize the full weight matrix and call sgemm once.
+        if m > 4 {
+            let w = self.dequantize(); // [N, K]
+            return a.matmul_bt(&w); // sgemm: A[M,K] @ W^T[K,N] → [M,N]
+        }
+
+        // Decode: row-by-row dequant + sdot — O(K) scratch, avoids N×K alloc.
         let mut out = Mat::zeros(m, n);
         let mut row_buf = vec![0.0f32; k];
 
         for j in 0..n {
             self.dequantize_row_into(j, &mut row_buf);
             for i in 0..m {
-                let dot = unsafe {
-                    cblas::sdot(
-                        k as i32,
-                        &a.data[i * k..], 1,
-                        &row_buf,         1,
-                    )
-                };
+                let dot = unsafe { cblas::sdot(k as i32, &a.data[i * k..], 1, &row_buf, 1) };
                 *out.at_mut(i, j) = dot;
             }
         }
@@ -958,7 +1081,7 @@ impl Q8Mat {
 
         for block in 0..n_blocks {
             let start = block * Q8_BLOCK_SIZE;
-            let end   = (start + Q8_BLOCK_SIZE).min(n);
+            let end = (start + Q8_BLOCK_SIZE).min(n);
 
             let absmax = mat.data[start..end]
                 .iter()
@@ -973,7 +1096,12 @@ impl Q8Mat {
             }
         }
 
-        Q8Mat { rows: mat.rows, cols: mat.cols, packed, scales }
+        Q8Mat {
+            rows: mat.rows,
+            cols: mat.cols,
+            packed,
+            scales,
+        }
     }
 
     /// Dequantize: recover an approximate `Mat`.
@@ -981,10 +1109,12 @@ impl Q8Mat {
     /// Quantization error per element ≤ 0.5 * scale ≤ absmax/254.
     pub fn dequantize(&self) -> Mat {
         let n = self.rows * self.cols;
-        let data: Vec<f32> = (0..n).map(|k| {
-            let block = k / Q8_BLOCK_SIZE;
-            self.packed[k] as f32 * self.scales[block]
-        }).collect();
+        let data: Vec<f32> = (0..n)
+            .map(|k| {
+                let block = k / Q8_BLOCK_SIZE;
+                self.packed[k] as f32 * self.scales[block]
+            })
+            .collect();
         Mat::new(data, self.rows, self.cols)
     }
 
@@ -995,7 +1125,11 @@ impl Q8Mat {
     /// Dequantizes B row-by-row on the fly (no full materialization).
     pub fn matmul_q8_t(&self, a: &Mat) -> Mat {
         let (m, k, nn) = (a.rows, a.cols, self.rows);
-        assert_eq!(k, self.cols, "matmul_q8_t: a.cols {} != q8.cols {}", k, self.cols);
+        assert_eq!(
+            k, self.cols,
+            "matmul_q8_t: a.cols {} != q8.cols {}",
+            k, self.cols
+        );
 
         let mut out = Mat::zeros(m, nn);
         for j in 0..nn {
@@ -1089,28 +1223,35 @@ pub fn save_checkpoint(path: &str, tensors: &[(&str, &TensorNode)]) -> Result<()
 ///
 /// The caller is responsible for matching names to model parameters.
 pub fn load_checkpoint(path: &str) -> Result<Vec<(String, Mat)>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("load_checkpoint: cannot read {}: {}", path, e))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("load_checkpoint: cannot read {}: {}", path, e))?;
 
     let mut pos = 0usize;
 
     let read_u32 = |b: &[u8], p: &mut usize| -> Result<u32, String> {
-        if *p + 4 > b.len() { return Err("unexpected EOF reading u32".to_string()); }
-        let v = u32::from_le_bytes(b[*p..*p+4].try_into().unwrap());
+        if *p + 4 > b.len() {
+            return Err("unexpected EOF reading u32".to_string());
+        }
+        let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
         *p += 4;
         Ok(v)
     };
     let read_f32 = |b: &[u8], p: &mut usize| -> Result<f32, String> {
-        if *p + 4 > b.len() { return Err("unexpected EOF reading f32".to_string()); }
-        let v = f32::from_le_bytes(b[*p..*p+4].try_into().unwrap());
+        if *p + 4 > b.len() {
+            return Err("unexpected EOF reading f32".to_string());
+        }
+        let v = f32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
         *p += 4;
         Ok(v)
     };
 
-    let magic   = read_u32(&bytes, &mut pos)?;
+    let magic = read_u32(&bytes, &mut pos)?;
     let version = read_u32(&bytes, &mut pos)?;
     if magic != CKPT_MAGIC {
-        return Err(format!("load_checkpoint: bad magic 0x{:08X} (expected 0x{:08X})", magic, CKPT_MAGIC));
+        return Err(format!(
+            "load_checkpoint: bad magic 0x{:08X} (expected 0x{:08X})",
+            magic, CKPT_MAGIC
+        ));
     }
     if version != CKPT_VERSION {
         return Err(format!("load_checkpoint: unsupported version {}", version));
@@ -1121,7 +1262,9 @@ pub fn load_checkpoint(path: &str) -> Result<Vec<(String, Mat)>, String> {
 
     for _ in 0..n_tensors {
         let name_len = read_u32(&bytes, &mut pos)? as usize;
-        if pos + name_len > bytes.len() { return Err("unexpected EOF reading name".to_string()); }
+        if pos + name_len > bytes.len() {
+            return Err("unexpected EOF reading name".to_string());
+        }
         let name = std::str::from_utf8(&bytes[pos..pos + name_len])
             .map_err(|e| format!("invalid UTF-8 name: {}", e))?
             .to_string();
@@ -1156,7 +1299,8 @@ pub fn restore_checkpoint(path: &str, params: &[TensorNode]) -> Result<(), Strin
     if tensors.len() != params.len() {
         return Err(format!(
             "restore_checkpoint: checkpoint has {} tensors but model has {} parameters",
-            tensors.len(), params.len()
+            tensors.len(),
+            params.len()
         ));
     }
     for (i, ((name, mat), param)) in tensors.iter().zip(params.iter()).enumerate() {
@@ -1256,11 +1400,14 @@ impl TensorNode {
     pub fn call_backward_fn(&self) {
         let fn_ptr = {
             let inner = self.0.borrow();
-            inner.backward_fn.as_ref().map(|f| unsafe {
-                &*(f.as_ref() as *const dyn Fn())
-            })
+            inner
+                .backward_fn
+                .as_ref()
+                .map(|f| unsafe { &*(f.as_ref() as *const dyn Fn()) })
         };
-        if let Some(f) = fn_ptr { f(); }
+        if let Some(f) = fn_ptr {
+            f();
+        }
     }
 
     /// Seed this node's gradient (set grad = ones of same shape).
@@ -1394,9 +1541,7 @@ impl TensorNode {
             1.0 / (1.0 + (-z).exp())
         });
 
-        let out_data = Mat::from_fn(x.rows, x.cols, |r, c| {
-            x.at(r, c) * sigmoid_vals.at(r, c)
-        });
+        let out_data = Mat::from_fn(x.rows, x.cols, |r, c| x.at(r, c) * sigmoid_vals.at(r, c));
         let out = TensorNode::leaf(out_data);
 
         let self_c = self.clone();
@@ -1408,8 +1553,8 @@ impl TensorNode {
 
             let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
                 let xv = x_data.at(r, c);
-                let z  = 1.702 * xv;
-                let s  = 1.0 / (1.0 + (-z).exp()); // sigmoid(z)
+                let z = 1.702 * xv;
+                let s = 1.0 / (1.0 + (-z).exp()); // sigmoid(z)
                 let dgelu_dx = s + xv * s * (1.0 - s) * 1.702;
                 dout.at(r, c) * dgelu_dx
             });
@@ -1436,19 +1581,19 @@ impl TensorNode {
         let out = TensorNode::leaf(out_data);
 
         let self_c = self.clone();
-        let out_c  = out.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout   = out_c.0.borrow().grad.clone();
+            let dout = out_c.0.borrow().grad.clone();
             let x_data = self_c.0.borrow().data.clone();
             let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
-                let xv    = x_data.at(r, c);
-                let x3    = xv * xv * xv;
+                let xv = x_data.at(r, c);
+                let x3 = xv * xv * xv;
                 let inner = SQRT_2_OVER_PI * (xv + COEFF * x3);
-                let t     = inner.tanh();
+                let t = inner.tanh();
                 let sech2 = 1.0 - t * t; // sech^2
-                let dg    = 0.5 * (1.0 + t)
-                          + xv * 0.5 * sech2 * SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * xv * xv);
+                let dg = 0.5 * (1.0 + t)
+                    + xv * 0.5 * sech2 * SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * xv * xv);
                 dout.at(r, c) * dg
             });
             self_c.0.borrow_mut().grad.add_assign(&dx);
@@ -1497,8 +1642,8 @@ impl TensorNode {
         let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let ds = out_c.0.borrow().grad.clone();   // upstream gradient
-            let s  = out_c.0.borrow().data.clone();   // forward softmax values
+            let ds = out_c.0.borrow().grad.clone(); // upstream gradient
+            let s = out_c.0.borrow().data.clone(); // forward softmax values
             let (t, v) = (s.rows, s.cols);
 
             let mut dx = Mat::zeros(t, v);
@@ -1545,13 +1690,13 @@ impl TensorNode {
         let inv_d = 1.0 / d as f32;
 
         // Forward: compute mean and variance per row, then normalize
-        let mut mean  = vec![0.0f32; t];
-        let mut var   = vec![0.0f32; t];
+        let mut mean = vec![0.0f32; t];
+        let mut var = vec![0.0f32; t];
         let mut x_hat = Mat::zeros(t, d);
 
         for r in 0..t {
             mean[r] = (0..d).map(|c| x.at(r, c)).sum::<f32>() * inv_d;
-            var[r]  = (0..d).map(|c| (x.at(r, c) - mean[r]).powi(2)).sum::<f32>() * inv_d;
+            var[r] = (0..d).map(|c| (x.at(r, c) - mean[r]).powi(2)).sum::<f32>() * inv_d;
             let inv_std = 1.0 / (var[r] + eps).sqrt();
             for c in 0..d {
                 *x_hat.at_mut(r, c) = (x.at(r, c) - mean[r]) * inv_std;
@@ -1559,26 +1704,26 @@ impl TensorNode {
         }
 
         // Y = gamma * X̂ + beta  (broadcast gamma/beta across rows)
-        let out_data = Mat::from_fn(t, d, |r, c| {
-            x_hat.at(r, c) * g.at(0, c) + b.at(0, c)
-        });
+        let out_data = Mat::from_fn(t, d, |r, c| x_hat.at(r, c) * g.at(0, c) + b.at(0, c));
         let out = TensorNode::leaf(out_data);
 
         let self_c = self.clone();
         let gamma_c = gamma.clone();
-        let beta_c  = beta.clone();
-        let out_c   = out.clone();
+        let beta_c = beta.clone();
+        let out_c = out.clone();
         let x_hat_stored = x_hat.clone(); // need X̂ in backward
-        let var_stored   = var.clone();
+        let var_stored = var.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dy = out_c.0.borrow().grad.clone();
-            let g  = gamma_c.0.borrow().data.clone();
+            let g = gamma_c.0.borrow().data.clone();
 
             // dγ = sum_rows(dY * X̂)   shape [1, d]
             let mut dg = Mat::zeros(1, d);
             for c in 0..d {
-                for r in 0..t { *dg.at_mut(0, c) += dy.at(r, c) * x_hat_stored.at(r, c); }
+                for r in 0..t {
+                    *dg.at_mut(0, c) += dy.at(r, c) * x_hat_stored.at(r, c);
+                }
             }
             gamma_c.0.borrow_mut().grad.add_assign(&dg);
 
@@ -1592,13 +1737,16 @@ impl TensorNode {
                 let inv_std = 1.0 / (var_stored[r] + eps).sqrt();
                 // D[r] = dY[r] * gamma   (element-wise)
                 let d_row: Vec<f32> = (0..d).map(|c| dy.at(r, c) * g.at(0, c)).collect();
-                let mean_d   = d_row.iter().sum::<f32>() * inv_d;
-                let mean_dxh = d_row.iter().enumerate()
+                let mean_d = d_row.iter().sum::<f32>() * inv_d;
+                let mean_dxh = d_row
+                    .iter()
+                    .enumerate()
                     .map(|(c, &dv)| dv * x_hat_stored.at(r, c))
-                    .sum::<f32>() * inv_d;
+                    .sum::<f32>()
+                    * inv_d;
                 for c in 0..d {
-                    *dx.at_mut(r, c) = inv_std * (d_row[c] - mean_d
-                        - x_hat_stored.at(r, c) * mean_dxh);
+                    *dx.at_mut(r, c) =
+                        inv_std * (d_row[c] - mean_d - x_hat_stored.at(r, c) * mean_dxh);
                 }
             }
             self_c.0.borrow_mut().grad.add_assign(&dx);
@@ -1624,9 +1772,12 @@ impl TensorNode {
     ///   d_scores  = softmax_backward(d_weights)  [T, T]  (causal positions only)
     ///   dQ        = d_scores @ K / sqrt(d_head)  [T, d_head]
     ///   dK        = d_scores.T @ Q / sqrt(d_head)[T, d_head]
-    pub fn causal_attention(q: &TensorNode, k: &TensorNode, v: &TensorNode, d_head: usize)
-        -> TensorNode
-    {
+    pub fn causal_attention(
+        q: &TensorNode,
+        k: &TensorNode,
+        v: &TensorNode,
+        d_head: usize,
+    ) -> TensorNode {
         let q_d = q.data().clone();
         let k_d = k.data().clone();
         let v_d = v.data().clone();
@@ -1638,7 +1789,7 @@ impl TensorNode {
 
         // Apply causal mask
         for i in 0..t {
-            for j in (i+1)..t {
+            for j in (i + 1)..t {
                 *scores.at_mut(i, j) = -1e9;
             }
         }
@@ -1647,14 +1798,18 @@ impl TensorNode {
         let weights = {
             let mut w = Mat::zeros(t, t);
             for r in 0..t {
-                let row_max = (0..t).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                let row_max = (0..t)
+                    .map(|c| scores.at(r, c))
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let mut row_sum = 0.0f32;
                 for c in 0..t {
                     let e = (scores.at(r, c) - row_max).exp();
                     *w.at_mut(r, c) = e;
                     row_sum += e;
                 }
-                for c in 0..t { *w.at_mut(r, c) /= row_sum; }
+                for c in 0..t {
+                    *w.at_mut(r, c) /= row_sum;
+                }
             }
             w
         };
@@ -1671,7 +1826,7 @@ impl TensorNode {
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dout = out_c.0.borrow().grad.clone();
-            let w  = &weights_stored;
+            let w = &weights_stored;
             let q_d = q_c.0.borrow().data.clone();
             let k_d = k_c.0.borrow().data.clone();
             let v_d = v_c.0.borrow().data.clone();
@@ -1745,7 +1900,7 @@ impl TensorNode {
 
         // Forward: compute per-row RMS and normalized values
         let mut rms_inv = vec![0.0f32; t]; // r[t]
-        let mut x_hat   = Mat::zeros(t, d); // x̂ = x * r
+        let mut x_hat = Mat::zeros(t, d); // x̂ = x * r
 
         for r in 0..t {
             let mean_sq = (0..d).map(|c| x.at(r, c).powi(2)).sum::<f32>() * inv_d;
@@ -1758,20 +1913,22 @@ impl TensorNode {
         let out_data = Mat::from_fn(t, d, |r, c| x_hat.at(r, c) * g.at(0, c));
         let out = TensorNode::leaf(out_data);
 
-        let self_c  = self.clone();
+        let self_c = self.clone();
         let gamma_c = gamma.clone();
-        let out_c   = out.clone();
+        let out_c = out.clone();
         let x_hat_s = x_hat.clone();
         let rms_inv_s = rms_inv.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dout = out_c.0.borrow().grad.clone();
-            let g    = gamma_c.0.borrow().data.clone();
+            let g = gamma_c.0.borrow().data.clone();
 
             // dγ = sum_t(dout[t] * x̂[t])   shape [1, d]
             let mut dg = Mat::zeros(1, d);
             for c in 0..d {
-                for r in 0..t { *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c); }
+                for r in 0..t {
+                    *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c);
+                }
             }
             gamma_c.0.borrow_mut().grad.add_assign(&dg);
 
@@ -1780,9 +1937,12 @@ impl TensorNode {
             let mut dx = Mat::zeros(t, d);
             for r in 0..t {
                 let d_row: Vec<f32> = (0..d).map(|c| dout.at(r, c) * g.at(0, c)).collect();
-                let mean_dxh = d_row.iter().enumerate()
+                let mean_dxh = d_row
+                    .iter()
+                    .enumerate()
                     .map(|(c, &dv)| dv * x_hat_s.at(r, c))
-                    .sum::<f32>() * inv_d;
+                    .sum::<f32>()
+                    * inv_d;
                 for c in 0..d {
                     *dx.at_mut(r, c) = rms_inv_s[r] * (d_row[c] - x_hat_s.at(r, c) * mean_dxh);
                 }
@@ -1810,7 +1970,7 @@ impl TensorNode {
         let inv_d = 1.0 / d as f32;
 
         let mut rms_inv = vec![0.0f32; t];
-        let mut x_hat   = Mat::zeros(t, d);
+        let mut x_hat = Mat::zeros(t, d);
 
         for r in 0..t {
             let mean_sq = (0..d).map(|c| x.at(r, c).powi(2)).sum::<f32>() * inv_d;
@@ -1824,20 +1984,22 @@ impl TensorNode {
         let out_data = Mat::from_fn(t, d, |r, c| x_hat.at(r, c) * (1.0 + g.at(0, c)));
         let out = TensorNode::leaf(out_data);
 
-        let self_c  = self.clone();
+        let self_c = self.clone();
         let gamma_c = gamma.clone();
-        let out_c   = out.clone();
+        let out_c = out.clone();
         let x_hat_s = x_hat.clone();
         let rms_inv_s = rms_inv.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dout = out_c.0.borrow().grad.clone();
-            let g    = gamma_c.0.borrow().data.clone();
+            let g = gamma_c.0.borrow().data.clone();
 
             // dγ = sum_t(dout[t] * x̂[t])  (same as rms_norm since d/dgamma of (1+g)*x̂ = x̂)
             let mut dg = Mat::zeros(1, d);
             for c in 0..d {
-                for r in 0..t { *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c); }
+                for r in 0..t {
+                    *dg.at_mut(0, c) += dout.at(r, c) * x_hat_s.at(r, c);
+                }
             }
             gamma_c.0.borrow_mut().grad.add_assign(&dg);
 
@@ -1845,9 +2007,12 @@ impl TensorNode {
             let mut dx = Mat::zeros(t, d);
             for r in 0..t {
                 let d_row: Vec<f32> = (0..d).map(|c| dout.at(r, c) * (1.0 + g.at(0, c))).collect();
-                let mean_dxh = d_row.iter().enumerate()
+                let mean_dxh = d_row
+                    .iter()
+                    .enumerate()
                     .map(|(c, &dv)| dv * x_hat_s.at(r, c))
-                    .sum::<f32>() * inv_d;
+                    .sum::<f32>()
+                    * inv_d;
                 for c in 0..d {
                     *dx.at_mut(r, c) = rms_inv_s[r] * (d_row[c] - x_hat_s.at(r, c) * mean_dxh);
                 }
@@ -1872,23 +2037,21 @@ impl TensorNode {
         let x = self.data().clone();
 
         // Precompute sigmoid for reuse in backward
-        let sig = Mat::from_fn(x.rows, x.cols, |r, c| {
-            1.0 / (1.0 + (-x.at(r, c)).exp())
-        });
+        let sig = Mat::from_fn(x.rows, x.cols, |r, c| 1.0 / (1.0 + (-x.at(r, c)).exp()));
 
         let out_data = Mat::from_fn(x.rows, x.cols, |r, c| x.at(r, c) * sig.at(r, c));
         let out = TensorNode::leaf(out_data);
 
         let self_c = self.clone();
-        let out_c  = out.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout   = out_c.0.borrow().grad.clone();
+            let dout = out_c.0.borrow().grad.clone();
             let x_data = self_c.0.borrow().data.clone();
 
             let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
                 let xv = x_data.at(r, c);
-                let s  = 1.0 / (1.0 + (-xv).exp());
+                let s = 1.0 / (1.0 + (-xv).exp());
                 // d/dx[x*σ] = σ + x*σ*(1-σ)
                 let dsilu = s + xv * s * (1.0 - s);
                 dout.at(r, c) * dsilu
@@ -1911,14 +2074,18 @@ impl TensorNode {
         let out = TensorNode::leaf(out_data);
 
         let self_c = self.clone();
-        let out_c  = out.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout   = out_c.0.borrow().grad.clone();
+            let dout = out_c.0.borrow().grad.clone();
             let x_data = self_c.0.borrow().data.clone();
             let dx = Mat::from_fn(x_data.rows, x_data.cols, |r, c| {
                 let v = x_data.at(r, c);
-                if v > min_val && v < max_val { dout.at(r, c) } else { 0.0 }
+                if v > min_val && v < max_val {
+                    dout.at(r, c)
+                } else {
+                    0.0
+                }
             });
             self_c.0.borrow_mut().grad.add_assign(&dx);
         }));
@@ -1935,18 +2102,25 @@ impl TensorNode {
     pub fn mul_elem_node(&self, other: &TensorNode) -> TensorNode {
         let a = self.data().clone();
         let b = other.data().clone();
-        assert_eq!((a.rows, a.cols), (b.rows, b.cols),
-            "mul_elem_node: shape mismatch [{},{}] vs [{},{}]", a.rows, a.cols, b.rows, b.cols);
+        assert_eq!(
+            (a.rows, a.cols),
+            (b.rows, b.cols),
+            "mul_elem_node: shape mismatch [{},{}] vs [{},{}]",
+            a.rows,
+            a.cols,
+            b.rows,
+            b.cols
+        );
 
         let out_data = a.mul_elem(&b);
         let out = TensorNode::leaf(out_data);
 
-        let self_c  = self.clone();
+        let self_c = self.clone();
         let other_c = other.clone();
-        let out_c   = out.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout  = out_c.0.borrow().grad.clone();
+            let dout = out_c.0.borrow().grad.clone();
             let a_data = self_c.0.borrow().data.clone();
             let b_data = other_c.0.borrow().data.clone();
 
@@ -1999,9 +2173,9 @@ impl TensorNode {
         });
 
         let out_data = Mat::from_fn(t, d, |row, col| {
-            let pair   = col / 2;
+            let pair = col / 2;
             let is_odd = col % 2 == 1;
-            let angle  = angles.at(row, pair);
+            let angle = angles.at(row, pair);
             let (cos_a, sin_a) = (angle.cos(), angle.sin());
             if !is_odd {
                 x.at(row, col) * cos_a - x.at(row, col + 1) * sin_a
@@ -2011,17 +2185,17 @@ impl TensorNode {
         });
 
         let out = TensorNode::leaf(out_data);
-        let self_c  = self.clone();
-        let out_c   = out.clone();
+        let self_c = self.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dout = out_c.0.borrow().grad.clone();
 
             // Backward: inverse rotation by -angle
             let dx = Mat::from_fn(t, d, |row, col| {
-                let pair   = col / 2;
+                let pair = col / 2;
                 let is_odd = col % 2 == 1;
-                let angle  = angles.at(row, pair);
+                let angle = angles.at(row, pair);
                 let (cos_a, sin_a) = (angle.cos(), angle.sin());
                 if !is_odd {
                     // dx[2i] = dout[2i]*cos + dout[2i+1]*sin
@@ -2071,16 +2245,20 @@ impl TensorNode {
     /// Backward: same inverse-rotation as rope_apply, using the YaRN-scaled angles.
     pub fn rope_apply_yarn(
         &self,
-        seq_offset:   usize,
-        theta:        f32,
+        seq_offset: usize,
+        theta: f32,
         original_ctx: usize,
-        max_ctx:      usize,
-        beta_fast:    f32,
-        beta_slow:    f32,
+        max_ctx: usize,
+        beta_fast: f32,
+        beta_slow: f32,
     ) -> TensorNode {
         let x = self.data().clone();
         let (t, d) = (x.rows, x.cols);
-        assert!(d % 2 == 0, "rope_apply_yarn: d_head must be even, got {}", d);
+        assert!(
+            d % 2 == 0,
+            "rope_apply_yarn: d_head must be even, got {}",
+            d
+        );
 
         let scale = max_ctx as f32 / original_ctx as f32;
 
@@ -2118,9 +2296,9 @@ impl TensorNode {
         });
 
         let out_data = Mat::from_fn(t, d, |row, col| {
-            let pair   = col / 2;
+            let pair = col / 2;
             let is_odd = col % 2 == 1;
-            let angle  = angles.at(row, pair);
+            let angle = angles.at(row, pair);
             let (cos_a, sin_a) = (angle.cos(), angle.sin());
             if !is_odd {
                 x.at(row, col) * cos_a - x.at(row, col + 1) * sin_a
@@ -2129,16 +2307,16 @@ impl TensorNode {
             }
         });
 
-        let out    = TensorNode::leaf(out_data);
+        let out = TensorNode::leaf(out_data);
         let self_c = self.clone();
-        let out_c  = out.clone();
+        let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
             let dout = out_c.0.borrow().grad.clone();
             let dx = Mat::from_fn(t, d, |row, col| {
-                let pair   = col / 2;
+                let pair = col / 2;
                 let is_odd = col % 2 == 1;
-                let angle  = angles.at(row, pair);
+                let angle = angles.at(row, pair);
                 let (cos_a, sin_a) = (angle.cos(), angle.sin());
                 if !is_odd {
                     dout.at(row, col) * cos_a + dout.at(row, col + 1) * sin_a
@@ -2197,32 +2375,45 @@ impl TensorNode {
         assert_eq!(v_data.cols, n_kv_heads * d_head);
 
         // Forward: run attention per q-head, storing weights for backward
-        let mut out_data    = Mat::zeros(t, n_q_heads * d_head);
+        let mut out_data = Mat::zeros(t, n_q_heads * d_head);
         let mut all_weights = vec![Mat::zeros(t, t); n_q_heads]; // one per q-head
 
         for qh in 0..n_q_heads {
             let kvh = qh / group_size;
 
-            let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
+            let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh * d_head + c));
             let k_h = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
             let v_h = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
 
             let mut scores = q_h.matmul(&k_h.transpose()).scale(scale);
-            for i in 0..t { for j in (i+1)..t { *scores.at_mut(i, j) = -1e9; } }
+            for i in 0..t {
+                for j in (i + 1)..t {
+                    *scores.at_mut(i, j) = -1e9;
+                }
+            }
 
             let mut w = Mat::zeros(t, t);
             for r in 0..t {
-                let row_max = (0..t).map(|c| scores.at(r, c)).fold(f32::NEG_INFINITY, f32::max);
+                let row_max = (0..t)
+                    .map(|c| scores.at(r, c))
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let mut row_sum = 0.0f32;
                 for c in 0..t {
                     let e = (scores.at(r, c) - row_max).exp();
-                    *w.at_mut(r, c) = e; row_sum += e;
+                    *w.at_mut(r, c) = e;
+                    row_sum += e;
                 }
-                for c in 0..t { *w.at_mut(r, c) /= row_sum; }
+                for c in 0..t {
+                    *w.at_mut(r, c) /= row_sum;
+                }
             }
 
             let out_h = w.matmul(&v_h);
-            for r in 0..t { for c in 0..d_head { *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c); } }
+            for r in 0..t {
+                for c in 0..d_head {
+                    *out_data.at_mut(r, qh * d_head + c) = out_h.at(r, c);
+                }
+            }
             all_weights[qh] = w;
         }
 
@@ -2233,12 +2424,12 @@ impl TensorNode {
         let out_c = out.clone();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout   = out_c.0.borrow().grad.clone();
+            let dout = out_c.0.borrow().grad.clone();
             let q_data = q_c.0.borrow().data.clone();
             let k_data = k_c.0.borrow().data.clone();
             let v_data = v_c.0.borrow().data.clone();
 
-            let mut dq_data = Mat::zeros(t, n_q_heads  * d_head);
+            let mut dq_data = Mat::zeros(t, n_q_heads * d_head);
             let mut dk_data = Mat::zeros(t, n_kv_heads * d_head);
             let mut dv_data = Mat::zeros(t, n_kv_heads * d_head);
 
@@ -2246,14 +2437,18 @@ impl TensorNode {
                 let kvh = qh / group_size;
                 let w = &all_weights[qh];
 
-                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh  * d_head + c));
-                let q_h    = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
-                let k_h    = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
-                let v_h    = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh * d_head + c));
+                let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh * d_head + c));
+                let k_h = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+                let v_h = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
 
                 // dV_kvh += W.T @ dOut_h
                 let dv_h = w.transpose().matmul(&dout_h);
-                for r in 0..t { for c in 0..d_head { *dv_data.at_mut(r, kvh * d_head + c) += dv_h.at(r, c); } }
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dv_data.at_mut(r, kvh * d_head + c) += dv_h.at(r, c);
+                    }
+                }
 
                 // dW = dOut_h @ V_h.T  [T, T]
                 let dw = dout_h.matmul(&v_h.transpose());
@@ -2262,17 +2457,27 @@ impl TensorNode {
                 let mut dscores = Mat::zeros(t, t);
                 for r in 0..t {
                     let dot: f32 = (0..=r).map(|c| dw.at(r, c) * w.at(r, c)).sum();
-                    for c in 0..=r { *dscores.at_mut(r, c) = w.at(r, c) * (dw.at(r, c) - dot); }
+                    for c in 0..=r {
+                        *dscores.at_mut(r, c) = w.at(r, c) * (dw.at(r, c) - dot);
+                    }
                 }
                 let dscores = dscores.scale(scale);
 
                 // dQ_h += dScores @ K_h
                 let dq_h = dscores.matmul(&k_h);
-                for r in 0..t { for c in 0..d_head { *dq_data.at_mut(r, qh * d_head + c) += dq_h.at(r, c); } }
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dq_data.at_mut(r, qh * d_head + c) += dq_h.at(r, c);
+                    }
+                }
 
                 // dK_kvh += dScores.T @ Q_h
                 let dk_h = dscores.transpose().matmul(&q_h);
-                for r in 0..t { for c in 0..d_head { *dk_data.at_mut(r, kvh * d_head + c) += dk_h.at(r, c); } }
+                for r in 0..t {
+                    for c in 0..d_head {
+                        *dk_data.at_mut(r, kvh * d_head + c) += dk_h.at(r, c);
+                    }
+                }
             }
 
             q_c.0.borrow_mut().grad.add_assign(&dq_data);
@@ -2320,7 +2525,7 @@ impl TensorNode {
         let scale = 1.0_f32 / (d_head as f32).sqrt();
         let group_size = n_q_heads / n_kv_heads;
 
-        assert_eq!(q_data.cols, n_q_heads  * d_head);
+        assert_eq!(q_data.cols, n_q_heads * d_head);
         assert_eq!(k_data.cols, n_kv_heads * d_head);
         assert_eq!(v_data.cols, n_kv_heads * d_head);
 
@@ -2328,14 +2533,14 @@ impl TensorNode {
         // NDArray uses row-major; we have data laid out as T rows of H*D.
         // reshape [T, H*D] → [T, H, D] then permute [1,0,2] → [H, T, D].
         let q_nd = NDArray::from_mat(&q_data)
-            .reshape(&[t, n_q_heads,  d_head])
-            .permute(&[1, 0, 2]);        // [n_q,  T, D]
+            .reshape(&[t, n_q_heads, d_head])
+            .permute(&[1, 0, 2]); // [n_q,  T, D]
         let k_nd = NDArray::from_mat(&k_data)
             .reshape(&[t, n_kv_heads, d_head])
-            .permute(&[1, 0, 2]);        // [n_kv, T, D]
+            .permute(&[1, 0, 2]); // [n_kv, T, D]
         let v_nd = NDArray::from_mat(&v_data)
             .reshape(&[t, n_kv_heads, d_head])
-            .permute(&[1, 0, 2]);        // [n_kv, T, D]
+            .permute(&[1, 0, 2]); // [n_kv, T, D]
 
         // ---- expand KV heads to match Q heads ----
         // Each KV head serves `group_size` Q heads.
@@ -2350,8 +2555,8 @@ impl TensorNode {
         });
 
         // ---- scores: [n_q, T, T] = Q [n_q,T,D] @ K^T [n_q,D,T] * scale ----
-        let k_t = k_exp.permute(&[0, 2, 1]);  // [n_q, D, T]
-        let mut scores = q_nd.bmm(&k_t).scale(scale);  // [n_q, T, T]
+        let k_t = k_exp.permute(&[0, 2, 1]); // [n_q, D, T]
+        let mut scores = q_nd.bmm(&k_t).scale(scale); // [n_q, T, T]
 
         // ---- causal mask: scores[h, i, j] = -1e9 for j > i ----
         for h in 0..n_q_heads {
@@ -2363,36 +2568,36 @@ impl TensorNode {
         }
 
         // ---- softmax over last axis ----
-        let weights = scores.softmax(2);  // [n_q, T, T]
+        let weights = scores.softmax(2); // [n_q, T, T]
 
         // ---- output: [n_q, T, D] = weights @ V ----
-        let out_nd = weights.bmm(&v_exp);  // [n_q, T, D]
+        let out_nd = weights.bmm(&v_exp); // [n_q, T, D]
 
         // ---- reshape back: [n_q, T, D] → [T, n_q, D] → [T, n_q*D] ----
         let out_mat = out_nd
-            .permute(&[1, 0, 2])          // [T, n_q, D]
+            .permute(&[1, 0, 2]) // [T, n_q, D]
             .reshape(&[t, n_q_heads * d_head])
             .into_mat();
 
         let out = TensorNode::leaf(out_mat);
-        let q_c   = q.clone();
-        let k_c   = k.clone();
-        let v_c   = v.clone();
+        let q_c = q.clone();
+        let k_c = k.clone();
+        let v_c = v.clone();
         let out_c = out.clone();
 
         // Store attention weights for backward (one [T,T] per q-head)
         // We extract them from the NDArray into Vec<Mat> for the closure.
-        let all_weights: Vec<Mat> = (0..n_q_heads).map(|h| {
-            Mat::from_fn(t, t, |r, c| weights.at(&[h, r, c]))
-        }).collect();
+        let all_weights: Vec<Mat> = (0..n_q_heads)
+            .map(|h| Mat::from_fn(t, t, |r, c| weights.at(&[h, r, c])))
+            .collect();
 
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout   = out_c.0.borrow().grad.clone();  // [T, n_q*D]
+            let dout = out_c.0.borrow().grad.clone(); // [T, n_q*D]
             let q_data = q_c.0.borrow().data.clone();
             let k_data = k_c.0.borrow().data.clone();
             let v_data = v_c.0.borrow().data.clone();
 
-            let mut dq_data = Mat::zeros(t, n_q_heads  * d_head);
+            let mut dq_data = Mat::zeros(t, n_q_heads * d_head);
             let mut dk_data = Mat::zeros(t, n_kv_heads * d_head);
             let mut dv_data = Mat::zeros(t, n_kv_heads * d_head);
 
@@ -2400,10 +2605,10 @@ impl TensorNode {
                 let kvh = qh / group_size;
                 let w = &all_weights[qh];
 
-                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh  * d_head + c));
-                let q_h    = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh  * d_head + c));
-                let k_h    = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
-                let v_h    = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
+                let dout_h = Mat::from_fn(t, d_head, |r, c| dout.at(r, qh * d_head + c));
+                let q_h = Mat::from_fn(t, d_head, |r, c| q_data.at(r, qh * d_head + c));
+                let k_h = Mat::from_fn(t, d_head, |r, c| k_data.at(r, kvh * d_head + c));
+                let v_h = Mat::from_fn(t, d_head, |r, c| v_data.at(r, kvh * d_head + c));
 
                 // dV += W.T @ dOut_h
                 let dv_h = w.transpose().matmul(&dout_h);
@@ -2536,7 +2741,7 @@ impl TensorNode {
             let br = q_end - q_start;
 
             // Per-block accumulator and softmax state
-            let mut acc   = vec![0.0f32; br * d_head]; // [br, d_head]
+            let mut acc = vec![0.0f32; br * d_head]; // [br, d_head]
             let mut m_blk = vec![f32::NEG_INFINITY; br];
             let mut l_blk = vec![0.0f32; br];
 
@@ -2615,19 +2820,19 @@ impl TensorNode {
         }
 
         let out = TensorNode::leaf(out_data);
-        let q_c  = q.clone();
-        let k_c  = k.clone();
-        let v_c  = v.clone();
+        let q_c = q.clone();
+        let k_c = k.clone();
+        let v_c = v.clone();
         let out_c = out.clone();
 
         // Backward: recompute softmax weights from stored (l, m) and propagate
         // gradients.  Memory: O(T) — no T×T matrix stored.
         out.0.borrow_mut().backward_fn = Some(Box::new(move || {
-            let dout  = out_c.0.borrow().grad.clone();  // [T, d_head]
-            let q_d   = q_c.0.borrow().data.clone();
-            let k_d   = k_c.0.borrow().data.clone();
-            let v_d   = v_c.0.borrow().data.clone();
-            let out_d = out_c.0.borrow().data.clone();  // [T, d_head] — final output
+            let dout = out_c.0.borrow().grad.clone(); // [T, d_head]
+            let q_d = q_c.0.borrow().data.clone();
+            let k_d = k_c.0.borrow().data.clone();
+            let v_d = v_c.0.borrow().data.clone();
+            let out_d = out_c.0.borrow().data.clone(); // [T, d_head] — final output
 
             let mut dq = Mat::zeros(t, d_head);
             let mut dk = Mat::zeros(t, d_head);
@@ -2656,7 +2861,9 @@ impl TensorNode {
                                 continue;
                             }
                             let mut dot = 0.0f32;
-                            for d in 0..d_head { dot += q_d.at(global_qi, d) * k_d.at(global_ki, d); }
+                            for d in 0..d_head {
+                                dot += q_d.at(global_qi, d) * k_d.at(global_ki, d);
+                            }
                             p[qi * bc + ki] = (dot * scale - m_i).exp() / l_global[global_qi];
                         }
                     }
@@ -2666,7 +2873,9 @@ impl TensorNode {
                         let global_ki = kv_start + ki;
                         for d in 0..d_head {
                             let mut sum = 0.0f32;
-                            for qi in 0..br { sum += p[qi * bc + ki] * dout.at(q_start + qi, d); }
+                            for qi in 0..br {
+                                sum += p[qi * bc + ki] * dout.at(q_start + qi, d);
+                            }
                             *dv.at_mut(global_ki, d) += sum;
                         }
                     }
@@ -2677,7 +2886,9 @@ impl TensorNode {
                         for ki in 0..bc {
                             let global_ki = kv_start + ki;
                             let mut sum = 0.0f32;
-                            for d in 0..d_head { sum += dout.at(q_start + qi, d) * v_d.at(global_ki, d); }
+                            for d in 0..d_head {
+                                sum += dout.at(q_start + qi, d) * v_d.at(global_ki, d);
+                            }
                             dp[qi * bc + ki] = sum;
                         }
                     }
@@ -2694,7 +2905,9 @@ impl TensorNode {
                             .map(|d| dout.at(global_qi, d) * out_d.at(global_qi, d))
                             .sum();
                         for ki in 0..bc {
-                            if kv_start + ki > global_qi { continue; }
+                            if kv_start + ki > global_qi {
+                                continue;
+                            }
                             ds[qi * bc + ki] = p[qi * bc + ki] * (dp[qi * bc + ki] - di) * scale;
                         }
                     }
@@ -2704,7 +2917,9 @@ impl TensorNode {
                         let global_qi = q_start + qi;
                         for d in 0..d_head {
                             let mut sum = 0.0f32;
-                            for ki in 0..bc { sum += ds[qi * bc + ki] * k_d.at(kv_start + ki, d); }
+                            for ki in 0..bc {
+                                sum += ds[qi * bc + ki] * k_d.at(kv_start + ki, d);
+                            }
                             *dq.at_mut(global_qi, d) += sum;
                         }
                     }
@@ -2714,7 +2929,9 @@ impl TensorNode {
                         let global_ki = kv_start + ki;
                         for d in 0..d_head {
                             let mut sum = 0.0f32;
-                            for qi in 0..br { sum += ds[qi * bc + ki] * q_d.at(q_start + qi, d); }
+                            for qi in 0..br {
+                                sum += ds[qi * bc + ki] * q_d.at(q_start + qi, d);
+                            }
                             *dk.at_mut(global_ki, d) += sum;
                         }
                     }
@@ -2754,13 +2971,20 @@ impl TensorNode {
         let mut topo: Vec<TensorNode> = Vec::new();
         let mut visited: HashSet<*const RefCell<NodeData>> = HashSet::new();
 
-        fn build(v: &TensorNode, topo: &mut Vec<TensorNode>,
-                 visited: &mut HashSet<*const RefCell<NodeData>>) {
+        fn build(
+            v: &TensorNode,
+            topo: &mut Vec<TensorNode>,
+            visited: &mut HashSet<*const RefCell<NodeData>>,
+        ) {
             let ptr = Rc::as_ptr(&v.0);
-            if visited.contains(&ptr) { return; }
+            if visited.contains(&ptr) {
+                return;
+            }
             visited.insert(ptr);
             let prev = v.0.borrow().prev.clone();
-            for p in &prev { build(p, topo, visited); }
+            for p in &prev {
+                build(p, topo, visited);
+            }
             topo.push(v.clone());
         }
         build(self, &mut topo, &mut visited);
@@ -2768,9 +2992,12 @@ impl TensorNode {
         // Seed: gradient of loss w.r.t. itself = 1
         {
             let mut inner = self.0.borrow_mut();
-            assert!(inner.data.numel() == 1,
+            assert!(
+                inner.data.numel() == 1,
                 "backward() must be called on a scalar (1×1 matrix), got shape [{},{}]",
-                inner.data.rows, inner.data.cols);
+                inner.data.rows,
+                inner.data.cols
+            );
             inner.grad = Mat::ones(1, 1);
         }
 
@@ -2786,7 +3013,9 @@ impl TensorNode {
                     unsafe { &*(f.as_ref() as *const dyn Fn()) }
                 })
             };
-            if let Some(f) = fn_ptr { f(); }
+            if let Some(f) = fn_ptr {
+                f();
+            }
         }
     }
 }
@@ -2794,8 +3023,13 @@ impl TensorNode {
 impl std::fmt::Debug for TensorNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.0.borrow();
-        write!(f, "TensorNode(shape=[{},{}], grad_norm={:.4})",
-               inner.data.rows, inner.data.cols, inner.grad.norm())
+        write!(
+            f,
+            "TensorNode(shape=[{},{}], grad_norm={:.4})",
+            inner.data.rows,
+            inner.data.cols,
+            inner.grad.norm()
+        )
     }
 }
 
@@ -2807,7 +3041,9 @@ impl std::fmt::Debug for TensorNode {
 mod tests {
     use super::*;
 
-    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-3 }
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
 
     // Numerical gradient check: perturb each element of mat by h, measure output change.
     fn numerical_grad<F: Fn(&Mat) -> f32>(f: &F, mat: &Mat) -> Mat {
@@ -2834,11 +3070,11 @@ mod tests {
     #[test]
     fn test_matmul_values() {
         // [1 2; 3 4] @ [5; 6] = [1*5+2*6; 3*5+4*6] = [17; 39]
-        let a = Mat::new(vec![1.,2.,3.,4.], 2, 2);
-        let b = Mat::new(vec![5.,6.], 2, 1);
+        let a = Mat::new(vec![1., 2., 3., 4.], 2, 2);
+        let b = Mat::new(vec![5., 6.], 2, 1);
         let c = a.matmul(&b);
-        assert!(approx(c.at(0,0), 17.0));
-        assert!(approx(c.at(1,0), 39.0));
+        assert!(approx(c.at(0, 0), 17.0));
+        assert!(approx(c.at(1, 0), 39.0));
     }
 
     /// When blas feature is active this exercises the cblas_sgemm path;
@@ -2852,32 +3088,49 @@ mod tests {
         // Compute reference with explicit triple loop to avoid depending on matmul
         let (m, k, n) = (8, 16, 8);
         let mut expected = Mat::zeros(m, n);
-        for i in 0..m { for p in 0..k { for j in 0..n {
-            *expected.at_mut(i, j) += a.at(i, p) * b.at(p, j);
-        }}}
-        for r in 0..m { for c in 0..n {
-            assert!((result.at(r, c) - expected.at(r, c)).abs() < 1e-4,
-                "matmul[{},{}]: got {} expected {}", r, c, result.at(r,c), expected.at(r,c));
-        }}
+        for i in 0..m {
+            for p in 0..k {
+                for j in 0..n {
+                    *expected.at_mut(i, j) += a.at(i, p) * b.at(p, j);
+                }
+            }
+        }
+        for r in 0..m {
+            for c in 0..n {
+                assert!(
+                    (result.at(r, c) - expected.at(r, c)).abs() < 1e-4,
+                    "matmul[{},{}]: got {} expected {}",
+                    r,
+                    c,
+                    result.at(r, c),
+                    expected.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_transpose() {
-        let a = Mat::new(vec![1.,2.,3.,4.,5.,6.], 2, 3);
+        let a = Mat::new(vec![1., 2., 3., 4., 5., 6.], 2, 3);
         let at = a.transpose();
         assert_eq!((at.rows, at.cols), (3, 2));
-        assert!(approx(at.at(0,0), 1.0));
-        assert!(approx(at.at(1,0), 2.0));
-        assert!(approx(at.at(0,1), 4.0));
+        assert!(approx(at.at(0, 0), 1.0));
+        assert!(approx(at.at(1, 0), 2.0));
+        assert!(approx(at.at(0, 1), 4.0));
     }
 
     // Helper: call a node's backward_fn without holding a RefCell borrow.
     fn call_backward(node: &TensorNode) {
         let fn_ptr = {
             let inner = node.0.borrow();
-            inner.backward_fn.as_ref().map(|f| unsafe { &*(f.as_ref() as *const dyn Fn()) })
+            inner
+                .backward_fn
+                .as_ref()
+                .map(|f| unsafe { &*(f.as_ref() as *const dyn Fn()) })
         };
-        if let Some(f) = fn_ptr { f(); }
+        if let Some(f) = fn_ptr {
+            f();
+        }
     }
 
     // --- TensorNode backward rules (verified numerically) ---
@@ -2885,88 +3138,129 @@ mod tests {
     #[test]
     fn test_matmul_grad_a() {
         // Loss = sum(A @ B). Check dA numerically.
-        let a_data = Mat::new(vec![1.,2.,3.,4.,5.,6.], 2, 3);
-        let b_data = Mat::new(vec![0.1,0.2, 0.3,0.4, 0.5,0.6], 3, 2);
+        let a_data = Mat::new(vec![1., 2., 3., 4., 5., 6.], 2, 3);
+        let b_data = Mat::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 3, 2);
 
-        let num = numerical_grad(&|a| {
-            let a_n = TensorNode::leaf(a.clone());
-            let b_n = TensorNode::leaf(b_data.clone());
-            let c = a_n.matmul(&b_n);
-            c.data().data.iter().sum::<f32>()
-        }, &a_data);
+        let num = numerical_grad(
+            &|a| {
+                let a_n = TensorNode::leaf(a.clone());
+                let b_n = TensorNode::leaf(b_data.clone());
+                let c = a_n.matmul(&b_n);
+                c.data().data.iter().sum::<f32>()
+            },
+            &a_data,
+        );
 
         let a = TensorNode::leaf(a_data);
         let b = TensorNode::leaf(b_data);
         let c = a.matmul(&b);
         // Read shape before borrowing mutably
-        let (cr, cc) = { let d = c.data(); (d.rows, d.cols) };
+        let (cr, cc) = {
+            let d = c.data();
+            (d.rows, d.cols)
+        };
         c.0.borrow_mut().grad = Mat::ones(cr, cc);
-        { let inner = c.0.borrow();
-          let fn_ptr = inner.backward_fn.as_ref().map(|f| unsafe { &*(f.as_ref() as *const dyn Fn()) });
-          drop(inner);
-          if let Some(f) = fn_ptr { f(); }
+        {
+            let inner = c.0.borrow();
+            let fn_ptr = inner
+                .backward_fn
+                .as_ref()
+                .map(|f| unsafe { &*(f.as_ref() as *const dyn Fn()) });
+            drop(inner);
+            if let Some(f) = fn_ptr {
+                f();
+            }
         }
 
         let ag = a.grad().clone();
         for r in 0..ag.rows {
             for col in 0..ag.cols {
-                assert!(approx(ag.at(r, col), num.at(r, col)),
-                    "dA[{},{}]: analytical={:.4} numerical={:.4}", r, col, ag.at(r,col), num.at(r,col));
+                assert!(
+                    approx(ag.at(r, col), num.at(r, col)),
+                    "dA[{},{}]: analytical={:.4} numerical={:.4}",
+                    r,
+                    col,
+                    ag.at(r, col),
+                    num.at(r, col)
+                );
             }
         }
     }
 
     #[test]
     fn test_matmul_grad_b() {
-        let a_data = Mat::new(vec![1.,2.,3.,4.,5.,6.], 2, 3);
-        let b_data = Mat::new(vec![0.1,0.2, 0.3,0.4, 0.5,0.6], 3, 2);
+        let a_data = Mat::new(vec![1., 2., 3., 4., 5., 6.], 2, 3);
+        let b_data = Mat::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 3, 2);
 
-        let num = numerical_grad(&|b| {
-            let a_n = TensorNode::leaf(a_data.clone());
-            let b_n = TensorNode::leaf(b.clone());
-            let c = a_n.matmul(&b_n);
-            c.data().data.iter().sum::<f32>()
-        }, &b_data);
+        let num = numerical_grad(
+            &|b| {
+                let a_n = TensorNode::leaf(a_data.clone());
+                let b_n = TensorNode::leaf(b.clone());
+                let c = a_n.matmul(&b_n);
+                c.data().data.iter().sum::<f32>()
+            },
+            &b_data,
+        );
 
         let a = TensorNode::leaf(a_data);
         let b = TensorNode::leaf(b_data);
         let c = a.matmul(&b);
-        let (cr, cc) = { let d = c.data(); (d.rows, d.cols) };
+        let (cr, cc) = {
+            let d = c.data();
+            (d.rows, d.cols)
+        };
         c.0.borrow_mut().grad = Mat::ones(cr, cc);
         call_backward(&c);
 
         let bg = b.grad().clone();
         for r in 0..bg.rows {
             for col in 0..bg.cols {
-                assert!(approx(bg.at(r, col), num.at(r, col)),
-                    "dB[{},{}]: analytical={:.4} numerical={:.4}", r, col, bg.at(r,col), num.at(r,col));
+                assert!(
+                    approx(bg.at(r, col), num.at(r, col)),
+                    "dB[{},{}]: analytical={:.4} numerical={:.4}",
+                    r,
+                    col,
+                    bg.at(r, col),
+                    num.at(r, col)
+                );
             }
         }
     }
 
     #[test]
     fn test_add_bias_grad() {
-        let a_data = Mat::new(vec![1.,2.,3.,4.,5.,6.], 3, 2);
+        let a_data = Mat::new(vec![1., 2., 3., 4., 5., 6.], 3, 2);
         let b_data = Mat::new(vec![0.5, -0.5], 1, 2);
 
-        let num_b = numerical_grad(&|b| {
-            let a_n = TensorNode::leaf(a_data.clone());
-            let b_n = TensorNode::leaf(b.clone());
-            let c = a_n.add_bias(&b_n);
-            c.data().data.iter().sum::<f32>()
-        }, &b_data);
+        let num_b = numerical_grad(
+            &|b| {
+                let a_n = TensorNode::leaf(a_data.clone());
+                let b_n = TensorNode::leaf(b.clone());
+                let c = a_n.add_bias(&b_n);
+                c.data().data.iter().sum::<f32>()
+            },
+            &b_data,
+        );
 
         let a = TensorNode::leaf(a_data);
         let b = TensorNode::leaf(b_data);
         let c = a.add_bias(&b);
-        let (cr, cc) = { let d = c.data(); (d.rows, d.cols) };
+        let (cr, cc) = {
+            let d = c.data();
+            (d.rows, d.cols)
+        };
         c.0.borrow_mut().grad = Mat::ones(cr, cc);
         call_backward(&c);
 
         let bg = b.grad().clone();
         for col in 0..2 {
-            assert!(approx(bg.at(0, col), num_b.at(0, col)),
-                "d_bias[{}]: analytical={:.4} numerical={:.4}", col, bg.at(0,col), num_b.at(0,col));
+            assert!(
+                approx(bg.at(0, col), num_b.at(0, col)),
+                "d_bias[{}]: analytical={:.4} numerical={:.4}",
+                col,
+                bg.at(0, col),
+                num_b.at(0, col)
+            );
         }
     }
 
@@ -2974,11 +3268,14 @@ mod tests {
     fn test_gelu_grad() {
         let x_data = Mat::new(vec![-1.0, 0.0, 0.5, 2.0], 1, 4);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            let g = xn.gelu();
-            g.data().data.iter().sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                let g = xn.gelu();
+                g.data().data.iter().sum::<f32>()
+            },
+            &x_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let g = x.gelu();
@@ -2987,18 +3284,23 @@ mod tests {
 
         let xg = x.grad().clone();
         for c in 0..4 {
-            assert!(approx(xg.at(0,c), num.at(0,c)),
-                "GELU grad[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0,c), num.at(0,c));
+            assert!(
+                approx(xg.at(0, c), num.at(0, c)),
+                "GELU grad[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                xg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
     #[test]
     fn test_softmax_probabilities() {
-        let x = TensorNode::leaf(Mat::new(vec![1.,2.,3., 4.,5.,6.], 2, 3));
+        let x = TensorNode::leaf(Mat::new(vec![1., 2., 3., 4., 5., 6.], 2, 3));
         let s = x.softmax();
         // Each row must sum to 1
         for r in 0..2 {
-            let row_sum: f32 = (0..3).map(|c| s.data().at(r,c)).sum();
+            let row_sum: f32 = (0..3).map(|c| s.data().at(r, c)).sum();
             assert!(approx(row_sum, 1.0), "row {} sum = {}", r, row_sum);
         }
     }
@@ -3007,12 +3309,20 @@ mod tests {
     fn test_softmax_grad() {
         let x_data = Mat::new(vec![1.0, 2.0, 0.5], 1, 3);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            let s = xn.softmax();
-            // Loss = sum(s * weights) with fixed weights to get non-trivial grad
-            s.data().data.iter().enumerate().map(|(i, &v)| v * (i+1) as f32).sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                let s = xn.softmax();
+                // Loss = sum(s * weights) with fixed weights to get non-trivial grad
+                s.data()
+                    .data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| v * (i + 1) as f32)
+                    .sum::<f32>()
+            },
+            &x_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let s = x.softmax();
@@ -3023,34 +3333,46 @@ mod tests {
 
         let xg = x.grad().clone();
         for c in 0..3 {
-            assert!(approx(xg.at(0,c), num.at(0,c)),
-                "softmax grad[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0,c), num.at(0,c));
+            assert!(
+                approx(xg.at(0, c), num.at(0, c)),
+                "softmax grad[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                xg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
     #[test]
     fn test_layer_norm_output_mean_zero() {
-        let x = TensorNode::leaf(Mat::new(vec![1.,2.,3.,4.], 1, 4));
+        let x = TensorNode::leaf(Mat::new(vec![1., 2., 3., 4.], 1, 4));
         let gamma = TensorNode::leaf(Mat::ones(1, 4));
-        let beta  = TensorNode::leaf(Mat::zeros(1, 4));
+        let beta = TensorNode::leaf(Mat::zeros(1, 4));
         let out = x.layer_norm(&gamma, &beta);
         let mean = out.data().data.iter().sum::<f32>() / 4.0;
-        assert!(mean.abs() < 1e-5, "LN output mean should be 0, got {}", mean);
+        assert!(
+            mean.abs() < 1e-5,
+            "LN output mean should be 0, got {}",
+            mean
+        );
     }
 
     #[test]
     fn test_layer_norm_grad_x() {
-        let x_data  = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
-        let g_data  = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
-        let b_data  = Mat::zeros(1, 4);
+        let x_data = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
+        let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
+        let b_data = Mat::zeros(1, 4);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            let gn = TensorNode::leaf(g_data.clone());
-            let bn = TensorNode::leaf(b_data.clone());
-            let out = xn.layer_norm(&gn, &bn);
-            out.data().data.iter().sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                let gn = TensorNode::leaf(g_data.clone());
+                let bn = TensorNode::leaf(b_data.clone());
+                let out = xn.layer_norm(&gn, &bn);
+                out.data().data.iter().sum::<f32>()
+            },
+            &x_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let g = TensorNode::leaf(g_data);
@@ -3061,8 +3383,13 @@ mod tests {
 
         let xg = x.grad().clone();
         for c in 0..4 {
-            assert!(approx(xg.at(0,c), num.at(0,c)),
-                "LN dX[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0,c), num.at(0,c));
+            assert!(
+                approx(xg.at(0, c), num.at(0, c)),
+                "LN dX[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                xg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
@@ -3072,13 +3399,16 @@ mod tests {
         let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
         let b_data = Mat::zeros(1, 4);
 
-        let num = numerical_grad(&|g| {
-            let xn = TensorNode::leaf(x_data.clone());
-            let gn = TensorNode::leaf(g.clone());
-            let bn = TensorNode::leaf(b_data.clone());
-            let out = xn.layer_norm(&gn, &bn);
-            out.data().data.iter().sum::<f32>()
-        }, &g_data);
+        let num = numerical_grad(
+            &|g| {
+                let xn = TensorNode::leaf(x_data.clone());
+                let gn = TensorNode::leaf(g.clone());
+                let bn = TensorNode::leaf(b_data.clone());
+                let out = xn.layer_norm(&gn, &bn);
+                out.data().data.iter().sum::<f32>()
+            },
+            &g_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let g = TensorNode::leaf(g_data);
@@ -3089,14 +3419,20 @@ mod tests {
 
         let gg = g.grad().clone();
         for c in 0..4 {
-            assert!(approx(gg.at(0,c), num.at(0,c)),
-                "LN d_gamma[{}]: analytical={:.4} numerical={:.4}", c, gg.at(0,c), num.at(0,c));
+            assert!(
+                approx(gg.at(0, c), num.at(0, c)),
+                "LN d_gamma[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                gg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
     #[test]
     fn test_causal_attention_output_shape() {
-        let t = 4; let d = 8;
+        let t = 4;
+        let d = 8;
         let q = TensorNode::leaf(Mat::zeros(t, d));
         let k = TensorNode::leaf(Mat::zeros(t, d));
         let v = TensorNode::leaf(Mat::zeros(t, d));
@@ -3106,18 +3442,22 @@ mod tests {
 
     #[test]
     fn test_causal_attention_grad_v() {
-        let t = 3; let d = 4;
-        let q_data = Mat::from_fn(t, d, |r,c| (r*d+c) as f32 * 0.1);
-        let k_data = Mat::from_fn(t, d, |r,c| (r*d+c) as f32 * 0.05);
-        let v_data = Mat::from_fn(t, d, |r,c| (r*d+c) as f32 * 0.07);
+        let t = 3;
+        let d = 4;
+        let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1);
+        let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05);
+        let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
 
-        let num = numerical_grad(&|v| {
-            let qn = TensorNode::leaf(q_data.clone());
-            let kn = TensorNode::leaf(k_data.clone());
-            let vn = TensorNode::leaf(v.clone());
-            let out = TensorNode::causal_attention(&qn, &kn, &vn, d);
-            out.data().data.iter().sum::<f32>()
-        }, &v_data);
+        let num = numerical_grad(
+            &|v| {
+                let qn = TensorNode::leaf(q_data.clone());
+                let kn = TensorNode::leaf(k_data.clone());
+                let vn = TensorNode::leaf(v.clone());
+                let out = TensorNode::causal_attention(&qn, &kn, &vn, d);
+                out.data().data.iter().sum::<f32>()
+            },
+            &v_data,
+        );
 
         let q = TensorNode::leaf(q_data);
         let k = TensorNode::leaf(k_data);
@@ -3127,17 +3467,26 @@ mod tests {
         call_backward(&out);
 
         let vg = v.grad().clone();
-        for r in 0..t { for c in 0..d {
-            assert!(approx(vg.at(r,c), num.at(r,c)),
-                "attn dV[{},{}]: analytical={:.4} numerical={:.4}", r, c, vg.at(r,c), num.at(r,c));
-        }}
+        for r in 0..t {
+            for c in 0..d {
+                assert!(
+                    approx(vg.at(r, c), num.at(r, c)),
+                    "attn dV[{},{}]: analytical={:.4} numerical={:.4}",
+                    r,
+                    c,
+                    vg.at(r, c),
+                    num.at(r, c)
+                );
+            }
+        }
     }
 
     // --- Flash Attention ---
 
     #[test]
     fn test_flash_attention_output_shape() {
-        let t = 5; let d = 8;
+        let t = 5;
+        let d = 8;
         let q = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1));
         let k = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05));
         let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07));
@@ -3148,7 +3497,8 @@ mod tests {
     #[test]
     fn test_flash_attention_matches_causal_attention() {
         // Flash and standard attention must produce identical outputs.
-        let t = 8; let d = 16;
+        let t = 8;
+        let d = 16;
         let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 - 0.5);
         let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05 + 0.1);
         let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07 - 0.2);
@@ -3165,52 +3515,75 @@ mod tests {
 
         let r = ref_out.data().clone();
         let f = flash_out.data().clone();
-        for row in 0..t { for col in 0..d {
-            let diff = (r.at(row, col) - f.at(row, col)).abs();
-            assert!(diff < 1e-4,
-                "flash vs causal [{row},{col}]: flash={:.5} ref={:.5}", f.at(row,col), r.at(row,col));
-        }}
+        for row in 0..t {
+            for col in 0..d {
+                let diff = (r.at(row, col) - f.at(row, col)).abs();
+                assert!(
+                    diff < 1e-4,
+                    "flash vs causal [{row},{col}]: flash={:.5} ref={:.5}",
+                    f.at(row, col),
+                    r.at(row, col)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_flash_attention_causal_first_token() {
         // Token 0 can only attend to itself — output must equal v[0] exactly.
-        let t = 4; let d = 4;
+        let t = 4;
+        let d = 4;
         let q = TensorNode::leaf(Mat::from_fn(t, d, |_, _| 1.0));
         let k = TensorNode::leaf(Mat::from_fn(t, d, |_, _| 1.0));
         let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| (r * d + c) as f32));
         let out = TensorNode::flash_attention(&q, &k, &v, d);
         // Row 0: softmax over only position 0 → weight=1 → output = v[0]
         for c in 0..d {
-            assert!((out.data().at(0, c) - v.data().at(0, c)).abs() < 1e-4,
-                "flash first token col {c}: got {} expected {}", out.data().at(0,c), v.data().at(0,c));
+            assert!(
+                (out.data().at(0, c) - v.data().at(0, c)).abs() < 1e-4,
+                "flash first token col {c}: got {} expected {}",
+                out.data().at(0, c),
+                v.data().at(0, c)
+            );
         }
     }
 
     #[test]
     fn test_flash_attention_output_finite() {
-        let t = 16; let d = 32;
+        let t = 16;
+        let d = 32;
         let q = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r + c) as f32) * 0.01));
         let k = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r * d + c) as f32) * 0.01 - 0.5));
         let v = TensorNode::leaf(Mat::from_fn(t, d, |r, c| ((r + c) as f32) * 0.02));
         let out = TensorNode::flash_attention(&q, &k, &v, d);
-        assert!(out.data().data.iter().all(|x| x.is_finite()), "flash output has NaN/Inf");
+        assert!(
+            out.data().data.iter().all(|x| x.is_finite()),
+            "flash output has NaN/Inf"
+        );
     }
 
     #[test]
     fn test_flash_attention_grad_v() {
         // Numerical gradient check for dV
-        let t = 4; let d = 4;
+        let t = 4;
+        let d = 4;
         let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1);
         let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05);
         let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
 
-        let num = numerical_grad(&|v| {
-            let qn = TensorNode::leaf(q_data.clone());
-            let kn = TensorNode::leaf(k_data.clone());
-            let vn = TensorNode::leaf(v.clone());
-            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
-        }, &v_data);
+        let num = numerical_grad(
+            &|v| {
+                let qn = TensorNode::leaf(q_data.clone());
+                let kn = TensorNode::leaf(k_data.clone());
+                let vn = TensorNode::leaf(v.clone());
+                TensorNode::flash_attention(&qn, &kn, &vn, d)
+                    .data()
+                    .data
+                    .iter()
+                    .sum::<f32>()
+            },
+            &v_data,
+        );
 
         let q = TensorNode::leaf(q_data);
         let k = TensorNode::leaf(k_data);
@@ -3220,25 +3593,39 @@ mod tests {
         call_backward(&out);
 
         let vg = v.grad().clone();
-        for r in 0..t { for c in 0..d {
-            assert!(approx(vg.at(r,c), num.at(r,c)),
-                "flash dV[{r},{c}]: analytical={:.4} numerical={:.4}", vg.at(r,c), num.at(r,c));
-        }}
+        for r in 0..t {
+            for c in 0..d {
+                assert!(
+                    approx(vg.at(r, c), num.at(r, c)),
+                    "flash dV[{r},{c}]: analytical={:.4} numerical={:.4}",
+                    vg.at(r, c),
+                    num.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_flash_attention_grad_q() {
-        let t = 4; let d = 4;
+        let t = 4;
+        let d = 4;
         let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 + 0.1);
         let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05);
         let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
 
-        let num = numerical_grad(&|q| {
-            let qn = TensorNode::leaf(q.clone());
-            let kn = TensorNode::leaf(k_data.clone());
-            let vn = TensorNode::leaf(v_data.clone());
-            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
-        }, &q_data);
+        let num = numerical_grad(
+            &|q| {
+                let qn = TensorNode::leaf(q.clone());
+                let kn = TensorNode::leaf(k_data.clone());
+                let vn = TensorNode::leaf(v_data.clone());
+                TensorNode::flash_attention(&qn, &kn, &vn, d)
+                    .data()
+                    .data
+                    .iter()
+                    .sum::<f32>()
+            },
+            &q_data,
+        );
 
         let q = TensorNode::leaf(q_data);
         let k = TensorNode::leaf(k_data);
@@ -3248,25 +3635,39 @@ mod tests {
         call_backward(&out);
 
         let qg = q.grad().clone();
-        for r in 0..t { for c in 0..d {
-            assert!(approx(qg.at(r,c), num.at(r,c)),
-                "flash dQ[{r},{c}]: analytical={:.4} numerical={:.4}", qg.at(r,c), num.at(r,c));
-        }}
+        for r in 0..t {
+            for c in 0..d {
+                assert!(
+                    approx(qg.at(r, c), num.at(r, c)),
+                    "flash dQ[{r},{c}]: analytical={:.4} numerical={:.4}",
+                    qg.at(r, c),
+                    num.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_flash_attention_grad_k() {
-        let t = 4; let d = 4;
+        let t = 4;
+        let d = 4;
         let q_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.1 + 0.1);
         let k_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.05 + 0.05);
         let v_data = Mat::from_fn(t, d, |r, c| (r * d + c) as f32 * 0.07);
 
-        let num = numerical_grad(&|k| {
-            let qn = TensorNode::leaf(q_data.clone());
-            let kn = TensorNode::leaf(k.clone());
-            let vn = TensorNode::leaf(v_data.clone());
-            TensorNode::flash_attention(&qn, &kn, &vn, d).data().data.iter().sum::<f32>()
-        }, &k_data);
+        let num = numerical_grad(
+            &|k| {
+                let qn = TensorNode::leaf(q_data.clone());
+                let kn = TensorNode::leaf(k.clone());
+                let vn = TensorNode::leaf(v_data.clone());
+                TensorNode::flash_attention(&qn, &kn, &vn, d)
+                    .data()
+                    .data
+                    .iter()
+                    .sum::<f32>()
+            },
+            &k_data,
+        );
 
         let q = TensorNode::leaf(q_data);
         let k = TensorNode::leaf(k_data);
@@ -3276,16 +3677,23 @@ mod tests {
         call_backward(&out);
 
         let kg = k.grad().clone();
-        for r in 0..t { for c in 0..d {
-            assert!(approx(kg.at(r,c), num.at(r,c)),
-                "flash dK[{r},{c}]: analytical={:.4} numerical={:.4}", kg.at(r,c), num.at(r,c));
-        }}
+        for r in 0..t {
+            for c in 0..d {
+                assert!(
+                    approx(kg.at(r, c), num.at(r, c)),
+                    "flash dK[{r},{c}]: analytical={:.4} numerical={:.4}",
+                    kg.at(r, c),
+                    num.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_flash_attention_large_t_matches_causal() {
         // T=128 (> BLOCK_SIZE=64) — tests multi-tile correctness
-        let t = 128; let d = 16;
+        let t = 128;
+        let d = 16;
         let q_data = Mat::from_fn(t, d, |r, c| ((r * d + c) as f32 * 0.01).sin());
         let k_data = Mat::from_fn(t, d, |r, c| ((r * d + c) as f32 * 0.01).cos());
         let v_data = Mat::from_fn(t, d, |r, c| (r as f32 * 0.1 - c as f32 * 0.05));
@@ -3302,12 +3710,17 @@ mod tests {
 
         let r = ref_out.data().clone();
         let f = flash_out.data().clone();
-        for row in 0..t { for col in 0..d {
-            let diff = (r.at(row, col) - f.at(row, col)).abs();
-            assert!(diff < 1e-3,
-                "large T flash vs causal [{row},{col}]: flash={:.5} ref={:.5}",
-                f.at(row,col), r.at(row,col));
-        }}
+        for row in 0..t {
+            for col in 0..d {
+                let diff = (r.at(row, col) - f.at(row, col)).abs();
+                assert!(
+                    diff < 1e-3,
+                    "large T flash vs causal [{row},{col}]: flash={:.5} ref={:.5}",
+                    f.at(row, col),
+                    r.at(row, col)
+                );
+            }
+        }
     }
 
     // --- RMSNorm backward ---
@@ -3317,12 +3730,15 @@ mod tests {
         let x_data = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
         let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            let gn = TensorNode::leaf(g_data.clone());
-            let out = xn.rms_norm(&gn, 1e-5);
-            out.data().data.iter().sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                let gn = TensorNode::leaf(g_data.clone());
+                let out = xn.rms_norm(&gn, 1e-5);
+                out.data().data.iter().sum::<f32>()
+            },
+            &x_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let g = TensorNode::leaf(g_data);
@@ -3332,8 +3748,13 @@ mod tests {
 
         let xg = x.grad().clone();
         for c in 0..4 {
-            assert!(approx(xg.at(0, c), num.at(0, c)),
-                "RMSNorm dX[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0, c), num.at(0, c));
+            assert!(
+                approx(xg.at(0, c), num.at(0, c)),
+                "RMSNorm dX[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                xg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
@@ -3342,12 +3763,15 @@ mod tests {
         let x_data = Mat::new(vec![0.5, -0.3, 1.2, -0.8], 1, 4);
         let g_data = Mat::new(vec![1.0, 0.8, 1.2, 0.9], 1, 4);
 
-        let num = numerical_grad(&|g| {
-            let xn = TensorNode::leaf(x_data.clone());
-            let gn = TensorNode::leaf(g.clone());
-            let out = xn.rms_norm(&gn, 1e-5);
-            out.data().data.iter().sum::<f32>()
-        }, &g_data);
+        let num = numerical_grad(
+            &|g| {
+                let xn = TensorNode::leaf(x_data.clone());
+                let gn = TensorNode::leaf(g.clone());
+                let out = xn.rms_norm(&gn, 1e-5);
+                out.data().data.iter().sum::<f32>()
+            },
+            &g_data,
+        );
 
         let x = TensorNode::leaf(x_data);
         let g = TensorNode::leaf(g_data);
@@ -3357,8 +3781,13 @@ mod tests {
 
         let gg = g.grad().clone();
         for c in 0..4 {
-            assert!(approx(gg.at(0, c), num.at(0, c)),
-                "RMSNorm dGamma[{}]: analytical={:.4} numerical={:.4}", c, gg.at(0, c), num.at(0, c));
+            assert!(
+                approx(gg.at(0, c), num.at(0, c)),
+                "RMSNorm dGamma[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                gg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
@@ -3368,20 +3797,28 @@ mod tests {
     fn test_silu_grad() {
         let x_data = Mat::new(vec![-1.0, 0.0, 0.5, 2.0], 1, 4);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            xn.silu().data().data.iter().sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                xn.silu().data().data.iter().sum::<f32>()
+            },
+            &x_data,
+        );
 
-        let x   = TensorNode::leaf(x_data);
+        let x = TensorNode::leaf(x_data);
         let out = x.silu();
         out.0.borrow_mut().grad = Mat::ones(1, 4);
         call_backward(&out);
 
         let xg = x.grad().clone();
         for c in 0..4 {
-            assert!(approx(xg.at(0, c), num.at(0, c)),
-                "SiLU grad[{}]: analytical={:.4} numerical={:.4}", c, xg.at(0, c), num.at(0, c));
+            assert!(
+                approx(xg.at(0, c), num.at(0, c)),
+                "SiLU grad[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                xg.at(0, c),
+                num.at(0, c)
+            );
         }
     }
 
@@ -3392,22 +3829,30 @@ mod tests {
         let a_data = Mat::new(vec![1.0, 2.0, 0.5, -1.0], 1, 4);
         let b_data = Mat::new(vec![0.3, -0.5, 1.2, 0.8], 1, 4);
 
-        let num_a = numerical_grad(&|a| {
-            let an = TensorNode::leaf(a.clone());
-            let bn = TensorNode::leaf(b_data.clone());
-            an.mul_elem_node(&bn).data().data.iter().sum::<f32>()
-        }, &a_data);
+        let num_a = numerical_grad(
+            &|a| {
+                let an = TensorNode::leaf(a.clone());
+                let bn = TensorNode::leaf(b_data.clone());
+                an.mul_elem_node(&bn).data().data.iter().sum::<f32>()
+            },
+            &a_data,
+        );
 
-        let a   = TensorNode::leaf(a_data);
-        let b   = TensorNode::leaf(b_data);
+        let a = TensorNode::leaf(a_data);
+        let b = TensorNode::leaf(b_data);
         let out = a.mul_elem_node(&b);
         out.0.borrow_mut().grad = Mat::ones(1, 4);
         call_backward(&out);
 
         let ag = a.grad().clone();
         for c in 0..4 {
-            assert!(approx(ag.at(0, c), num_a.at(0, c)),
-                "mul_elem dA[{}]: analytical={:.4} numerical={:.4}", c, ag.at(0, c), num_a.at(0, c));
+            assert!(
+                approx(ag.at(0, c), num_a.at(0, c)),
+                "mul_elem dA[{}]: analytical={:.4} numerical={:.4}",
+                c,
+                ag.at(0, c),
+                num_a.at(0, c)
+            );
         }
     }
 
@@ -3420,65 +3865,102 @@ mod tests {
         let tol = 5e-3f32;
         let x_data = Mat::from_fn(3, 8, |r, c| (r * 8 + c) as f32 * 0.1 + 0.1);
 
-        let num = numerical_grad(&|x| {
-            let xn = TensorNode::leaf(x.clone());
-            xn.rope_apply(0, 10000.0).data().data.iter().sum::<f32>()
-        }, &x_data);
+        let num = numerical_grad(
+            &|x| {
+                let xn = TensorNode::leaf(x.clone());
+                xn.rope_apply(0, 10000.0).data().data.iter().sum::<f32>()
+            },
+            &x_data,
+        );
 
-        let x   = TensorNode::leaf(x_data);
+        let x = TensorNode::leaf(x_data);
         let out = x.rope_apply(0, 10000.0);
-        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        let (r, c) = {
+            let d = out.data();
+            (d.rows, d.cols)
+        };
         out.0.borrow_mut().grad = Mat::ones(r, c);
         call_backward(&out);
 
         let xg = x.grad().clone();
-        for row in 0..3 { for col in 0..8 {
-            assert!((xg.at(row, col) - num.at(row, col)).abs() < tol,
-                "RoPE dX[{},{}]: analytical={:.4} numerical={:.4}",
-                row, col, xg.at(row, col), num.at(row, col));
-        }}
+        for row in 0..3 {
+            for col in 0..8 {
+                assert!(
+                    (xg.at(row, col) - num.at(row, col)).abs() < tol,
+                    "RoPE dX[{},{}]: analytical={:.4} numerical={:.4}",
+                    row,
+                    col,
+                    xg.at(row, col),
+                    num.at(row, col)
+                );
+            }
+        }
     }
 
     // --- GQA backward ---
 
     #[test]
     fn test_gqa_grad_q() {
-        let t = 3; let n_q = 4; let n_kv = 2; let dh = 4;
+        let t = 3;
+        let n_q = 4;
+        let n_kv = 2;
+        let dh = 4;
         let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
-        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
-        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05
+        });
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02
+        });
 
-        let num = numerical_grad(&|q| {
-            let qn = TensorNode::leaf(q.clone());
-            let kn = TensorNode::leaf(k_data.clone());
-            let vn = TensorNode::leaf(v_data.clone());
-            TensorNode::gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh).data().data.iter().sum::<f32>()
-        }, &q_data);
+        let num = numerical_grad(
+            &|q| {
+                let qn = TensorNode::leaf(q.clone());
+                let kn = TensorNode::leaf(k_data.clone());
+                let vn = TensorNode::leaf(v_data.clone());
+                TensorNode::gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh)
+                    .data()
+                    .data
+                    .iter()
+                    .sum::<f32>()
+            },
+            &q_data,
+        );
 
-        let q   = TensorNode::leaf(q_data);
-        let k   = TensorNode::leaf(k_data);
-        let v   = TensorNode::leaf(v_data);
+        let q = TensorNode::leaf(q_data);
+        let k = TensorNode::leaf(k_data);
+        let v = TensorNode::leaf(v_data);
         let out = TensorNode::gqa_attention(&q, &k, &v, n_q, n_kv, dh);
-        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        let (r, c) = {
+            let d = out.data();
+            (d.rows, d.cols)
+        };
         out.0.borrow_mut().grad = Mat::ones(r, c);
         call_backward(&out);
 
         let qg = q.grad().clone();
-        for row in 0..t { for col in 0..(n_q * dh) {
-            assert!(approx(qg.at(row, col), num.at(row, col)),
-                "GQA dQ[{},{}]: analytical={:.4} numerical={:.4}",
-                row, col, qg.at(row, col), num.at(row, col));
-        }}
+        for row in 0..t {
+            for col in 0..(n_q * dh) {
+                assert!(
+                    approx(qg.at(row, col), num.at(row, col)),
+                    "GQA dQ[{},{}]: analytical={:.4} numerical={:.4}",
+                    row,
+                    col,
+                    qg.at(row, col),
+                    num.at(row, col)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_full_backward_via_backward_method() {
         // Build a small compute graph and call .backward() end-to-end.
         // We add a sum-to-scalar node so backward() can be called directly.
-        let a = TensorNode::leaf(Mat::new(vec![1.,2.,3.,4.], 2, 2));
-        let b = TensorNode::leaf(Mat::new(vec![0.5,0.5,0.5,0.5], 2, 2));
-        let c = a.matmul(&b);    // [2,2]
-        let g = c.gelu();        // [2,2]
+        let a = TensorNode::leaf(Mat::new(vec![1., 2., 3., 4.], 2, 2));
+        let b = TensorNode::leaf(Mat::new(vec![0.5, 0.5, 0.5, 0.5], 2, 2));
+        let c = a.matmul(&b); // [2,2]
+        let g = c.gelu(); // [2,2]
 
         // Reduce to scalar: loss = sum(g) implemented as sum node
         let sum_val = g.data().sum();
@@ -3495,15 +3977,23 @@ mod tests {
 
         // a.grad should be finite and non-zero
         let ag = a.grad().clone();
-        assert!(ag.data.iter().all(|x| x.is_finite()), "gradient should be finite");
-        assert!(ag.data.iter().any(|x| x.abs() > 1e-6), "gradient should be non-zero");
+        assert!(
+            ag.data.iter().all(|x| x.is_finite()),
+            "gradient should be finite"
+        );
+        assert!(
+            ag.data.iter().any(|x| x.abs() > 1e-6),
+            "gradient should be non-zero"
+        );
     }
 
     // --- Parallel matmul ---
 
     #[test]
     fn test_matmul_parallel_matches_sequential() {
-        let m = 32; let k = 64; let n = 48;
+        let m = 32;
+        let k = 64;
+        let n = 48;
         let a = Mat::from_fn(m, k, |r, c| (r * k + c) as f32 * 0.01 - 0.5);
         let b = Mat::from_fn(k, n, |r, c| (r * n + c) as f32 * 0.02 - 0.3);
 
@@ -3513,10 +4003,20 @@ mod tests {
         let par = a.matmul_parallel(&b, 4);
 
         assert_eq!((par.rows, par.cols), (seq.rows, seq.cols));
-        for r in 0..m { for c in 0..n {
-            assert!((par.at(r, c) - seq.at(r, c)).abs() < 1e-4,
-                "par[{},{}]={} seq[{},{}]={}", r, c, par.at(r,c), r, c, seq.at(r,c));
-        }}
+        for r in 0..m {
+            for c in 0..n {
+                assert!(
+                    (par.at(r, c) - seq.at(r, c)).abs() < 1e-4,
+                    "par[{},{}]={} seq[{},{}]={}",
+                    r,
+                    c,
+                    par.at(r, c),
+                    r,
+                    c,
+                    seq.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3525,9 +4025,11 @@ mod tests {
         let b = Mat::from_fn(4, 2, |r, c| (r * 2 + c) as f32);
         let seq = a.matmul(&b);
         let par = a.matmul_parallel(&b, 1);
-        for r in 0..3 { for c in 0..2 {
-            assert!((par.at(r, c) - seq.at(r, c)).abs() < 1e-5);
-        }}
+        for r in 0..3 {
+            for c in 0..2 {
+                assert!((par.at(r, c) - seq.at(r, c)).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
@@ -3536,10 +4038,20 @@ mod tests {
         let b = Mat::from_fn(8, 16, |r, c| (r * 16 + c) as f32 * 0.1);
         let seq = a.matmul(&b);
         let par = a.matmul_parallel(&b, 0); // 0 = auto-detect thread count
-        for r in 0..16 { for c in 0..16 {
-            assert!((par.at(r, c) - seq.at(r, c)).abs() < 1e-3,
-                "auto-thread: par[{},{}]={:.4} seq[{},{}]={:.4}", r,c,par.at(r,c),r,c,seq.at(r,c));
-        }}
+        for r in 0..16 {
+            for c in 0..16 {
+                assert!(
+                    (par.at(r, c) - seq.at(r, c)).abs() < 1e-3,
+                    "auto-thread: par[{},{}]={:.4} seq[{},{}]={:.4}",
+                    r,
+                    c,
+                    par.at(r, c),
+                    r,
+                    c,
+                    seq.at(r, c)
+                );
+            }
+        }
     }
 
     // --- Q4 quantization ---
@@ -3550,10 +4062,18 @@ mod tests {
         let q = Q4Mat::quantize(&m);
         let m2 = q.dequantize();
         assert_eq!((m2.rows, m2.cols), (4, 8));
-        for r in 0..4 { for c in 0..8 {
-            assert!((m2.at(r, c) - m.at(r, c)).abs() < 0.15,
-                "q4 round-trip error at [{},{}]: {} vs {}", r, c, m2.at(r,c), m.at(r,c));
-        }}
+        for r in 0..4 {
+            for c in 0..8 {
+                assert!(
+                    (m2.at(r, c) - m.at(r, c)).abs() < 0.15,
+                    "q4 round-trip error at [{},{}]: {} vs {}",
+                    r,
+                    c,
+                    m2.at(r, c),
+                    m.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3569,7 +4089,10 @@ mod tests {
         let m = Mat::zeros(4, 8);
         let q = Q4Mat::quantize(&m);
         let m2 = q.dequantize();
-        assert!(m2.data.iter().all(|&v| v == 0.0), "zeros should stay zero after Q4");
+        assert!(
+            m2.data.iter().all(|&v| v == 0.0),
+            "zeros should stay zero after Q4"
+        );
     }
 
     #[test]
@@ -3578,15 +4101,26 @@ mod tests {
         let w = Mat::from_fn(4, 8, |r, c| (r * 8 + c) as f32 * 0.03 - 0.2);
         let q = Q4Mat::quantize(&w);
 
-        let w_approx  = q.dequantize();
-        let ref_out   = a.matmul(&w_approx.transpose());
+        let w_approx = q.dequantize();
+        let ref_out = a.matmul(&w_approx.transpose());
         let fused_out = q.matmul_q4_t(&a);
 
-        assert_eq!((fused_out.rows, fused_out.cols), (ref_out.rows, ref_out.cols));
-        for r in 0..ref_out.rows { for c in 0..ref_out.cols {
-            assert!((fused_out.at(r, c) - ref_out.at(r, c)).abs() < 1e-4,
-                "q4 matmul [{},{}]: fused={:.5} ref={:.5}", r, c, fused_out.at(r,c), ref_out.at(r,c));
-        }}
+        assert_eq!(
+            (fused_out.rows, fused_out.cols),
+            (ref_out.rows, ref_out.cols)
+        );
+        for r in 0..ref_out.rows {
+            for c in 0..ref_out.cols {
+                assert!(
+                    (fused_out.at(r, c) - ref_out.at(r, c)).abs() < 1e-4,
+                    "q4 matmul [{},{}]: fused={:.5} ref={:.5}",
+                    r,
+                    c,
+                    fused_out.at(r, c),
+                    ref_out.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3595,8 +4129,13 @@ mod tests {
         let q = Q4Mat::quantize(&m);
         let m2 = q.dequantize();
         for c in 0..10 {
-            assert!((m2.at(0, c) - m.at(0, c)).abs() < 0.15,
-                "small Q4: error at col {}: {} vs {}", c, m2.at(0,c), m.at(0,c));
+            assert!(
+                (m2.at(0, c) - m.at(0, c)).abs() < 0.15,
+                "small Q4: error at col {}: {} vs {}",
+                c,
+                m2.at(0, c),
+                m.at(0, c)
+            );
         }
     }
 
@@ -3609,8 +4148,13 @@ mod tests {
         for v in [0.0f32, 1.0, -1.0, 2.0, 0.5, 16.0, -8.0, 0.125] {
             let bits = MatBf16::f32_to_bf16(v);
             let back = MatBf16::bf16_to_f32(bits);
-            assert!((back - v).abs() < 1e-2,
-                "bf16 roundtrip: {} → bits={:#06x} → {}", v, bits, back);
+            assert!(
+                (back - v).abs() < 1e-2,
+                "bf16 roundtrip: {} → bits={:#06x} → {}",
+                v,
+                bits,
+                back
+            );
         }
     }
 
@@ -3619,8 +4163,7 @@ mod tests {
         let v = 3.14159f32;
         let bits = MatBf16::f32_to_bf16(v);
         let back = MatBf16::bf16_to_f32(bits);
-        assert!((back - v).abs() < 0.01,
-            "bf16 precision: {} → {}", v, back);
+        assert!((back - v).abs() < 0.01, "bf16 precision: {} → {}", v, back);
     }
 
     #[test]
@@ -3637,10 +4180,18 @@ mod tests {
         let bf = m.to_bf16();
         let back = bf.to_f32();
         assert_eq!((back.rows, back.cols), (m.rows, m.cols));
-        for r in 0..m.rows { for c in 0..m.cols {
-            assert!((back.at(r, c) - m.at(r, c)).abs() < 0.05,
-                "bf16 Mat roundtrip [{},{}]: {} → {}", r, c, m.at(r,c), back.at(r,c));
-        }}
+        for r in 0..m.rows {
+            for c in 0..m.cols {
+                assert!(
+                    (back.at(r, c) - m.at(r, c)).abs() < 0.05,
+                    "bf16 Mat roundtrip [{},{}]: {} → {}",
+                    r,
+                    c,
+                    m.at(r, c),
+                    back.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3654,9 +4205,16 @@ mod tests {
         let m = Mat::from_bf16_bytes(&bytes, 2, 2);
         assert_eq!((m.rows, m.cols), (2, 2));
         for (i, &v) in values.iter().enumerate() {
-            let r = i / 2; let c = i % 2;
-            assert!((m.at(r, c) - v).abs() < 0.01,
-                "from_bf16_bytes [{},{}]: expected {} got {}", r, c, v, m.at(r,c));
+            let r = i / 2;
+            let c = i % 2;
+            assert!(
+                (m.at(r, c) - v).abs() < 0.01,
+                "from_bf16_bytes [{},{}]: expected {} got {}",
+                r,
+                c,
+                v,
+                m.at(r, c)
+            );
         }
     }
 
@@ -3692,10 +4250,16 @@ mod tests {
         let out_ref = x.matmul(&w);
         let od = out_chk.data();
         let rd = out_ref.data();
-        for r in 0..4 { for c in 0..4 {
-            assert!((od.at(r,c) - rd.at(r,c)).abs() < 1e-5,
-                "checkpoint output mismatch [{},{}]", r, c);
-        }}
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!(
+                    (od.at(r, c) - rd.at(r, c)).abs() < 1e-5,
+                    "checkpoint output mismatch [{},{}]",
+                    r,
+                    c
+                );
+            }
+        }
     }
 
     #[test]
@@ -3711,15 +4275,20 @@ mod tests {
         let sum_val: f32 = out.data().data.iter().sum();
         let loss = TensorNode::leaf(Mat::new(vec![sum_val], 1, 1));
         let out_c = out.clone();
-        loss.set_backward(Box::new(move || {
-            let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
-            out_c.set_grad(ones);
-            out_c.call_backward_fn();
-        }), vec![out]);
+        loss.set_backward(
+            Box::new(move || {
+                let ones = Mat::ones(out_c.data().rows, out_c.data().cols);
+                out_c.set_grad(ones);
+                out_c.call_backward_fn();
+            }),
+            vec![out],
+        );
         loss.backward();
         let gx = x.grad();
-        assert!(gx.data.iter().any(|&v| v.abs() > 1e-6),
-            "expected non-zero gradient through checkpoint");
+        assert!(
+            gx.data.iter().any(|&v| v.abs() > 1e-6),
+            "expected non-zero gradient through checkpoint"
+        );
     }
 
     #[test]
@@ -3732,8 +4301,11 @@ mod tests {
             t1.gelu()
         });
         let out = chk.forward(&x);
-        assert_eq!(out.0.borrow().prev.len(), 1,
-            "checkpointed output should have exactly 1 prev");
+        assert_eq!(
+            out.0.borrow().prev.len(),
+            1,
+            "checkpointed output should have exactly 1 prev"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -3756,15 +4328,22 @@ mod tests {
         let q = Q8Mat::quantize(&m);
         let back = q.dequantize();
         assert_eq!((back.rows, back.cols), (m.rows, m.cols));
-        for r in 0..m.rows { for c in 0..m.cols {
-            let err = (back.at(r, c) - m.at(r, c)).abs();
-            // Q8 max error = absmax/254 per block
-            let absmax = m.data.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
-            let max_err = absmax / 254.0 + 1e-5;
-            assert!(err <= max_err,
-                "Q8 roundtrip [{r},{c}]: orig={} deq={} err={:.4} max={:.4}",
-                m.at(r,c), back.at(r,c), err, max_err);
-        }}
+        for r in 0..m.rows {
+            for c in 0..m.cols {
+                let err = (back.at(r, c) - m.at(r, c)).abs();
+                // Q8 max error = absmax/254 per block
+                let absmax = m.data.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
+                let max_err = absmax / 254.0 + 1e-5;
+                assert!(
+                    err <= max_err,
+                    "Q8 roundtrip [{r},{c}]: orig={} deq={} err={:.4} max={:.4}",
+                    m.at(r, c),
+                    back.at(r, c),
+                    err,
+                    max_err
+                );
+            }
+        }
     }
 
     #[test]
@@ -3772,8 +4351,12 @@ mod tests {
         let m = Mat::from_fn(32, 64, |r, c| (r * 64 + c) as f32 * 0.01);
         let q = Q8Mat::quantize(&m);
         let f32_bytes = 32 * 64 * 4;
-        assert!(q.size_bytes() < f32_bytes,
-            "Q8 must use less memory than f32: {} vs {}", q.size_bytes(), f32_bytes);
+        assert!(
+            q.size_bytes() < f32_bytes,
+            "Q8 must use less memory than f32: {} vs {}",
+            q.size_bytes(),
+            f32_bytes
+        );
     }
 
     #[test]
@@ -3783,8 +4366,11 @@ mod tests {
         // f32: 2048 * 4 = 8192 bytes → ratio ≈ 3.77
         let m = Mat::from_fn(32, 64, |_, _| 1.0);
         let q = Q8Mat::quantize(&m);
-        assert!(q.compression_ratio() > 2.0,
-            "Q8 should compress by at least 2×, got {:.2}×", q.compression_ratio());
+        assert!(
+            q.compression_ratio() > 2.0,
+            "Q8 should compress by at least 2×, got {:.2}×",
+            q.compression_ratio()
+        );
     }
 
     #[test]
@@ -3794,16 +4380,22 @@ mod tests {
         let b = Mat::from_fn(4, 8, |r, c| (r * 8 + c) as f32 * 0.05 - 0.5);
         let q = Q8Mat::quantize(&b);
 
-        let exact  = a.matmul(&b.transpose());
+        let exact = a.matmul(&b.transpose());
         let approx = q.matmul_q8_t(&a);
 
         assert_eq!((approx.rows, approx.cols), (3, 4));
-        for r in 0..3 { for c in 0..4 {
-            let err = (approx.at(r, c) - exact.at(r, c)).abs();
-            assert!(err < 0.1,
-                "Q8 matmul [{r},{c}]: exact={:.4} approx={:.4} err={:.4}",
-                exact.at(r,c), approx.at(r,c), err);
-        }}
+        for r in 0..3 {
+            for c in 0..4 {
+                let err = (approx.at(r, c) - exact.at(r, c)).abs();
+                assert!(
+                    err < 0.1,
+                    "Q8 matmul [{r},{c}]: exact={:.4} approx={:.4} err={:.4}",
+                    exact.at(r, c),
+                    approx.at(r, c),
+                    err
+                );
+            }
+        }
     }
 
     #[test]
@@ -3811,7 +4403,9 @@ mod tests {
         let m = Mat::zeros(4, 4);
         let q = Q8Mat::quantize(&m);
         let back = q.dequantize();
-        for &v in &back.data { assert_eq!(v, 0.0, "zero matrix should roundtrip to zero"); }
+        for &v in &back.data {
+            assert_eq!(v, 0.0, "zero matrix should roundtrip to zero");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3849,8 +4443,9 @@ mod tests {
     fn test_save_load_checkpoint_large_tensor() {
         let tmp = std::env::temp_dir().join("test_ckpt_large.bin");
         let path = tmp.to_str().unwrap();
-        let rows = 64usize; let cols = 128usize;
-        let data: Vec<f32> = (0..rows*cols).map(|i| i as f32 * 0.001 - 0.5).collect();
+        let rows = 64usize;
+        let cols = 128usize;
+        let data: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.001 - 0.5).collect();
         let node = TensorNode::leaf(Mat::new(data.clone(), rows, cols));
 
         save_checkpoint(path, &[("big", &node)]).expect("save failed");
@@ -3889,10 +4484,17 @@ mod tests {
     #[test]
     fn test_batched_gqa_output_matches_gqa() {
         // batched_gqa_attention must produce identical forward output to gqa_attention.
-        let t = 5; let n_q = 4; let n_kv = 2; let dh = 8;
+        let t = 5;
+        let n_q = 4;
+        let n_kv = 2;
+        let dh = 8;
         let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.01 + 0.1);
-        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.02 + 0.05);
-        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.015 + 0.03);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.02 + 0.05
+        });
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.015 + 0.03
+        });
 
         let q1 = TensorNode::leaf(q_data.clone());
         let k1 = TensorNode::leaf(k_data.clone());
@@ -3907,17 +4509,24 @@ mod tests {
         let ref_d = out_ref.data().clone();
         let bat_d = out_bat.data().clone();
         assert_eq!((ref_d.rows, ref_d.cols), (bat_d.rows, bat_d.cols));
-        for r in 0..t { for c in 0..(n_q * dh) {
-            assert!((ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
-                "output mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
-                ref_d.at(r, c), bat_d.at(r, c));
-        }}
+        for r in 0..t {
+            for c in 0..(n_q * dh) {
+                assert!(
+                    (ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
+                    "output mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
+                    ref_d.at(r, c),
+                    bat_d.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_batched_gqa_mha_output_matches_gqa() {
         // n_q == n_kv (standard MHA case): must still match.
-        let t = 4; let n = 3; let dh = 6;
+        let t = 4;
+        let n = 3;
+        let dh = 6;
         let q_data = Mat::from_fn(t, n * dh, |r, c| (r + c) as f32 * 0.03 + 0.02);
         let k_data = q_data.clone();
         let v_data = Mat::from_fn(t, n * dh, |r, c| ((r * (n * dh) + c) as f32 + 1.0) * 0.02);
@@ -3926,27 +4535,39 @@ mod tests {
             &TensorNode::leaf(q_data.clone()),
             &TensorNode::leaf(k_data.clone()),
             &TensorNode::leaf(v_data.clone()),
-            n, n, dh,
+            n,
+            n,
+            dh,
         );
         let out_bat = TensorNode::batched_gqa_attention(
             &TensorNode::leaf(q_data.clone()),
             &TensorNode::leaf(k_data.clone()),
             &TensorNode::leaf(v_data.clone()),
-            n, n, dh,
+            n,
+            n,
+            dh,
         );
 
         let ref_d = out_ref.data().clone();
         let bat_d = out_bat.data().clone();
-        for r in 0..t { for c in 0..(n * dh) {
-            assert!((ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
-                "MHA mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
-                ref_d.at(r, c), bat_d.at(r, c));
-        }}
+        for r in 0..t {
+            for c in 0..(n * dh) {
+                assert!(
+                    (ref_d.at(r, c) - bat_d.at(r, c)).abs() < 1e-4,
+                    "MHA mismatch at [{r},{c}]: ref={:.5} bat={:.5}",
+                    ref_d.at(r, c),
+                    bat_d.at(r, c)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_batched_gqa_output_shape() {
-        let t = 6; let n_q = 4; let n_kv = 2; let dh = 8;
+        let t = 6;
+        let n_q = 4;
+        let n_kv = 2;
+        let dh = 8;
         let q = TensorNode::leaf(Mat::zeros(t, n_q * dh));
         let k = TensorNode::leaf(Mat::zeros(t, n_kv * dh));
         let v = TensorNode::leaf(Mat::zeros(t, n_kv * dh));
@@ -3959,10 +4580,15 @@ mod tests {
     fn test_batched_gqa_causal_first_token() {
         // Token 0 can only attend to itself — output[0] must equal V[0..dh] exactly
         // (softmax over a single position → weight=1.0).
-        let t = 4; let n_q = 2; let n_kv = 2; let dh = 4;
+        let t = 4;
+        let n_q = 2;
+        let n_kv = 2;
+        let dh = 4;
         let q = TensorNode::leaf(Mat::ones(t, n_q * dh));
         let k = TensorNode::leaf(Mat::ones(t, n_kv * dh));
-        let v = TensorNode::leaf(Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c + 1) as f32));
+        let v = TensorNode::leaf(Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c + 1) as f32
+        }));
         let out = TensorNode::batched_gqa_attention(&q, &k, &v, n_q, n_kv, dh);
         let d = out.data();
         // For each query head h, token 0 must match v[0, h*dh .. (h+1)*dh]
@@ -3971,8 +4597,10 @@ mod tests {
             for c in 0..dh {
                 let expected = v.data().at(0, kvh * dh + c);
                 let got = d.at(0, h * dh + c);
-                assert!((got - expected).abs() < 1e-4,
-                    "head {h}, col {c}: expected {expected:.4} got {got:.4}");
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "head {h}, col {c}: expected {expected:.4} got {got:.4}"
+                );
             }
         }
     }
@@ -3980,49 +4608,80 @@ mod tests {
     #[test]
     fn test_batched_gqa_grad_v() {
         // Gradient check for dV: batched vs numerical.
-        let t = 3; let n_q = 2; let n_kv = 1; let dh = 4;
+        let t = 3;
+        let n_q = 2;
+        let n_kv = 1;
+        let dh = 4;
         let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
-        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
-        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05
+        });
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02
+        });
 
-        let num = numerical_grad(&|v| {
-            let qn = TensorNode::leaf(q_data.clone());
-            let kn = TensorNode::leaf(k_data.clone());
-            let vn = TensorNode::leaf(v.clone());
-            TensorNode::batched_gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh)
-                .data().data.iter().sum::<f32>()
-        }, &v_data);
+        let num = numerical_grad(
+            &|v| {
+                let qn = TensorNode::leaf(q_data.clone());
+                let kn = TensorNode::leaf(k_data.clone());
+                let vn = TensorNode::leaf(v.clone());
+                TensorNode::batched_gqa_attention(&qn, &kn, &vn, n_q, n_kv, dh)
+                    .data()
+                    .data
+                    .iter()
+                    .sum::<f32>()
+            },
+            &v_data,
+        );
 
         let q = TensorNode::leaf(q_data);
         let k = TensorNode::leaf(k_data);
         let v = TensorNode::leaf(v_data);
         let out = TensorNode::batched_gqa_attention(&q, &k, &v, n_q, n_kv, dh);
-        let (r, c) = { let d = out.data(); (d.rows, d.cols) };
+        let (r, c) = {
+            let d = out.data();
+            (d.rows, d.cols)
+        };
         out.0.borrow_mut().grad = Mat::ones(r, c);
         call_backward(&out);
 
         let vg = v.grad().clone();
-        for row in 0..t { for col in 0..(n_kv * dh) {
-            assert!(approx(vg.at(row, col), num.at(row, col)),
-                "batched dV[{row},{col}]: analytical={:.4} numerical={:.4}",
-                vg.at(row, col), num.at(row, col));
-        }}
+        for row in 0..t {
+            for col in 0..(n_kv * dh) {
+                assert!(
+                    approx(vg.at(row, col), num.at(row, col)),
+                    "batched dV[{row},{col}]: analytical={:.4} numerical={:.4}",
+                    vg.at(row, col),
+                    num.at(row, col)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_batched_gqa_grad_matches_gqa_grad() {
         // Gradient of batched_gqa must match gradient of gqa_attention exactly.
-        let t = 3; let n_q = 4; let n_kv = 2; let dh = 4;
+        let t = 3;
+        let n_q = 4;
+        let n_kv = 2;
+        let dh = 4;
         let q_data = Mat::from_fn(t, n_q * dh, |r, c| (r * (n_q * dh) + c) as f32 * 0.05 + 0.1);
-        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05);
-        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02);
+        let k_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.03 + 0.05
+        });
+        let v_data = Mat::from_fn(t, n_kv * dh, |r, c| {
+            (r * (n_kv * dh) + c) as f32 * 0.04 + 0.02
+        });
 
         // Reference: gqa_attention
         let q1 = TensorNode::leaf(q_data.clone());
         let k1 = TensorNode::leaf(k_data.clone());
         let v1 = TensorNode::leaf(v_data.clone());
         let out1 = TensorNode::gqa_attention(&q1, &k1, &v1, n_q, n_kv, dh);
-        let (r, c) = { let d = out1.data(); (d.rows, d.cols) };
+        let (r, c) = {
+            let d = out1.data();
+            (d.rows, d.cols)
+        };
         out1.0.borrow_mut().grad = Mat::ones(r, c);
         call_backward(&out1);
 
@@ -4034,19 +4693,38 @@ mod tests {
         out2.0.borrow_mut().grad = Mat::ones(r, c);
         call_backward(&out2);
 
-        let dq1 = q1.grad().clone(); let dq2 = q2.grad().clone();
-        let dk1 = k1.grad().clone(); let dk2 = k2.grad().clone();
-        let dv1 = v1.grad().clone(); let dv2 = v2.grad().clone();
+        let dq1 = q1.grad().clone();
+        let dq2 = q2.grad().clone();
+        let dk1 = k1.grad().clone();
+        let dk2 = k2.grad().clone();
+        let dv1 = v1.grad().clone();
+        let dv2 = v2.grad().clone();
 
-        for row in 0..t { for col in 0..(n_q * dh) {
-            assert!(approx(dq1.at(row, col), dq2.at(row, col)),
-                "dQ mismatch [{row},{col}]: ref={:.4} bat={:.4}", dq1.at(row,col), dq2.at(row,col));
-        }}
-        for row in 0..t { for col in 0..(n_kv * dh) {
-            assert!(approx(dk1.at(row, col), dk2.at(row, col)),
-                "dK mismatch [{row},{col}]: ref={:.4} bat={:.4}", dk1.at(row,col), dk2.at(row,col));
-            assert!(approx(dv1.at(row, col), dv2.at(row, col)),
-                "dV mismatch [{row},{col}]: ref={:.4} bat={:.4}", dv1.at(row,col), dv2.at(row,col));
-        }}
+        for row in 0..t {
+            for col in 0..(n_q * dh) {
+                assert!(
+                    approx(dq1.at(row, col), dq2.at(row, col)),
+                    "dQ mismatch [{row},{col}]: ref={:.4} bat={:.4}",
+                    dq1.at(row, col),
+                    dq2.at(row, col)
+                );
+            }
+        }
+        for row in 0..t {
+            for col in 0..(n_kv * dh) {
+                assert!(
+                    approx(dk1.at(row, col), dk2.at(row, col)),
+                    "dK mismatch [{row},{col}]: ref={:.4} bat={:.4}",
+                    dk1.at(row, col),
+                    dk2.at(row, col)
+                );
+                assert!(
+                    approx(dv1.at(row, col), dv2.at(row, col)),
+                    "dV mismatch [{row},{col}]: ref={:.4} bat={:.4}",
+                    dv1.at(row, col),
+                    dv2.at(row, col)
+                );
+            }
+        }
     }
 }
