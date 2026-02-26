@@ -20,7 +20,8 @@
       "WebFetch(domain:lib.rs)",
       "Bash(xxd:*)",
       "WebFetch(domain:ai.google.dev)",
-      "Bash(ln:*)"
+      "Bash(ln:*)",
+      "Bash(tee:*)"
     ]
   }
 }
