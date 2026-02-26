@@ -1812,36 +1812,36 @@ impl Gemma3Model {
                     / nx_vals.len() as f32;
                 v.sqrt()
             };
-            eprintln!(
-                "[ Gemma3-dbg ] prefill hidden_after_norm: \
-                 min={:.4} max={:.4} mean={:.4} std={:.4}",
-                nx_min, nx_max, nx_mean, nx_std
-            );
+            // eprintln!(
+            //     "[ Gemma3-dbg ] prefill hidden_after_norm: \
+            //      min={:.4} max={:.4} mean={:.4} std={:.4}",
+            //     nx_min, nx_max, nx_mean, nx_std
+            // );
 
             let ld = logits_node.data();
             let lv = &ld.data;
             let l_min = lv.iter().cloned().fold(f32::INFINITY, f32::min);
             let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let l_mean = lv.iter().sum::<f32>() / lv.len() as f32;
-            eprintln!(
-                "[ Gemma3-dbg ] prefill logits: min={:.2} max={:.2} mean={:.2}  vocab={}",
-                l_min,
-                l_max,
-                l_mean,
-                lv.len()
-            );
+            // eprintln!(
+            //     "[ Gemma3-dbg ] prefill logits: min={:.2} max={:.2} mean={:.2}  vocab={}",
+            //     l_min,
+            //     l_max,
+            //     l_mean,
+            //     lv.len()
+            // );
             let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-            eprintln!("[ Gemma3-dbg ] prefill top-5 raw logits: {:?}", top5);
+            // eprintln!("[ Gemma3-dbg ] prefill top-5 raw logits: {:?}", top5);
 
             let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
             let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
             if n_nan > 0 || n_inf > 0 {
-                eprintln!(
-                    "[ Gemma3-dbg ] *** WARNING: {} NaN, {} Inf in prefill logits ***",
-                    n_nan, n_inf
-                );
+                // eprintln!(
+                //     "[ Gemma3-dbg ] *** WARNING: {} NaN, {} Inf in prefill logits ***",
+                //     n_nan, n_inf
+                // );
             }
         }
 
@@ -1893,17 +1893,17 @@ impl Gemma3Model {
                 let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                eprintln!(
-                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
-                    step, prev, l_max, top5
-                );
+                // eprintln!(
+                //     "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
+                //     step, prev, l_max, top5
+                // );
                 let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
                 let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
                 if n_nan > 0 || n_inf > 0 {
-                    eprintln!(
-                        "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
-                        n_nan, n_inf
-                    );
+                    // eprintln!(
+                    //     "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
+                    //     n_nan, n_inf
+                    // );
                 }
             }
 
