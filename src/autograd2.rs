@@ -629,15 +629,9 @@ impl MatBf16 {
             }
         }
 
-        // ── Decode path (M ≤ 4) ───────────────────────────────────────────
-        // Chunked SGEMM: dequantise CHUNK weight rows → f32, call sgemm once.
-        //
-        // Why not row-by-row sdot?  Each BLAS sdot call has ~1 µs kernel-entry
-        // overhead.  For lm_head (vocab = 262 144) that overhead alone is
-        // 262 ms per token — far larger than the actual compute time.
-        // With CHUNK = 1024 we make only 256 sgemm calls instead of 262 144.
-        //
-        // The output slice trick: pass &mut out.data[j0..] with ldc = n so
+        // ── Decode path (M ≤ 4): chunked SGEMM ───────────────────────────
+        // Dequantise CHUNK weight rows → f32, call sgemm once per chunk.
+        // The output-slice trick: pass &mut out.data[j0..] with ldc = n so
         // sgemm writes C[i, j] directly to out[i, j0 + j] via row stride n.
         #[cfg(feature = "blas")]
         {
@@ -661,8 +655,6 @@ impl MatBf16 {
                 }
 
                 // SGEMM: out[m, actual] = a[m, k] × chunk_buf[actual, k]^T
-                // Writing into out.data[j0..] with ldc = n places each result
-                // element at out[i, j0 + j] = out.data[i*n + j0 + j]. ✓
                 unsafe {
                     cblas::sgemm(
                         cblas::Layout::RowMajor,

@@ -2043,16 +2043,14 @@ impl Tokenizer for HfBpeTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() { return Vec::new(); }
 
-        // Normalize: replace spaces with ▁
-        // Then split on ▁ boundaries but keep ▁ prepended to each word
+        // Normalize: replace spaces with ▁ (do NOT prepend ▁ to the start —
+        // the Gemma tokenizer only adds ▁ where spaces appear in the source).
         let normalized = text.replace(' ', "\u{2581}");
-        // Prepend ▁ to the whole text (matching SentencePiece convention)
-        let full = format!("\u{2581}{}", normalized);
 
         // Split into words at ▁ boundaries (keep ▁ as prefix of each word)
         let mut words: Vec<String> = Vec::new();
         let mut current = String::new();
-        for ch in full.chars() {
+        for ch in normalized.chars() {
             if ch == '\u{2581}' && !current.is_empty() {
                 words.push(current.clone());
                 current = String::from('\u{2581}');

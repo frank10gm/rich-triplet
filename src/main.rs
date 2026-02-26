@@ -135,7 +135,7 @@ impl CliArgs {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
-            rep_penalty: 1.1,
+            rep_penalty: 1.0,
             seed: 42,
             train_steps: 200,
             checkpoint: None,
@@ -299,7 +299,7 @@ fn print_help() {
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
     println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
     println!("  --top-p P                Nucleus probability         [default: 0.95]");
-    println!("  --rep-penalty R          Repetition penalty          [default: 1.1]");
+    println!("  --rep-penalty R          Repetition penalty          [default: 1.0]");
     println!("  --seed S                 RNG seed                    [default: 42]");
     println!("  --train-steps N          Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");

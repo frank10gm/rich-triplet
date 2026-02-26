@@ -266,7 +266,8 @@ impl Gemma3Mlp {
     }
 
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
-        let gate = self.gate_proj.forward(x).silu();
+        // Gemma3 uses gelu_pytorch_tanh (approximate GeLU), not SiLU.
+        let gate = self.gate_proj.forward(x).gelu_tanh();
         let up = self.up_proj.forward(x);
         let hidden = gate.mul_elem_node(&up);
         self.down_proj.forward(&hidden)
@@ -1886,44 +1887,16 @@ impl Gemma3Model {
 
             // ── Diagnostics for first 3 decode steps ──────────────────────
             if step <= 3 {
-                // Hidden-state stats (post final-norm)
-                let nx = normed_x.data();
-                let nx_vals = &nx.data;
-                let nx_min = nx_vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                let nx_max = nx_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let nx_mean = nx_vals.iter().sum::<f32>() / nx_vals.len() as f32;
-                let nx_std = {
-                    let v = nx_vals.iter().map(|&v| (v - nx_mean).powi(2)).sum::<f32>()
-                        / nx_vals.len() as f32;
-                    v.sqrt()
-                };
-                eprintln!(
-                    "[ Gemma3-dbg ] step={} prev_tok={}  hidden_after_norm: \
-                     min={:.4} max={:.4} mean={:.4} std={:.4}",
-                    step, prev, nx_min, nx_max, nx_mean, nx_std
-                );
-
-                // Raw logit stats
                 let ld = logits_node.data();
                 let lv = &ld.data;
-                let l_min = lv.iter().cloned().fold(f32::INFINITY, f32::min);
                 let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let l_mean = lv.iter().sum::<f32>() / lv.len() as f32;
-                eprintln!(
-                    "[ Gemma3-dbg ]   logits: min={:.2} max={:.2} mean={:.2}  vocab={}",
-                    l_min,
-                    l_max,
-                    l_mean,
-                    lv.len()
-                );
-
-                // Top-5 tokens by raw logit
                 let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                eprintln!("[ Gemma3-dbg ]   top-5 raw logits: {:?}", top5);
-
-                // Check for NaN/Inf
+                eprintln!(
+                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
+                    step, prev, l_max, top5
+                );
                 let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
                 let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
                 if n_nan > 0 || n_inf > 0 {
