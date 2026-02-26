@@ -1885,25 +1885,25 @@ impl Gemma3Model {
             let logits_node = self.lm_head.forward(&normed_x);
             t_lmhead_us += t2.elapsed().as_micros();
 
-            // ── Diagnostics for first 3 decode steps ──────────────────────
-            if step <= 3 {
+            // ── Diagnostics for first 10 decode steps ─────────────────────
+            if step <= 10 {
                 let ld = logits_node.data();
                 let lv = &ld.data;
                 let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                // eprintln!(
-                //     "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
-                //     step, prev, l_max, top5
-                // );
+                eprintln!(
+                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
+                    step, prev, l_max, top5
+                );
                 let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
                 let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
                 if n_nan > 0 || n_inf > 0 {
-                    // eprintln!(
-                    //     "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
-                    //     n_nan, n_inf
-                    // );
+                    eprintln!(
+                        "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
+                        n_nan, n_inf
+                    );
                 }
             }
 

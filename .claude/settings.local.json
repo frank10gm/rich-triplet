@@ -19,7 +19,8 @@
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:lib.rs)",
       "Bash(xxd:*)",
-      "WebFetch(domain:ai.google.dev)"
+      "WebFetch(domain:ai.google.dev)",
+      "Bash(ln:*)"
     ]
   }
 }
