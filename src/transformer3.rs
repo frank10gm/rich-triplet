@@ -1507,6 +1507,20 @@ pub struct SafeTensor {
 /// The JSON has the shape:
 ///   { "tensor_name": { "dtype": "BF16", "shape": [rows, cols], "data_offsets": [start, end] } }
 pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<SafeTensor>, String> {
+    parse_safetensors_inner(bytes, false)
+}
+
+/// Like `parse_safetensors` but skips the BF16→f32 conversion for BF16 tensors.
+///
+/// For BF16 safetensors, the standard parser wastes ~2× RAM by converting every
+/// weight to f32 even when the caller will use `bf16_data` directly (e.g. Gemma3).
+/// With this variant, `SafeTensor::data` is empty for BF16 tensors; callers must
+/// read `bf16_data` instead.  F32 and F16 tensors are unaffected.
+pub fn parse_safetensors_skip_bf16_f32(bytes: &[u8]) -> Result<Vec<SafeTensor>, String> {
+    parse_safetensors_inner(bytes, true)
+}
+
+fn parse_safetensors_inner(bytes: &[u8], skip_bf16_to_f32: bool) -> Result<Vec<SafeTensor>, String> {
     if bytes.len() < 8 {
         return Err("safetensors: file too small".to_string());
     }
@@ -1522,7 +1536,7 @@ pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<SafeTensor>, String> {
     // Parse top-level object: iterate over key-value pairs
     for (name, value_json) in iter_top_level_pairs(header_json) {
         if name == "__metadata__" { continue; }
-        if let Some(tensor) = parse_tensor_value(name, value_json, data_section) {
+        if let Some(tensor) = parse_tensor_value_flags(name, value_json, data_section, skip_bf16_to_f32) {
             tensors.push(tensor);
         }
     }
@@ -1567,6 +1581,10 @@ fn iter_top_level_pairs(json: &str) -> Vec<(String, String)> {
 
 /// Parse a single tensor's value object: `{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}`
 fn parse_tensor_value(name: String, value_json: String, data_section: &[u8]) -> Option<SafeTensor> {
+    parse_tensor_value_flags(name, value_json, data_section, false)
+}
+
+fn parse_tensor_value_flags(name: String, value_json: String, data_section: &[u8], skip_bf16_to_f32: bool) -> Option<SafeTensor> {
     let dtype   = extract_quoted_value(&value_json, "dtype")?;
     let shape   = extract_int_array(&value_json, "shape")?;
     let offsets = extract_int_array(&value_json, "data_offsets")?;
@@ -1586,15 +1604,17 @@ fn parse_tensor_value(name: String, value_json: String, data_section: &[u8]) -> 
                .collect()
         }
         "BF16" => {
-            // Preserve raw u16 bits so callers can store weights in BF16
-            // without the f32 round-trip cost. Also compute f32 for callers
-            // that still need it (e.g. layer-norm weights, embeddings).
+            // Preserve raw u16 bits so callers can store weights in BF16.
             let bits: Vec<u16> = raw.chunks_exact(2)
                 .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
                 .collect();
-            let f32s = bits.iter()
-                .map(|&b| f32::from_bits((b as u32) << 16))
-                .collect();
+            // skip_bf16_to_f32: avoid the ~2× RAM overhead of converting
+            // every BF16 weight to f32 when the caller reads bf16_data directly.
+            let f32s = if skip_bf16_to_f32 {
+                Vec::new()  // data will be empty; callers must use bf16_data
+            } else {
+                bits.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect()
+            };
             bf16_data = Some(bits);
             f32s
         }

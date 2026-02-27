@@ -610,10 +610,10 @@ impl Gemma3Model {
             let bytes =
                 std::fs::read(&path).map_err(|e| format!("cannot read {:?}: {}", path, e))?;
 
-            let tensors = crate::transformer3::parse_safetensors(&bytes)
+            let tensors = crate::transformer3::parse_safetensors_skip_bf16_f32(&bytes)
                 .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
 
-            for t in &tensors {
+            for t in tensors {
                 loaded_tensors += 1;
                 if apply_tensor(self, t) {
                     matched += 1;
@@ -1425,7 +1425,7 @@ impl Gemma3Model {
                     .collect();
                 st.bf16_data = Some(u16s);
             }
-            apply_tensor(self, &st);
+            apply_tensor(self, st);
         }
         Ok(true)
     }
@@ -1435,60 +1435,55 @@ impl Gemma3Model {
 // Weight name → model field mapping
 // ============================================================================
 
-fn apply_tensor(model: &mut Gemma3Model, t: &crate::transformer3::SafeTensor) -> bool {
+fn apply_tensor(model: &mut Gemma3Model, t: crate::transformer3::SafeTensor) -> bool {
     apply_tensor_inner(model, t).unwrap_or(false)
 }
 
 fn apply_tensor_inner(
     model: &mut Gemma3Model,
-    t: &crate::transformer3::SafeTensor,
+    t: crate::transformer3::SafeTensor,
 ) -> Option<bool> {
-    // Strip optional "language_model." prefix (present in vision-language model checkpoints)
-    let name = t
+    // Own the name so we can freely move `t` later (e.g. into set_linear).
+    let name_owned: String = t
         .name
         .strip_prefix("language_model.")
-        .unwrap_or(t.name.as_str());
+        .unwrap_or(t.name.as_str())
+        .to_owned();
+    let name: &str = &name_owned;
 
     // Global tensors
     if name == "model.embed_tokens.weight" {
         // Store as BF16 to avoid a 2.7 GB f32 allocation for the 262K×2560 table.
-        if let Some(ref bits) = t.bf16_data {
-            if bits.len() == t.shape[0] * t.shape[1] {
+        let (vocab, hidden) = (t.shape[0], t.shape[1]);
+        if let Some(bits) = t.bf16_data {
+            if bits.len() == vocab * hidden {
                 use crate::autograd2::MatBf16;
-                // Wrap in Arc so embed_bf16 and lm_head share one allocation.
-                let arc = std::sync::Arc::new(bits.clone());
+                // Move bits into Arc — zero copy (no clone).
+                let arc = std::sync::Arc::new(bits);
                 model.embed_bf16 = Some(MatBf16 {
                     data: arc.clone(),
-                    rows: t.shape[0],
-                    cols: t.shape[1],
+                    rows: vocab,
+                    cols: hidden,
                 });
                 // Free the f32 init — embedding lookup uses embed_bf16 exclusively.
                 model
                     .embed_tokens
                     .set_data(crate::autograd2::Mat::zeros(0, 0));
                 // Share the same Arc with lm_head — no data copy.
-                model.lm_head.load_bf16_arc(arc, t.shape[0], t.shape[1]);
+                model.lm_head.load_bf16_arc(arc, vocab, hidden);
                 return Some(true);
             }
         }
-        return Some(set_node(
-            &model.embed_tokens,
-            &t.data,
-            t.shape[0],
-            t.shape[1],
-        ));
+        return Some(set_node(&model.embed_tokens, &t.data, vocab, hidden));
     }
     if name == "model.norm.weight" {
-        let n = t.data.len();
-        return Some(set_node(&model.norm.gamma, &t.data, 1, n));
+        let f32s = st_to_f32(&t);
+        return Some(set_node(&model.norm.gamma, &f32s, 1, f32s.len()));
     }
     if name == "lm_head.weight" {
-        return Some(set_node(
-            &model.lm_head.weight,
-            &t.data,
-            t.shape[0],
-            t.shape[1],
-        ));
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+        let f32s = st_to_f32(&t);
+        return Some(set_node(&model.lm_head.weight, &f32s, rows, cols));
     }
 
     // Per-layer tensors: "model.layers.{i}.{...}"
@@ -1498,52 +1493,55 @@ fn apply_tensor_inner(
     if layer_idx >= model.layers.len() {
         return Some(false);
     }
-    let layer_name = &rest[dot + 1..];
+    let layer_name = rest[dot + 1..].to_owned();
     let layer = &mut model.layers[layer_idx];
 
-    match layer_name {
-        // Layer-norm weights: use data.len() as size to handle both
-        // 1D [N] (safetensors) and 2D [1,N] (cache file) shapes.
-        "input_layernorm.weight" => Some(set_node(
-            &layer.input_layernorm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
-        "post_attention_layernorm.weight" => Some(set_node(
-            &layer.post_attention_layernorm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
-        "pre_feedforward_layernorm.weight" => Some(set_node(
-            &layer.pre_feedforward_layernorm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
-        "post_feedforward_layernorm.weight" => Some(set_node(
-            &layer.post_feedforward_layernorm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
-        "self_attn.q_norm.weight" => Some(set_node(
-            &layer.self_attn.q_norm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
-        "self_attn.k_norm.weight" => Some(set_node(
-            &layer.self_attn.k_norm.gamma,
-            &t.data,
-            1,
-            t.data.len(),
-        )),
+    match layer_name.as_str() {
+        // Layer-norm weights: convert BF16→f32 on the fly (small tensors, trivial cost).
+        "input_layernorm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(&layer.input_layernorm.gamma, &f32s, 1, f32s.len()))
+        }
+        "post_attention_layernorm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(
+                &layer.post_attention_layernorm.gamma,
+                &f32s,
+                1,
+                f32s.len(),
+            ))
+        }
+        "pre_feedforward_layernorm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(
+                &layer.pre_feedforward_layernorm.gamma,
+                &f32s,
+                1,
+                f32s.len(),
+            ))
+        }
+        "post_feedforward_layernorm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(
+                &layer.post_feedforward_layernorm.gamma,
+                &f32s,
+                1,
+                f32s.len(),
+            ))
+        }
+        "self_attn.q_norm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(&layer.self_attn.q_norm.gamma, &f32s, 1, f32s.len()))
+        }
+        "self_attn.k_norm.weight" => {
+            let f32s = st_to_f32(&t);
+            Some(set_node(&layer.self_attn.k_norm.gamma, &f32s, 1, f32s.len()))
+        }
 
-        // Large projection weights: store as BF16 when available (lossless, 2× RAM).
+        // Large projection weights: move BF16 bits into Linear2 (no clone).
         "self_attn.q_proj.weight" => {
-            let r = set_linear(&mut layer.self_attn.q_proj, t, t.shape[0], t.shape[1]);
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            let r = set_linear(&mut layer.self_attn.q_proj, t, rows, cols);
             // Debug: print first 8 values of layer 0's q_proj for comparison with GGUF
             if layer_idx == 0 {
                 let vals: Vec<f32> = if let Some(ref bf16) = layer.self_attn.q_proj.bf16_weight {
@@ -1556,46 +1554,34 @@ fn apply_tensor_inner(
                 for v in &vals {
                     eprint!("{:.4} ", v);
                 }
-                eprintln!("  shape={}x{}", t.shape[0], t.shape[1]);
+                eprintln!("  shape={}x{}", rows, cols);
             }
             Some(r)
         }
-        "self_attn.k_proj.weight" => Some(set_linear(
-            &mut layer.self_attn.k_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
-        "self_attn.v_proj.weight" => Some(set_linear(
-            &mut layer.self_attn.v_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
-        "self_attn.o_proj.weight" => Some(set_linear(
-            &mut layer.self_attn.o_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
-        "mlp.gate_proj.weight" => Some(set_linear(
-            &mut layer.mlp.gate_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
-        "mlp.up_proj.weight" => Some(set_linear(
-            &mut layer.mlp.up_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
-        "mlp.down_proj.weight" => Some(set_linear(
-            &mut layer.mlp.down_proj,
-            t,
-            t.shape[0],
-            t.shape[1],
-        )),
+        "self_attn.k_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.self_attn.k_proj, t, rows, cols))
+        }
+        "self_attn.v_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.self_attn.v_proj, t, rows, cols))
+        }
+        "self_attn.o_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.self_attn.o_proj, t, rows, cols))
+        }
+        "mlp.gate_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.mlp.gate_proj, t, rows, cols))
+        }
+        "mlp.up_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.mlp.up_proj, t, rows, cols))
+        }
+        "mlp.down_proj.weight" => {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            Some(set_linear(&mut layer.mlp.down_proj, t, rows, cols))
+        }
         _ => Some(false),
     }
 }
@@ -1609,17 +1595,32 @@ fn set_node(node: &TensorNode, data: &[f32], rows: usize, cols: usize) -> bool {
     true
 }
 
+/// Convert a SafeTensor to a Vec<f32>, handling both f32 and BF16-only tensors.
+/// Only intended for small tensors (norms) — always allocates a new Vec<f32>.
+fn st_to_f32(t: &crate::transformer3::SafeTensor) -> Vec<f32> {
+    if !t.data.is_empty() {
+        t.data.clone()
+    } else if let Some(ref bits) = t.bf16_data {
+        bits.iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
 /// Set a Linear2 weight, preferring BF16 storage when the tensor was BF16 on disk.
+/// Takes the SafeTensor by value so BF16 bits can be *moved* rather than cloned.
 /// Falls back to f32 if no BF16 data is available (e.g. F32 or F16 safetensors).
 fn set_linear(
     linear: &mut crate::nn2::Linear2,
-    t: &crate::transformer3::SafeTensor,
+    t: crate::transformer3::SafeTensor,
     rows: usize,
     cols: usize,
 ) -> bool {
-    if let Some(ref bits) = t.bf16_data {
+    if let Some(bits) = t.bf16_data {
         if bits.len() == rows * cols {
-            linear.load_bf16(bits.clone(), rows, cols);
+            linear.load_bf16(bits, rows, cols); // move — no clone
             return true;
         }
     }
@@ -1627,7 +1628,7 @@ fn set_linear(
     if t.data.len() != rows * cols {
         return false;
     }
-    linear.weight.set_data(Mat::new(t.data.clone(), rows, cols));
+    linear.weight.set_data(Mat::new(t.data, rows, cols)); // move — no clone
     true
 }
 
