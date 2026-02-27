@@ -617,7 +617,11 @@ fn main() {
             || args
                 .model
                 .as_deref()
-                .map_or(false, |m| m.starts_with("gemma3"));
+                .map_or(false, |m| m.starts_with("gemma3"))
+            || args
+                .weights
+                .as_deref()
+                .map_or(false, |w| w.ends_with(".gguf"));
         if is_gemma3 {
             run_gemma3(&args, prompt);
         } else if args.weights.is_some() {

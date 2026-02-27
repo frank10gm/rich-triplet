@@ -21,7 +21,8 @@
       "Bash(xxd:*)",
       "WebFetch(domain:ai.google.dev)",
       "Bash(ln:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "WebFetch(domain:eadst.com)"
     ]
   }
 }

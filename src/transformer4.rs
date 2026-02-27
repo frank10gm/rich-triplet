@@ -388,6 +388,7 @@ impl Gemma3Model {
             in_features: cfg.hidden_size,
             out_features: cfg.vocab_size,
             q4_weight: None,
+            q4k_weight: None,
             bf16_weight: None,
         };
 
@@ -696,6 +697,18 @@ impl Gemma3Model {
                             f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
+                    GgufType::Q4K => {
+                        let f32s = gguf.decode_q4k_to_f32(idx)?;
+                        let bits: Vec<u16> =
+                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
+                    GgufType::Q6K => {
+                        let f32s = gguf.decode_q6k_to_f32(idx)?;
+                        let bits: Vec<u16> =
+                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        model_set_embed_bf16(self, bits, vocab, hidden);
+                    }
                     _ => {
                         eprintln!(
                             "[ GGUF ] Warning: token_embd type {:?} not supported, skipping",
@@ -857,7 +870,10 @@ impl Gemma3Model {
                     }
                 }
             } else if name != "token_embd.weight" && name != "output_norm.weight" {
-                eprintln!("[ GGUF ] Skipping unknown top-level tensor: {}", name);
+                // Suppress verbose output for vision tower (v.blk.*) and multimodal tensors
+                if !name.starts_with("v.") && !name.starts_with("mm.") {
+                    eprintln!("[ GGUF ] Skipping unknown top-level tensor: {}", name);
+                }
             }
 
             if loaded % 50 == 0 && loaded > 0 {
@@ -967,6 +983,21 @@ fn load_linear_from_gguf(
             linear
                 .weight
                 .set_data(crate::autograd2::Mat::new(f32s, rows, cols));
+        }
+        GgufType::Q4K => {
+            // Load Q4_K natively: keep raw block bytes, dequantize on-the-fly
+            // during matmul. Saves ~3.5× RAM vs BF16 and avoids the full
+            // decode+convert pass at load time.
+            let q4k = gguf.decode_q4k_to_q4kmat(idx)?;
+            // Diagnostic: check first 8 values of first Q4K tensor loaded
+            linear.q4k_weight = Some(q4k);
+            linear.bf16_weight = None;
+            linear.weight.set_data(crate::autograd2::Mat::zeros(0, 0));
+        }
+        GgufType::Q6K => {
+            let f32s = gguf.decode_q6k_to_f32(idx)?;
+            let bits: Vec<u16> = f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+            linear.load_bf16(bits, rows, cols);
         }
         _ => {
             eprintln!(

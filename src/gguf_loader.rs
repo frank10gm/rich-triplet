@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
-use crate::autograd2::Q4Mat;
+use crate::autograd2::{Q4KMat, Q4Mat};
 
 // ---------------------------------------------------------------------------
 // Tensor type enum
@@ -348,6 +348,37 @@ impl GgufFile {
         Ok(Q4Mat { rows, cols, packed, scales })
     }
 
+    /// Load a Q4_K tensor into a `Q4KMat` by copying the raw block bytes.
+    ///
+    /// The GGUF block layout (144 bytes/256 elements) is preserved verbatim;
+    /// dequantization happens on-the-fly during matmul via
+    /// `Q4KMat::dequantize_row_into`.
+    ///
+    /// Shape convention: GGUF stores [in_features, out_features]; we flip to
+    /// [out_features, in_features] to match our row-major weight layout.
+    pub fn decode_q4k_to_q4kmat(&self, idx: usize) -> io::Result<Q4KMat> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q4K,
+            "decode_q4k_to_q4kmat called on non-Q4K tensor");
+
+        let (rows, cols) = match info.shape.len() {
+            1 => (1, info.shape[0]),
+            2 => (info.shape[1], info.shape[0]),  // transpose: GGUF [cols, rows] → ours [rows, cols]
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("unexpected shape rank {} for {}", info.shape.len(), info.name))),
+        };
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem   = rows * cols;
+        let n_blocks = (n_elem + 255) / 256;
+        assert_eq!(
+            bytes.len(), n_blocks * 144,
+            "Q4K tensor {} expected {} bytes, got {}", info.name, n_blocks * 144, bytes.len()
+        );
+
+        Ok(Q4KMat { rows, cols, blocks: bytes })
+    }
+
     /// Decode an F32 tensor into a Vec<f32>.
     pub fn decode_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
         let bytes = self.read_tensor_bytes(idx)?;
@@ -424,6 +455,164 @@ impl GgufFile {
                     let v = ((src >> 4) & 0x0F) as i8 - 8;
                     out[e1] = v as f32 * scale;
                 }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Decode a Q6_K tensor into a flat Vec<f32>.
+    ///
+    /// ## Q6_K block layout (210 bytes per 256 elements):
+    ///   ql[128]    — lower 4 bits of each 6-bit quant (bytes 0–127)
+    ///   qh[64]     — upper 2 bits of each 6-bit quant (bytes 128–191)
+    ///   scales[16] — int8 scales, one per 16-element group (bytes 192–207)
+    ///   d          — fp16 super-block scale (bytes 208–209)
+    ///
+    /// ## Memory layout (from llama.cpp dequantize_row_q6_K):
+    /// The 256 elements are processed in 2 halves of 128 each.
+    /// Within each half, elements are interleaved across 4 lanes of 32:
+    ///   For l in 0..32:
+    ///     q1 = (ql[l]    & 0xF) | (((qh[l] >> 0) & 3) << 4) - 32  → y[l]
+    ///     q2 = (ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4) - 32  → y[l+32]
+    ///     q3 = (ql[l]    >> 4)  | (((qh[l] >> 4) & 3) << 4) - 32  → y[l+64]
+    ///     q4 = (ql[l+32] >> 4)  | (((qh[l] >> 6) & 3) << 4) - 32  → y[l+96]
+    /// Then advance ql by 64, qh by 32, y by 128 for second half.
+    pub fn decode_q6k_to_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q6K,
+            "decode_q6k_to_f32 called on non-Q6K tensor");
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem = info.n_elements();
+        let n_blocks = (n_elem + 255) / 256;
+        let mut out = vec![0.0f32; n_elem];
+
+        for b in 0..n_blocks {
+            let block_off = b * 210;
+            let ql_all = &bytes[block_off..block_off + 128];
+            let qh_all = &bytes[block_off + 128..block_off + 192];
+            let sc_all = &bytes[block_off + 192..block_off + 208]; // 16 int8 scales
+            let d_bits = u16::from_le_bytes([bytes[block_off + 208], bytes[block_off + 209]]);
+            let d = f16_to_f32(d_bits);
+
+            let base = b * 256;
+            let end  = (base + 256).min(n_elem);
+
+            // Two halves of 128 elements each (j=0: first half, j=1: second half)
+            for j in 0..2usize {
+                let ql = &ql_all[j * 64..(j + 1) * 64]; // 64 bytes for this half
+                let qh = &qh_all[j * 32..(j + 1) * 32]; // 32 bytes for this half
+                let sc = &sc_all[j * 8..(j + 1) * 8];   // 8 scales for this half
+                let y_base = base + j * 128;
+
+                // For each l in 0..32, produce 4 output values at l, l+32, l+64, l+96
+                for l in 0..32usize {
+                    let is = l / 16; // 0 for l=0..15, 1 for l=16..31
+                    let q1 = ((ql[l]      & 0x0F) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                    let q3 = ((ql[l]      >>    4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[l + 32] >>    4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+
+                    // scale pairs: is=0 → sc[0],sc[2],sc[4],sc[6]; is=1 → sc[1],sc[3],sc[5],sc[7]
+                    let s0 = d * sc[is]     as i8 as f32;
+                    let s1 = d * sc[is + 2] as i8 as f32;
+                    let s2 = d * sc[is + 4] as i8 as f32;
+                    let s3 = d * sc[is + 6] as i8 as f32;
+
+                    if y_base + l      < end { out[y_base + l]      = s0 * q1 as f32; }
+                    if y_base + l + 32 < end { out[y_base + l + 32] = s1 * q2 as f32; }
+                    if y_base + l + 64 < end { out[y_base + l + 64] = s2 * q3 as f32; }
+                    if y_base + l + 96 < end { out[y_base + l + 96] = s3 * q4 as f32; }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Decode a Q4_K tensor into a flat Vec<f32>.
+    ///
+    /// ## Q4_K block layout (144 bytes per 256 elements):
+    ///   d          — fp16 super-block scale for scales (bytes 0–1)
+    ///   dmin       — fp16 super-block scale for mins (bytes 2–3)
+    ///   scales[12] — packed 6-bit scales/mins for 8 sub-groups (bytes 4–15)
+    ///   qs[128]    — 4-bit quants, 2 per byte (bytes 16–143)
+    ///
+    /// The 256 elements are split into 4 chunks of 64. Each chunk uses:
+    ///   - low nibbles of 32 bytes → 32 elements with scale/min pair `is`
+    ///   - high nibbles of same 32 bytes → 32 elements with scale/min pair `is+1`
+    ///
+    /// get_scale_min_k4 extracts 6-bit scale/min for pair j from scales[12]:
+    ///   if j < 4: scale = sc[j] & 0x3F;  min = sc[j+4] & 0x3F
+    ///   else:     scale = (sc[j+4] & 0x0F) | ((sc[j-4] >> 6) << 4);
+    ///             min   = (sc[j+4] >> 4)   | ((sc[j+0] >> 6) << 4)
+    pub fn decode_q4k_to_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q4K,
+            "decode_q4k_to_f32 called on non-Q4K tensor");
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem = info.n_elements();
+        let n_blocks = (n_elem + 255) / 256;
+        let mut out = vec![0.0f32; n_elem];
+
+        // get_scale_min_k4: extract 6-bit scale and min for pair j (0..8)
+        let get_scale_min = |sc: &[u8], j: usize| -> (f32, f32) {
+            let (sc_val, min_val) = if j < 4 {
+                (sc[j] & 0x3F, sc[j + 4] & 0x3F)
+            } else {
+                (
+                    (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4),
+                    (sc[j + 4] >> 4)   | ((sc[j + 0] >> 6) << 4),
+                )
+            };
+            (sc_val as f32, min_val as f32)
+        };
+
+        for b in 0..n_blocks {
+            let block_off = b * 144;
+            let d_bits    = u16::from_le_bytes([bytes[block_off],     bytes[block_off + 1]]);
+            let dmin_bits = u16::from_le_bytes([bytes[block_off + 2], bytes[block_off + 3]]);
+            let d    = f16_to_f32(d_bits);
+            let dmin = f16_to_f32(dmin_bits);
+            let sc   = &bytes[block_off + 4..block_off + 16];
+            let qs   = &bytes[block_off + 16..block_off + 144];
+
+            let base = b * 256;
+            let end  = (base + 256).min(n_elem);
+
+            // Process 4 chunks of 64 elements. Each chunk advances qs by 32 bytes
+            // and uses 2 scale/min pairs.
+            let mut q_off = 0usize; // offset into qs[]
+            let mut is    = 0usize; // scale/min pair index
+            let mut elem  = 0usize; // element within block
+
+            for _chunk in 0..4 {
+                let (d1, m1) = get_scale_min(sc, is);
+                let (d2, m2) = get_scale_min(sc, is + 1);
+                let scale1 = d * d1;
+                let min1   = dmin * m1;
+                let scale2 = d * d2;
+                let min2   = dmin * m2;
+
+                // First 32 elements: low nibbles of qs[q_off .. q_off+32]
+                for l in 0..32usize {
+                    if base + elem < end {
+                        out[base + elem] = scale1 * (qs[q_off + l] & 0x0F) as f32 - min1;
+                    }
+                    elem += 1;
+                }
+                // Next 32 elements: high nibbles of qs[q_off .. q_off+32]
+                for l in 0..32usize {
+                    if base + elem < end {
+                        out[base + elem] = scale2 * (qs[q_off + l] >> 4) as f32 - min2;
+                    }
+                    elem += 1;
+                }
+
+                q_off += 32;
+                is    += 2;
             }
         }
 

@@ -705,6 +705,196 @@ impl MatBf16 {
     }
 }
 
+// =============================================================================
+// Q4KMat — Q4_K (GGUF Q4_K_M) native packed storage
+// =============================================================================
+//
+// Stores weights in the raw Q4_K block layout (144 bytes per 256 elements):
+//   bytes[0..2]   — f16 `d`    (super-block scale for the 8 sub-block scales)
+//   bytes[2..4]   — f16 `dmin` (super-block scale for the 8 sub-block mins)
+//   bytes[4..16]  — 12 packed 6-bit scale/min pairs
+//   bytes[16..144]— 128 bytes of 4-bit quants (4 chunks × 32 bytes × 8 nibbles)
+//
+// Dequantization on-the-fly avoids storing BF16/f32 copies at rest, saving
+// ~3.5× RAM compared to BF16 (144/256 ≈ 0.56 bytes/elem vs 2 bytes/elem).
+//
+// The matmul path mirrors Q4Mat: chunked SGEMM for decode (M ≤ 4),
+// full dequant + single SGEMM for prefill (M > 4).
+
+/// Q4_K native packed weight matrix.
+///
+/// `blocks` holds the raw GGUF Q4_K bytes in row-major block order.
+/// Each super-block of 256 elements takes exactly 144 bytes.
+/// Dimensions follow our convention: `rows` = out_features, `cols` = in_features.
+#[derive(Clone)]
+pub struct Q4KMat {
+    pub rows: usize,
+    pub cols: usize,
+    /// Raw Q4_K block bytes: `n_blocks * 144` bytes where
+    /// `n_blocks = ceil(rows * cols / 256)`.
+    pub blocks: Vec<u8>,
+}
+
+impl Q4KMat {
+    /// Convert IEEE 754 half-precision (f16) bits to f32.
+    /// Q4_K super-block headers store d and dmin as f16, not bfloat16.
+    #[inline(always)]
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign     = ((bits >> 15) & 1) as u32;
+        let exponent = ((bits >> 10) & 0x1F) as u32;
+        let mantissa = (bits & 0x3FF) as u32;
+        let f32_bits = if exponent == 0 {
+            // Denormal: ±0.0 if mantissa==0, else denormal
+            if mantissa == 0 { sign << 31 }
+            else {
+                // Normalise the denormal (matches gguf_loader::f16_to_f32)
+                let mut m = mantissa;
+                let mut e = 0u32;
+                while (m & 0x400) == 0 { m <<= 1; e += 1; }
+                m &= 0x3FF;
+                (sign << 31) | ((127 - 14 - e) << 23) | (m << 13)
+            }
+        } else if exponent == 0x1F {
+            // Inf / NaN
+            (sign << 31) | (0xFF << 23) | (mantissa << 13)
+        } else {
+            (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13)
+        };
+        f32::from_bits(f32_bits)
+    }
+
+    /// Extract the 6-bit scale and 6-bit min for sub-block pair `j` (0..8)
+    /// from the 12-byte scales array of a Q4_K super-block.
+    #[inline(always)]
+    fn scale_min(sc: &[u8], j: usize) -> (f32, f32) {
+        let (sv, mv) = if j < 4 {
+            (sc[j] & 0x3F, sc[j + 4] & 0x3F)
+        } else {
+            (
+                (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4),
+                (sc[j + 4] >> 4)   | ((sc[j + 0] >> 6) << 4),
+            )
+        };
+        (sv as f32, mv as f32)
+    }
+
+    /// Dequantize row `row_idx` (in [0, rows)) into `buf` (length >= cols).
+    ///
+    /// `cols` must be a multiple of 256 (true for all Gemma3 weight matrices),
+    /// so each row starts exactly on a super-block boundary.
+    pub fn dequantize_row_into(&self, row_idx: usize, buf: &mut [f32]) {
+        let k = self.cols;
+        debug_assert_eq!(k % 256, 0, "cols must be a multiple of 256");
+        let n_blocks = k / 256;
+        let base_block = row_idx * n_blocks;
+
+        for b in 0..n_blocks {
+            let boff = (base_block + b) * 144;
+            let d_bits    = u16::from_le_bytes([self.blocks[boff],     self.blocks[boff + 1]]);
+            let dmin_bits = u16::from_le_bytes([self.blocks[boff + 2], self.blocks[boff + 3]]);
+            let d    = Self::f16_to_f32(d_bits);
+            let dmin = Self::f16_to_f32(dmin_bits);
+            let sc   = &self.blocks[boff + 4..boff + 16];
+            let qs   = &self.blocks[boff + 16..boff + 144];
+
+            // 4 chunks of 64 elements; chunk c uses qs[c*32..(c+1)*32]:
+            //   low  nibbles → sub-block 2c   (scale_min index 2c)
+            //   high nibbles → sub-block 2c+1 (scale_min index 2c+1)
+            let out = &mut buf[b * 256..(b + 1) * 256];
+            for chunk in 0..4usize {
+                let (sv1, mv1) = Self::scale_min(sc, chunk * 2);
+                let (sv2, mv2) = Self::scale_min(sc, chunk * 2 + 1);
+                let scale1 = d * sv1; let min1 = dmin * mv1;
+                let scale2 = d * sv2; let min2 = dmin * mv2;
+                let q = &qs[chunk * 32..(chunk + 1) * 32];
+                let (lo, hi) = out[chunk * 64..chunk * 64 + 64].split_at_mut(32);
+                for l in 0..32 {
+                    lo[l] = scale1 * (q[l] & 0x0F) as f32 - min1;
+                    hi[l] = scale2 * (q[l] >> 4)   as f32 - min2;
+                }
+            }
+        }
+    }
+
+    /// Memory usage in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Scalar matmul: `a [M, K] @ self^T [N, K] → [M, N]`.
+    pub fn matmul_q4k_t(&self, a: &Mat) -> Mat {
+        let (m, k, n) = (a.rows, a.cols, self.rows);
+        assert_eq!(k, self.cols, "matmul_q4k_t: a.cols {} != q4k.cols {}", k, self.cols);
+        let mut out = Mat::zeros(m, n);
+        let mut row_buf = vec![0.0f32; k];
+        for j in 0..n {
+            self.dequantize_row_into(j, &mut row_buf);
+            for i in 0..m {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a.data[i * k + p] * row_buf[p];
+                }
+                *out.at_mut(i, j) = acc;
+            }
+        }
+        out
+    }
+
+    /// BLAS-accelerated matmul: `a [M, K] @ self^T [N, K] → [M, N]`.
+    ///
+    /// Decode path (M ≤ 4): chunked SGEMM (target ~8 MB scratch).
+    /// Prefill path (M > 4): full dequant + single SGEMM.
+    #[cfg(feature = "blas")]
+    pub fn matmul_q4k_t_blas(&self, a: &Mat) -> Mat {
+        let (m, k, n) = (a.rows, a.cols, self.rows);
+        assert_eq!(k, self.cols, "matmul_q4k_t_blas: a.cols {} != q4k.cols {}", k, self.cols);
+
+        // Prefill: full dequant → single sgemm.
+        if m > 4 {
+            let mut w_f32 = vec![0.0f32; n * k];
+            for j in 0..n {
+                self.dequantize_row_into(j, &mut w_f32[j * k..(j + 1) * k]);
+            }
+            let w = Mat { data: w_f32, rows: n, cols: k };
+            return a.matmul_bt(&w);
+        }
+
+        // Decode: chunked SGEMM.
+        let chunk: usize = ((8 * 1024 * 1024) / (k * 4)).max(64).min(n);
+        let mut out = Mat::zeros(m, n);
+        let mut chunk_buf = vec![0.0f32; chunk * k];
+
+        let mut j0 = 0usize;
+        while j0 < n {
+            let j1     = (j0 + chunk).min(n);
+            let actual = j1 - j0;
+            for ji in 0..actual {
+                self.dequantize_row_into(j0 + ji, &mut chunk_buf[ji * k..(ji + 1) * k]);
+            }
+            unsafe {
+                cblas::sgemm(
+                    cblas::Layout::RowMajor,
+                    cblas::Transpose::None,
+                    cblas::Transpose::Ordinary,
+                    m as i32,
+                    actual as i32,
+                    k as i32,
+                    1.0f32,
+                    &a.data,
+                    k as i32,
+                    &chunk_buf[..actual * k],
+                    k as i32,
+                    0.0f32,
+                    &mut out.data[j0..],
+                    n as i32,
+                );
+            }
+            j0 = j1;
+        }
+        out
+    }
+}
+
 impl Mat {
     /// Convert this `Mat` to compact BF16 storage.
     pub fn to_bf16(&self) -> MatBf16 {

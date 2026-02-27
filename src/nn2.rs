@@ -22,7 +22,7 @@
 /// Each parameter is a `TensorNode::leaf` — no backward function, just
 /// raw data and a gradient accumulator. The optimizer reads `.grad()` and
 /// writes `.set_data()` directly on these leaf nodes.
-use crate::autograd2::{Mat, MatBf16, Q4Mat, TensorNode};
+use crate::autograd2::{Mat, MatBf16, Q4KMat, Q4Mat, TensorNode};
 use crate::nn::InitRng; // reuse the RNG from Phase 2
 
 // =============================================================================
@@ -114,6 +114,9 @@ pub struct Linear2 {
     /// INT4 quantized weight, set by `quantize()`.
     /// When present, forward uses `matmul_q4_t` instead of the f32 weight.
     pub q4_weight: Option<Q4Mat>,
+    /// Q4_K native packed weight (GGUF Q4_K_M). When present, forward
+    /// dequantizes on-the-fly: ~3.5× less RAM than BF16.
+    pub q4k_weight: Option<Q4KMat>,
     /// BF16 weight storage (inference-only). When present and q4_weight is
     /// absent, forward dequantizes on-the-fly: 2× less RAM than f32, lossless.
     pub bf16_weight: Option<MatBf16>,
@@ -133,6 +136,7 @@ impl Linear2 {
             in_features,
             out_features,
             q4_weight: None,
+            q4k_weight: None,
             bf16_weight: None,
         }
     }
@@ -153,6 +157,7 @@ impl Linear2 {
             in_features,
             out_features,
             q4_weight: None,
+            q4k_weight: None,
             bf16_weight: None,
         }
     }
@@ -223,7 +228,7 @@ impl Linear2 {
         let x = input.data().clone();
         let b = self.bias.data().clone();
 
-        // Forward matmul priority: Q4 > BF16 > f32.
+        // Forward matmul priority: Q4 > Q4K > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
             // Q4_0 path: chunked SGEMM decode or full-dequant sgemm for prefill.
             // See Q4Mat::matmul_q4_t_blas for the dispatch strategy.
@@ -236,6 +241,24 @@ impl Linear2 {
             let mut o = q4.matmul_q4_t_blas(&x);
             #[cfg(not(feature = "blas"))]
             let mut o = q4.matmul_q4_t(&x);
+            for r in 0..o.rows {
+                for c in 0..o.cols {
+                    *o.at_mut(r, c) += b.at(0, c);
+                }
+            }
+            o
+        } else if let Some(ref q4k) = self.q4k_weight {
+            // Q4_K path: chunked SGEMM decode or full-dequant sgemm for prefill.
+            // See Q4KMat::matmul_q4k_t_blas for the dispatch strategy.
+            assert_eq!(
+                x.cols, q4k.cols,
+                "Linear (q4k): input cols {} != weight cols {}",
+                x.cols, q4k.cols
+            );
+#[cfg(feature = "blas")]
+            let mut o = q4k.matmul_q4k_t_blas(&x);
+            #[cfg(not(feature = "blas"))]
+            let mut o = q4k.matmul_q4k_t(&x);
             for r in 0..o.rows {
                 for c in 0..o.cols {
                     *o.at_mut(r, c) += b.at(0, c);
@@ -283,7 +306,7 @@ impl Linear2 {
         // heap allocation plus four Arc increments per linear-layer call — a
         // meaningful reduction in allocator pressure during token generation
         // (the inference hot-path calls ~180+ linear layers per decode step).
-        if self.q4_weight.is_some() || self.bf16_weight.is_some() {
+        if self.q4_weight.is_some() || self.q4k_weight.is_some() || self.bf16_weight.is_some() {
             return out;
         }
 
