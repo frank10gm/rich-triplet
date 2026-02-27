@@ -135,7 +135,7 @@ impl CliArgs {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
-            rep_penalty: 1.0,
+            rep_penalty: 1.1,
             seed: 42,
             train_steps: 200,
             checkpoint: None,

@@ -2593,8 +2593,9 @@ fn sample_token(
     let v = logits.cols;
     let mut scores: Vec<f32> = (0..v).map(|c| logits.at(row, c)).collect();
 
-    // Repetition penalty
-    if params.repetition_penalty != 1.0 {
+    // Repetition penalty — skipped at temperature=0 (greedy) to avoid
+    // perturbing the argmax when common tokens appear in the context.
+    if params.repetition_penalty != 1.0 && params.temperature > 0.0 {
         for &tok in seen {
             if tok < v {
                 if scores[tok] >= 0.0 {
