@@ -2595,8 +2595,11 @@ fn sample_token(
 
     // Repetition penalty — skipped at temperature=0 (greedy) to avoid
     // perturbing the argmax when common tokens appear in the context.
+    // Window capped at 64 tokens (llama.cpp default) so common function words
+    // don't accumulate unbounded penalties as the sequence grows.
     if params.repetition_penalty != 1.0 && params.temperature > 0.0 {
-        for &tok in seen {
+        let window = &seen[seen.len().saturating_sub(64)..];
+        for &tok in window {
             if tok < v {
                 if scores[tok] >= 0.0 {
                     scores[tok] /= params.repetition_penalty;
