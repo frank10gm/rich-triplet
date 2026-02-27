@@ -162,6 +162,23 @@ impl Linear2 {
         }
     }
 
+    /// Create a Linear layer without bias, with zero-placeholder weights (no rng needed).
+    ///
+    /// Used for inference-only paths where weights will be loaded from GGUF/safetensors.
+    /// Avoids the expensive random-initialization allocation — saves ~12 GB peak RAM for
+    /// Gemma3-4b (34 layers × ~375 MB per layer).
+    pub fn new_no_bias_zeros(in_features: usize, out_features: usize) -> Self {
+        Linear2 {
+            weight: TensorNode::leaf(Mat::zeros(0, 0)),
+            bias: TensorNode::leaf(Mat::zeros(1, out_features)),
+            in_features,
+            out_features,
+            q4_weight: None,
+            q4k_weight: None,
+            bf16_weight: None,
+        }
+    }
+
     /// Quantize the weight matrix to 4-bit and store it.
     ///
     /// After calling this, `forward()` uses the INT4 path (`matmul_q4_t`)

@@ -196,6 +196,36 @@ impl Gemma3Attention {
         }
     }
 
+    /// Create attention with zero-placeholder weights — for inference-only use.
+    ///
+    /// Avoids the ~42 MB random-init allocation per layer. Weights must be
+    /// loaded via `load_weights_from_gguf` / `load_weights_from_dir` before use.
+    pub fn new_for_inference(cfg: &Config4, layer_idx: usize) -> Self {
+        let h = cfg.hidden_size;
+        let d = cfg.head_dim;
+        let nq = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let is_global = cfg.is_global_layer(layer_idx);
+        Gemma3Attention {
+            q_proj: Linear2::new_no_bias_zeros(h, nq * d),
+            k_proj: Linear2::new_no_bias_zeros(h, nkv * d),
+            v_proj: Linear2::new_no_bias_zeros(h, nkv * d),
+            o_proj: Linear2::new_no_bias_zeros(nq * d, h),
+            q_norm: RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
+            k_norm: RmsNorm2::new_with_eps(d, cfg.rms_norm_eps),
+            n_q_heads: nq,
+            n_kv_heads: nkv,
+            head_dim: d,
+            attn_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
+            sliding_window: if is_global { None } else { cfg.sliding_window },
+            rope_theta: if is_global {
+                cfg.rope_theta_global
+            } else {
+                cfg.rope_theta_local
+            },
+        }
+    }
+
     /// Forward pass: x [T, hidden] → output [T, hidden].
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         let t = x.data().rows;
@@ -265,6 +295,15 @@ impl Gemma3Mlp {
         }
     }
 
+    /// Create MLP with zero-placeholder weights — for inference-only use.
+    pub fn new_for_inference(cfg: &Config4) -> Self {
+        Gemma3Mlp {
+            gate_proj: Linear2::new_no_bias_zeros(cfg.hidden_size, cfg.intermediate_size),
+            up_proj: Linear2::new_no_bias_zeros(cfg.hidden_size, cfg.intermediate_size),
+            down_proj: Linear2::new_no_bias_zeros(cfg.intermediate_size, cfg.hidden_size),
+        }
+    }
+
     pub fn forward(&self, x: &TensorNode) -> TensorNode {
         // Gemma3 uses gelu_pytorch_tanh (approximate GeLU), not SiLU.
         let gate = self.gate_proj.forward(x).gelu_tanh();
@@ -309,6 +348,18 @@ impl Gemma3Block {
             pre_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
             post_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
             mlp: Gemma3Mlp::new(cfg, rng),
+        }
+    }
+
+    /// Create block with zero-placeholder weights — for inference-only use.
+    pub fn new_for_inference(cfg: &Config4, layer_idx: usize) -> Self {
+        Gemma3Block {
+            input_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            self_attn: Gemma3Attention::new_for_inference(cfg, layer_idx),
+            post_attention_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            pre_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            post_feedforward_layernorm: RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps),
+            mlp: Gemma3Mlp::new_for_inference(cfg),
         }
     }
 
@@ -392,6 +443,37 @@ impl Gemma3Model {
             bf16_weight: None,
         };
 
+        Gemma3Model {
+            embed_tokens: embed,
+            embed_bf16: None,
+            layers,
+            norm,
+            lm_head,
+            config: cfg,
+        }
+    }
+
+    /// Create a model with zero-placeholder weights — for inference-only use.
+    ///
+    /// Avoids allocating ~12.75 GB of random f32 weights that are immediately
+    /// overwritten by `load_weights_from_gguf` / `load_weights_from_dir`.
+    /// Do NOT use this for training (gradients won't work without real f32 weights).
+    pub fn new_for_inference(cfg: Config4) -> Self {
+        // Embed is a zero placeholder; actual data arrives via model_set_embed_bf16.
+        let embed = TensorNode::leaf(Mat::zeros(0, 0));
+        let layers: Vec<Gemma3Block> = (0..cfg.num_hidden_layers)
+            .map(|i| Gemma3Block::new_for_inference(&cfg, i))
+            .collect();
+        let norm = RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps);
+        let lm_head = Linear2 {
+            weight: embed.clone(),
+            bias: TensorNode::leaf(Mat::zeros(1, cfg.vocab_size)),
+            in_features: cfg.hidden_size,
+            out_features: cfg.vocab_size,
+            q4_weight: None,
+            q4k_weight: None,
+            bf16_weight: None,
+        };
         Gemma3Model {
             embed_tokens: embed,
             embed_bf16: None,
@@ -937,9 +1019,11 @@ fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, h
         rows: vocab,
         cols: hidden,
     });
+    // Use a zero-sized placeholder so the ~2.5 GB f32 init is freed immediately.
+    // The actual embedding lookup always goes through embed_bf16 when it's set.
     model
         .embed_tokens
-        .set_data(crate::autograd2::Mat::zeros(vocab, hidden));
+        .set_data(crate::autograd2::Mat::zeros(0, 0));
     model.lm_head.load_bf16_arc(arc, vocab, hidden);
 }
 
@@ -1378,10 +1462,10 @@ fn apply_tensor_inner(
                     rows: t.shape[0],
                     cols: t.shape[1],
                 });
-                // Keep a tiny f32 placeholder so the TensorNode shape is consistent.
+                // Free the f32 init — embedding lookup uses embed_bf16 exclusively.
                 model
                     .embed_tokens
-                    .set_data(crate::autograd2::Mat::zeros(t.shape[0], t.shape[1]));
+                    .set_data(crate::autograd2::Mat::zeros(0, 0));
                 // Share the same Arc with lm_head — no data copy.
                 model.lm_head.load_bf16_arc(arc, t.shape[0], t.shape[1]);
                 return Some(true);

@@ -439,8 +439,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         model_name, config.num_hidden_layers, config.hidden_size
     );
 
-    let mut rng = InitRng::new(0);
-    let mut model = Gemma3Model::new(config, &mut rng);
+    let mut model = Gemma3Model::new_for_inference(config);
 
     if is_gguf {
         // --- GGUF path: load directly from .gguf file ---
