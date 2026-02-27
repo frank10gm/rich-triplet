@@ -535,9 +535,12 @@ impl Mat {
 ///
 /// Use `Mat::from_bf16` to convert to f32 for computation.
 /// Use `Mat::to_bf16` to convert an f32 `Mat` back to `MatBf16`.
+///
+/// `data` is reference-counted so that weight-tied tensors (embed_tokens and
+/// lm_head) can share the same allocation without cloning 1.3 GB of BF16 bits.
 #[derive(Clone)]
 pub struct MatBf16 {
-    pub data: Vec<u16>, // bf16 bits, one u16 per element
+    pub data: std::sync::Arc<Vec<u16>>, // bf16 bits, one u16 per element
     pub rows: usize,
     pub cols: usize,
 }
@@ -899,7 +902,7 @@ impl Mat {
     /// Convert this `Mat` to compact BF16 storage.
     pub fn to_bf16(&self) -> MatBf16 {
         MatBf16 {
-            data: self.data.iter().map(|&v| MatBf16::f32_to_bf16(v)).collect(),
+            data: std::sync::Arc::new(self.data.iter().map(|&v| MatBf16::f32_to_bf16(v)).collect()),
             rows: self.rows,
             cols: self.cols,
         }

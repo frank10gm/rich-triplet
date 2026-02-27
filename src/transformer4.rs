@@ -892,7 +892,7 @@ impl Gemma3Model {
                 "[ GGUF ] embed_bf16 set: {}×{} — applying weight tying to lm_head.",
                 e.rows, e.cols
             );
-            self.lm_head.load_bf16(e.data.clone(), e.rows, e.cols);
+            self.lm_head.load_bf16_arc(e.data.clone(), e.rows, e.cols);
         } else {
             eprintln!("[ GGUF ] WARNING: embed_bf16 is None — token embeddings not loaded!");
         }
@@ -930,15 +930,17 @@ impl Gemma3Model {
 
 fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, hidden: usize) {
     use crate::autograd2::MatBf16;
+    // Wrap in Arc once so embed_bf16 and lm_head share the same allocation (no clone).
+    let arc = std::sync::Arc::new(bits);
     model.embed_bf16 = Some(MatBf16 {
-        data: bits.clone(),
+        data: arc.clone(),   // O(1) refcount bump, not a data copy
         rows: vocab,
         cols: hidden,
     });
     model
         .embed_tokens
         .set_data(crate::autograd2::Mat::zeros(vocab, hidden));
-    model.lm_head.load_bf16(bits, vocab, hidden);
+    model.lm_head.load_bf16_arc(arc, vocab, hidden);
 }
 
 /// Load a Linear2 weight from a GGUF tensor, supporting Q4_0, BF16, F16, F32.
@@ -1369,8 +1371,10 @@ fn apply_tensor_inner(
         if let Some(ref bits) = t.bf16_data {
             if bits.len() == t.shape[0] * t.shape[1] {
                 use crate::autograd2::MatBf16;
+                // Wrap in Arc so embed_bf16 and lm_head share one allocation.
+                let arc = std::sync::Arc::new(bits.clone());
                 model.embed_bf16 = Some(MatBf16 {
-                    data: bits.clone(),
+                    data: arc.clone(),
                     rows: t.shape[0],
                     cols: t.shape[1],
                 });
@@ -1378,10 +1382,8 @@ fn apply_tensor_inner(
                 model
                     .embed_tokens
                     .set_data(crate::autograd2::Mat::zeros(t.shape[0], t.shape[1]));
-                // Also store as bf16 in lm_head so the vocab projection is fast.
-                model
-                    .lm_head
-                    .load_bf16(bits.clone(), t.shape[0], t.shape[1]);
+                // Share the same Arc with lm_head — no data copy.
+                model.lm_head.load_bf16_arc(arc, t.shape[0], t.shape[1]);
                 return Some(true);
             }
         }

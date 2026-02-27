@@ -380,7 +380,18 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     let model_name = args.model.as_deref().unwrap_or("gemma3-1b");
 
     // Determine if --weights points to a GGUF file or a directory of safetensors.
-    let is_gguf = weights_path.ends_with(".gguf");
+    // Accept both ".gguf" extension and extensionless files (e.g. Ollama blob paths).
+    let is_gguf = weights_path.ends_with(".gguf")
+        || std::fs::metadata(weights_path).map(|m| m.is_file()).unwrap_or(false)
+            && !std::fs::metadata(weights_path).map(|m| m.is_dir()).unwrap_or(false)
+            && {
+                // Confirm GGUF magic: first 4 bytes == b"GGUF"
+                std::fs::File::open(weights_path).ok().and_then(|mut f| {
+                    use std::io::Read;
+                    let mut magic = [0u8; 4];
+                    f.read_exact(&mut magic).ok().map(|_| magic == *b"GGUF")
+                }).unwrap_or(false)
+            };
 
     // The tokenizer lives next to the weights (directory for safetensors).
     // For GGUF files, the tokenizer is NOT included — pass --tokenizer-dir pointing

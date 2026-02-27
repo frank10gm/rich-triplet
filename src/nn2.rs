@@ -212,10 +212,16 @@ impl Linear2 {
     /// Do NOT call this if you need backward passes.
     pub fn load_bf16(&mut self, bits: Vec<u16>, rows: usize, cols: usize) {
         self.bf16_weight = Some(MatBf16 {
-            data: bits,
+            data: std::sync::Arc::new(bits),
             rows,
             cols,
         });
+        self.weight.set_data(Mat::zeros(0, 0));
+    }
+
+    /// Same as `load_bf16` but takes an already Arc-wrapped slice, avoiding a clone.
+    pub fn load_bf16_arc(&mut self, data: std::sync::Arc<Vec<u16>>, rows: usize, cols: usize) {
+        self.bf16_weight = Some(MatBf16 { data, rows, cols });
         self.weight.set_data(Mat::zeros(0, 0));
     }
 
