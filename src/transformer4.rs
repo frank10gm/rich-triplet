@@ -1873,6 +1873,7 @@ impl Gemma3Model {
         top_p: f32,
         repetition_penalty: f32,
         seed: u64,
+        debug: bool,
         mut callback: impl FnMut(usize),
     ) {
         use crate::transformer3::SamplingParams;
@@ -1948,36 +1949,10 @@ impl Gemma3Model {
         );
 
         // ── Prefill logit diagnostics ──────────────────────────────────────
-        {
-            // Hidden-state (post final-norm, last token row)
-            let nx = normed_final.data();
-            let nx_vals = &nx.data;
-            let nx_min = nx_vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let nx_max = nx_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let nx_mean = nx_vals.iter().sum::<f32>() / nx_vals.len() as f32;
-            let nx_std = {
-                let v = nx_vals.iter().map(|&v| (v - nx_mean).powi(2)).sum::<f32>()
-                    / nx_vals.len() as f32;
-                v.sqrt()
-            };
-            // eprintln!(
-            //     "[ Gemma3-dbg ] prefill hidden_after_norm: \
-            //      min={:.4} max={:.4} mean={:.4} std={:.4}",
-            //     nx_min, nx_max, nx_mean, nx_std
-            // );
-
+        if debug {
             let ld = logits_node.data();
             let lv = &ld.data;
-            let l_min = lv.iter().cloned().fold(f32::INFINITY, f32::min);
             let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let l_mean = lv.iter().sum::<f32>() / lv.len() as f32;
-            // eprintln!(
-            //     "[ Gemma3-dbg ] prefill logits: min={:.2} max={:.2} mean={:.2}  vocab={}",
-            //     l_min,
-            //     l_max,
-            //     l_mean,
-            //     lv.len()
-            // );
             let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
@@ -1986,15 +1961,6 @@ impl Gemma3Model {
                 "[ Gemma3-dbg ] prefill logit_max={:.2}  gap={:.2}  top-5: {:?}",
                 l_max, gap, top5
             );
-
-            let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
-            let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
-            if n_nan > 0 || n_inf > 0 {
-                // eprintln!(
-                //     "[ Gemma3-dbg ] *** WARNING: {} NaN, {} Inf in prefill logits ***",
-                //     n_nan, n_inf
-                // );
-            }
         }
 
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
@@ -2038,8 +2004,7 @@ impl Gemma3Model {
             t_lmhead_us += t2.elapsed().as_micros();
 
             // ── Diagnostics for all decode steps ──────────────────────────
-            {
-                // Hidden-state norms (before and after final norm)
+            if debug {
                 let xd = x.data();
                 let xv = &xd.data;
                 let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
@@ -2058,22 +2023,6 @@ impl Gemma3Model {
                     "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
                     step, prev, x_norm, nx_norm, l_max, gap, top5
                 );
-                let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
-                let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
-                if n_nan > 0 || n_inf > 0 {
-                    eprintln!(
-                        "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
-                        n_nan, n_inf
-                    );
-                }
-                let x_nan = xv.iter().filter(|v| v.is_nan()).count();
-                let x_inf = xv.iter().filter(|v| v.is_infinite()).count();
-                if x_nan > 0 || x_inf > 0 {
-                    eprintln!(
-                        "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in hidden state ***",
-                        x_nan, x_inf
-                    );
-                }
             }
 
             prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
@@ -3047,7 +2996,7 @@ mod tests {
         let mut rng = InitRng::new(7);
         let model = Gemma3Model::new(cfg, &mut rng);
         let mut generated = Vec::new();
-        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, |tok| {
+        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, false, |tok| {
             generated.push(tok);
         });
         assert!(!generated.is_empty());
@@ -3074,7 +3023,7 @@ mod tests {
 
         // Cached: greedy (temperature=0)
         let mut cached_tok = usize::MAX;
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, |tok| {
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, |tok| {
             cached_tok = tok;
         });
 
@@ -3094,7 +3043,7 @@ mod tests {
         let model = Gemma3Model::new(cfg.clone(), &mut rng);
         let prompt: Vec<usize> = (0..20).map(|i| i % cfg.vocab_size).collect();
         let mut toks = Vec::new();
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, |t| toks.push(t));
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, |t| toks.push(t));
         assert_eq!(toks.len(), 1);
         assert!(toks[0] < cfg.vocab_size);
     }

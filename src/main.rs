@@ -120,6 +120,8 @@ struct CliArgs {
     benchmark: bool,
     /// --quantize : quantize weights to Q4 after loading (saves RAM, may improve output quality)
     quantize: bool,
+    /// --debug : enable per-step diagnostic logging (h_rms, logit gaps, top-5 tokens)
+    debug: bool,
 }
 
 impl CliArgs {
@@ -144,6 +146,7 @@ impl CliArgs {
             pretokenize: None,
             benchmark: false,
             quantize: false,
+            debug: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -259,6 +262,9 @@ impl CliArgs {
                 "--quantize" => {
                     a.quantize = true;
                 }
+                "--debug" => {
+                    a.debug = true;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -310,6 +316,7 @@ fn print_help() {
     println!("  --train-steps N          Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");
     println!("  --benchmark              Run scalar-vs-tensor autograd benchmark");
+    println!("  --debug                  Enable per-step diagnostic logging");
     println!("  --pretokenize S D        Tokenize text file S, write binary D.bin");
     println!("                           Uses char tokenizer built from S.");
     println!("                           For BPE: also pass --vocab and --merges.");
@@ -505,7 +512,6 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
     print!("{}", prompt);
     std::io::stdout().flush().ok();
 
-    let mut step_count = 0usize;
     model.generate_cached_streaming(
         &token_ids,
         args.max_new,
@@ -514,16 +520,9 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         args.top_p,
         args.rep_penalty,
         args.seed,
+        args.debug,
         |tok_id| {
             let text = tok.decode(&[tok_id as u32]);
-            // Print first 15 generated tokens with their IDs for debugging
-            if step_count < 15 {
-                // eprintln!(
-                //     "[ Gemma3-dbg ] gen[{}] id={} text={:?}",
-                //     step_count, tok_id, text
-                // );
-            }
-            step_count += 1;
             print!("{}", text);
             std::io::stdout().flush().ok();
         },
