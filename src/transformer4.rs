@@ -64,6 +64,10 @@ pub struct Config4 {
     /// RoPE base theta. 10_000 for local layers, 1_000_000 for global in Gemma 3.
     pub rope_theta_local: f32,
     pub rope_theta_global: f32,
+    /// RoPE frequency scale (linear scaling). 1.0 = no scaling.
+    /// For Gemma 3 4B global layers: 1/8 = 0.125 (rope_scaling.factor = 8).
+    pub rope_freq_scale_local: f32,
+    pub rope_freq_scale_global: f32,
     pub rms_norm_eps: f32,
     /// Attention score scale = 1 / sqrt(query_pre_attn_scalar).
     /// In Gemma 3 this is 256.0 so scale = 1/16.
@@ -89,6 +93,8 @@ impl Config4 {
             sliding_window: Some(512),
             rope_theta_local: 10_000.0,
             rope_theta_global: 1_000_000.0,
+            rope_freq_scale_local: 1.0,
+            rope_freq_scale_global: 1.0,
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
             eos_token_id: 1, // <eos> in Gemma tokenizer
@@ -100,7 +106,8 @@ impl Config4 {
     /// Source: google/gemma-3-4b-it config.json / unsloth/gemma-3-4b-pt config.json
     ///
     /// rope_scaling: {factor: 8.0, rope_type: "linear"} applies to global layers only.
-    /// Effective global theta = rope_theta (1M) * factor (8) = 8M.
+    /// Linear scaling divides inv_freq by factor (equivalent to scaling position
+    /// by 1/factor), NOT multiplying theta by factor.
     /// Local layers use rope_local_base_freq = 10_000 (no scaling).
     pub fn gemma3_4b() -> Self {
         Config4 {
@@ -113,7 +120,9 @@ impl Config4 {
             head_dim: 256,
             sliding_window: Some(1024),
             rope_theta_local: 10_000.0,
-            rope_theta_global: 8_000_000.0, // 1_000_000 * rope_scaling.factor(8.0)
+            rope_theta_global: 1_000_000.0,
+            rope_freq_scale_local: 1.0,
+            rope_freq_scale_global: 0.125, // 1/factor = 1/8
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 256.0,
             eos_token_id: 1, // also 106, checked separately in generate loop
@@ -165,6 +174,8 @@ pub struct Gemma3Attention {
     pub sliding_window: Option<usize>,
     /// RoPE theta for this layer (10k for local, 1M for global).
     pub rope_theta: f32,
+    /// RoPE frequency scale (linear scaling). 1.0 for local, 1/8 for global.
+    pub rope_freq_scale: f32,
 }
 
 impl Gemma3Attention {
@@ -192,6 +203,11 @@ impl Gemma3Attention {
                 cfg.rope_theta_global
             } else {
                 cfg.rope_theta_local
+            },
+            rope_freq_scale: if is_global {
+                cfg.rope_freq_scale_global
+            } else {
+                cfg.rope_freq_scale_local
             },
         }
     }
@@ -223,6 +239,11 @@ impl Gemma3Attention {
             } else {
                 cfg.rope_theta_local
             },
+            rope_freq_scale: if is_global {
+                cfg.rope_freq_scale_global
+            } else {
+                cfg.rope_freq_scale_local
+            },
         }
     }
 
@@ -242,9 +263,9 @@ impl Gemma3Attention {
         let q = apply_per_head_norm(&q, &self.q_norm, t, nq, d);
         let k = apply_per_head_norm(&k, &self.k_norm, t, nkv, d);
 
-        // Apply RoPE to each head
-        let q = apply_rope_to_all_heads(&q, nq, t, d, self.rope_theta);
-        let k = apply_rope_to_all_heads(&k, nkv, t, d, self.rope_theta);
+        // Apply RoPE to each head (NeoX pattern: half-split pairs)
+        let q = apply_rope_to_all_heads(&q, nq, t, d, self.rope_theta, self.rope_freq_scale);
+        let k = apply_rope_to_all_heads(&k, nkv, t, d, self.rope_theta, self.rope_freq_scale);
 
         // GQA attention
         let attn_out = if let Some(window) = self.sliding_window {
@@ -1762,9 +1783,9 @@ impl Gemma3Attention {
         let q = apply_per_head_norm(&q, &self.q_norm, n_new, nq, d);
         let k = apply_per_head_norm(&k, &self.k_norm, n_new, nkv, d);
 
-        // 3. RoPE at absolute positions
-        let q = apply_rope_at_offset(&q, nq, n_new, d, self.rope_theta, seq_offset);
-        let k = apply_rope_at_offset(&k, nkv, n_new, d, self.rope_theta, seq_offset);
+        // 3. RoPE at absolute positions (NeoX pattern: half-split pairs)
+        let q = apply_rope_at_offset(&q, nq, n_new, d, self.rope_theta, seq_offset, self.rope_freq_scale);
+        let k = apply_rope_at_offset(&k, nkv, n_new, d, self.rope_theta, seq_offset, self.rope_freq_scale);
 
         // 4. Append to cache
         cache.append(&k.data().clone(), &v.data().clone());
@@ -1960,7 +1981,11 @@ impl Gemma3Model {
             let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-            // eprintln!("[ Gemma3-dbg ] prefill top-5 raw logits: {:?}", top5);
+            let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
+            eprintln!(
+                "[ Gemma3-dbg ] prefill logit_max={:.2}  gap={:.2}  top-5: {:?}",
+                l_max, gap, top5
+            );
 
             let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
             let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
@@ -2012,8 +2037,16 @@ impl Gemma3Model {
             let logits_node = self.lm_head.forward(&normed_x);
             t_lmhead_us += t2.elapsed().as_micros();
 
-            // ── Diagnostics for first 30 decode steps ─────────────────────
-            if step <= 30 {
+            // ── Diagnostics for all decode steps ──────────────────────────
+            {
+                // Hidden-state norms (before and after final norm)
+                let xd = x.data();
+                let xv = &xd.data;
+                let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
+                let nx = normed_x.data();
+                let nxv = &nx.data;
+                let nx_norm = (nxv.iter().map(|v| v * v).sum::<f32>() / nxv.len() as f32).sqrt();
+
                 let ld = logits_node.data();
                 let lv = &ld.data;
                 let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2022,8 +2055,8 @@ impl Gemma3Model {
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
                 let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
                 eprintln!(
-                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
-                    step, prev, l_max, gap, top5
+                    "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
+                    step, prev, x_norm, nx_norm, l_max, gap, top5
                 );
                 let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
                 let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
@@ -2031,6 +2064,14 @@ impl Gemma3Model {
                     eprintln!(
                         "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in logits ***",
                         n_nan, n_inf
+                    );
+                }
+                let x_nan = xv.iter().filter(|v| v.is_nan()).count();
+                let x_inf = xv.iter().filter(|v| v.is_infinite()).count();
+                if x_nan > 0 || x_inf > 0 {
+                    eprintln!(
+                        "[ Gemma3-dbg ]   *** WARNING: {} NaN, {} Inf in hidden state ***",
+                        x_nan, x_inf
                     );
                 }
             }
@@ -2178,24 +2219,25 @@ fn apply_rope_to_all_heads(
     t: usize,
     head_dim: usize,
     theta: f32,
+    freq_scale: f32,
 ) -> TensorNode {
     let x_data = x.data().clone();
     let mut out = x_data.clone();
+    let half = head_dim / 2;
 
     for h in 0..n_heads {
         for pos in 0..t {
-            // Rotate pairs (2i, 2i+1) within this head
-            let pairs = head_dim / 2;
-            for i in 0..pairs {
-                let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            // NeoX/half-split RoPE: rotate pairs (i, i + half) within each head
+            for i in 0..half {
+                let angle = (pos as f32 * freq_scale) / theta.powf(2.0 * i as f32 / head_dim as f32);
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
-                let c0 = h * head_dim + 2 * i;
-                let c1 = h * head_dim + 2 * i + 1;
+                let c0 = h * head_dim + i;
+                let c1 = h * head_dim + i + half;
                 let x0 = x_data.at(pos, c0);
                 let x1 = x_data.at(pos, c1);
                 *out.at_mut(pos, c0) = x0 * cos_a - x1 * sin_a;
-                *out.at_mut(pos, c1) = x1 * cos_a + x0 * sin_a;
+                *out.at_mut(pos, c1) = x0 * sin_a + x1 * cos_a;
             }
         }
     }
@@ -2212,13 +2254,12 @@ fn apply_rope_to_all_heads(
             let mut dx = x_c.grad().clone();
             for h in 0..n_heads {
                 for pos in 0..t {
-                    let pairs = head_dim / 2;
-                    for i in 0..pairs {
-                        let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                    for i in 0..half {
+                        let angle = (pos as f32 * freq_scale) / theta.powf(2.0 * i as f32 / head_dim as f32);
                         let cos_a = angle.cos();
                         let sin_a = angle.sin();
-                        let c0 = h * head_dim + 2 * i;
-                        let c1 = h * head_dim + 2 * i + 1;
+                        let c0 = h * head_dim + i;
+                        let c1 = h * head_dim + i + half;
                         // Inverse rotation: [cos, sin; -sin, cos] (transpose of forward)
                         let dy0 = dout.at(pos, c0);
                         let dy1 = dout.at(pos, c1);
@@ -2342,6 +2383,8 @@ fn gqa_attention_windowed(
 /// Used in the KV-cached decode path where token row `r` is at absolute
 /// sequence position `offset + r`.  This is the inference-only counterpart
 /// to `apply_rope_to_all_heads` (which always starts at position 0).
+///
+/// Uses NeoX/half-split pairing: element `i` pairs with `i + head_dim/2`.
 fn apply_rope_at_offset(
     x: &TensorNode,
     n_heads: usize,
@@ -2349,23 +2392,24 @@ fn apply_rope_at_offset(
     head_dim: usize,
     theta: f32,
     offset: usize,
+    freq_scale: f32,
 ) -> TensorNode {
     let x_data = x.data().clone();
     let mut out = x_data.clone();
+    let half = head_dim / 2;
     for h in 0..n_heads {
         for row in 0..n_new {
             let pos = offset + row;
-            let pairs = head_dim / 2;
-            for i in 0..pairs {
-                let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            for i in 0..half {
+                let angle = (pos as f32 * freq_scale) / theta.powf(2.0 * i as f32 / head_dim as f32);
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
-                let c0 = h * head_dim + 2 * i;
-                let c1 = h * head_dim + 2 * i + 1;
+                let c0 = h * head_dim + i;
+                let c1 = h * head_dim + i + half;
                 let x0 = x_data.at(row, c0);
                 let x1 = x_data.at(row, c1);
                 *out.at_mut(row, c0) = x0 * cos_a - x1 * sin_a;
-                *out.at_mut(row, c1) = x1 * cos_a + x0 * sin_a;
+                *out.at_mut(row, c1) = x0 * sin_a + x1 * cos_a;
             }
         }
     }
@@ -2603,11 +2647,11 @@ fn sample_token(
     let v = logits.cols;
     let mut scores: Vec<f32> = (0..v).map(|c| logits.at(row, c)).collect();
 
-    // Repetition penalty — skipped at temperature=0 (greedy) to avoid
-    // perturbing the argmax when common tokens appear in the context.
-    // Window capped at 64 tokens (llama.cpp default) so common function words
-    // don't accumulate unbounded penalties as the sequence grows.
-    if params.repetition_penalty != 1.0 && params.temperature > 0.0 {
+    // Repetition penalty — applied at all temperatures.  `seen` only contains
+    // generated tokens (not prompt), so chat-template tokens like <end_of_turn>
+    // are never penalised.  Window capped at 64 tokens (llama.cpp default) so
+    // common function words don't accumulate unbounded penalties.
+    if params.repetition_penalty != 1.0 {
         let window = &seen[seen.len().saturating_sub(64)..];
         for &tok in window {
             if tok < v {
@@ -2725,6 +2769,8 @@ mod tests {
             sliding_window: Some(8),
             rope_theta_local: 10_000.0,
             rope_theta_global: 1_000_000.0,
+            rope_freq_scale_local: 1.0,
+            rope_freq_scale_global: 1.0,
             rms_norm_eps: 1e-6,
             query_pre_attn_scalar: 16.0, // matches head_dim for this tiny cfg
             eos_token_id: 1,

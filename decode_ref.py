@@ -332,5 +332,33 @@ for i in range(N_LAYERS):
 normed_dec = rms_norm_gemma3(x_dec, final_norm_gamma)
 logits_dec = normed_dec @ embed.T   # [1, vocab]
 top_idx    = np.argsort(logits_dec[0])[::-1][:5]
-print(f"\nDecode step 1 top-5 tokens: {[(int(t), round(float(logits_dec[0, t]), 3)) for t in top_idx]}", flush=True)
+h_rms = float(np.sqrt((x_dec**2).mean()))
+hn_rms = float(np.sqrt((normed_dec**2).mean()))
+print(f"\nDecode step 1: h_rms={h_rms:.2f}  hn_rms={hn_rms:.2f}", flush=True)
+print(f"Decode step 1 top-5 tokens: {[(int(t), round(float(logits_dec[0, t]), 3)) for t in top_idx]}", flush=True)
 print("(Expected: token 900 = ' +' should be in top-1)", flush=True)
+
+# ── Multi-step greedy decode (h_rms tracking) ────────────────────────────────
+print(f"\n--- Running 30 greedy decode steps to track h_rms growth ---", flush=True)
+
+# Step 1 already done above; get its argmax token
+prev_tok = int(np.argmax(logits_dec[0]))
+print(f"[ numpy step=1 ] tok={prev_tok}  h_rms={h_rms:.2f}  hn_rms={hn_rms:.2f}  logit_max={float(logits_dec[0].max()):.2f}", flush=True)
+
+for step in range(2, 31):
+    x_s = embed[[prev_tok]] * embed_scale
+    for i in range(N_LAYERS):
+        x_s, seq_lens[i] = layer_forward(
+            x_s, layers[i], k_caches[i], v_caches[i],
+            seq_offset=seq_lens[i],
+            causal=False,
+        )
+    h_rms_s = float(np.sqrt((x_s**2).mean()))
+    normed_s = rms_norm_gemma3(x_s, final_norm_gamma)
+    hn_rms_s = float(np.sqrt((normed_s**2).mean()))
+    logits_s = normed_s @ embed.T
+    l_max = float(logits_s[0].max())
+    top5 = [(int(t), round(float(logits_s[0, t]), 3)) for t in np.argsort(logits_s[0])[::-1][:5]]
+    gap = top5[0][1] - top5[1][1] if len(top5) >= 2 else 0.0
+    prev_tok = int(np.argmax(logits_s[0]))
+    print(f"[ numpy step={step} ] tok={prev_tok}  h_rms={h_rms_s:.2f}  hn_rms={hn_rms_s:.2f}  logit_max={l_max:.2f}  gap={gap:.2f}  top5={top5}", flush=True)

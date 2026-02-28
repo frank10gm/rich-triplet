@@ -118,6 +118,8 @@ struct CliArgs {
     pretokenize: Option<(String, String)>,
     /// --benchmark : run scalar-vs-tensor autograd benchmark
     benchmark: bool,
+    /// --quantize : quantize weights to Q4 after loading (saves RAM, may improve output quality)
+    quantize: bool,
 }
 
 impl CliArgs {
@@ -141,6 +143,7 @@ impl CliArgs {
             checkpoint: None,
             pretokenize: None,
             benchmark: false,
+            quantize: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -253,6 +256,9 @@ impl CliArgs {
                 "--benchmark" => {
                     a.benchmark = true;
                 }
+                "--quantize" => {
+                    a.quantize = true;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -299,7 +305,7 @@ fn print_help() {
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
     println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
     println!("  --top-p P                Nucleus probability         [default: 0.95]");
-    println!("  --rep-penalty R          Repetition penalty          [default: 1.0]");
+    println!("  --rep-penalty R          Repetition penalty          [default: 1.1]");
     println!("  --seed S                 RNG seed                    [default: 42]");
     println!("  --train-steps N          Training steps (no-weights) [default: 200]");
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");
@@ -463,6 +469,12 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
             model.save_cache(&cache_path).expect("failed to save cache");
             eprintln!("[ Gemma3 ] Cache saved.");
         }
+    }
+
+    if args.quantize {
+        eprintln!("[ Gemma3 ] Quantizing weights to Q4...");
+        model.quantize_all_weights();
+        eprintln!("[ Gemma3 ] Quantization complete.");
     }
 
     // Gemma 3-IT requires the chat template:
