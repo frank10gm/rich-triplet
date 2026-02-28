@@ -22,7 +22,10 @@
       "WebFetch(domain:ai.google.dev)",
       "Bash(ln:*)",
       "Bash(tee:*)",
-      "WebFetch(domain:eadst.com)"
+      "WebFetch(domain:eadst.com)",
+      "Bash(GGUF=/Users/francesco/.ollama/models/blobs/sha256-aeda25e63ebd698fab8638ffb778e68bed908b960d39d0becc650fa981609d25)",
+      "Bash(ollama run gemma3:4b \"What do you think about juventus footbal club?\")",
+      "Bash(sort -k5 -rn)"
     ]
   }
 }

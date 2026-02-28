@@ -819,8 +819,7 @@ impl Gemma3Model {
             if name == "output_norm.weight" {
                 let f32s = load_f32(&gguf, idx)?;
                 let n = f32s.len();
-                // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but forward_gemma3
-                // applies (1 + gamma).  Subtract 1 so the net result is (1 + w) * x_norm.
+                // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 (1+gamma) gives correct result.
                 let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                 self.norm
                     .gamma
@@ -847,9 +846,7 @@ impl Gemma3Model {
                         "attn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w) for Gemma3 RMSNorm weights, but
-                            // forward_gemma3 already applies (1 + gamma).  Subtract 1
-                            // so the net effect is the correct (1 + w) * x_norm.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .input_layernorm
@@ -861,7 +858,7 @@ impl Gemma3Model {
                         "post_attn_norm.weight" | "post_attention_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .post_attention_layernorm
@@ -873,7 +870,7 @@ impl Gemma3Model {
                         "ffn_pre_norm.weight" | "ffn_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .pre_feedforward_layernorm
@@ -885,7 +882,7 @@ impl Gemma3Model {
                         "ffn_post_norm.weight" | "post_ffw_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .post_feedforward_layernorm
@@ -896,7 +893,7 @@ impl Gemma3Model {
                         "attn_q_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .self_attn
@@ -908,7 +905,7 @@ impl Gemma3Model {
                         "attn_k_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
-                            // GGUF stores (1 + w); subtract 1 to match forward_gemma3.
+                            // GGUF stores (1 + HF_w); subtract 1 so forward_gemma3 gives correct result.
                             let adjusted: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
                             layer
                                 .self_attn
@@ -994,7 +991,19 @@ impl Gemma3Model {
         {
             let g = self.layers[0].post_attention_layernorm.gamma.data();
             let vals: Vec<f32> = (0..5.min(g.cols)).map(|c| g.at(0, c)).collect();
+            let eff: Vec<f32> = vals.iter().map(|&v| 1.0 + v).collect();
             eprintln!("  post_attn_layernorm gamma (stored):           {:?}", vals);
+            eprintln!("  post_attn_layernorm effective scale (1+gamma): {:?}", eff);
+            // Full distribution of effective scales across all hidden dims.
+            let all_eff: Vec<f32> = (0..g.cols).map(|c| 1.0 + g.at(0, c)).collect();
+            let mean = all_eff.iter().sum::<f32>() / all_eff.len() as f32;
+            let min  = all_eff.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max  = all_eff.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let n_near_zero = all_eff.iter().filter(|&&v| v.abs() < 0.1).count();
+            eprintln!(
+                "  post_attn_layernorm eff-scale stats: mean={:.4} min={:.4} max={:.4} near-zero(<0.1)={}/{}",
+                mean, min, max, n_near_zero, all_eff.len()
+            );
         }
         {
             let g = self.layers[0].self_attn.q_norm.gamma.data();
@@ -2003,17 +2012,18 @@ impl Gemma3Model {
             let logits_node = self.lm_head.forward(&normed_x);
             t_lmhead_us += t2.elapsed().as_micros();
 
-            // ── Diagnostics for first 10 decode steps ─────────────────────
-            if step <= 10 {
+            // ── Diagnostics for first 30 decode steps ─────────────────────
+            if step <= 30 {
                 let ld = logits_node.data();
                 let lv = &ld.data;
                 let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
+                let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
                 eprintln!(
-                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  top-5: {:?}",
-                    step, prev, l_max, top5
+                    "[ Gemma3-dbg ] step={} prev_tok={}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
+                    step, prev, l_max, gap, top5
                 );
                 let n_nan = lv.iter().filter(|&&v| v.is_nan()).count();
                 let n_inf = lv.iter().filter(|&&v| v.is_infinite()).count();
