@@ -860,7 +860,8 @@ kernel void gemv_bf16_t(
         }
     }
 
-    /// Upload and detect whether a Linear2 is BF16 or Q4K.
+    /// Upload and detect whether a Linear2 is BF16, Q4K, or Q4_0.
+    /// Returns (buffer, is_bf16). Q4_0 weights are dequantized to BF16 for upload.
     fn upload_linear_detect_type(
         device: &ProtocolObject<dyn MTLDevice>,
         linear: &crate::nn2::Linear2,
@@ -869,6 +870,13 @@ kernel void gemv_bf16_t(
             (upload_bytes(device, &q4k.blocks), false)
         } else if let Some(ref bf16) = linear.bf16_weight {
             (upload_u16(device, &bf16.data), true)
+        } else if let Some(ref q4) = linear.q4_weight {
+            // Q4_0: dequantize → f32 → bf16, then upload as BF16
+            let f32_mat = q4.dequantize();
+            let bf16_data: Vec<u16> = f32_mat.data.iter()
+                .map(|&f| crate::autograd2::MatBf16::f32_to_bf16(f))
+                .collect();
+            (upload_u16(device, &bf16_data), true)
         } else {
             (upload_f32(device, &linear.weight.data().data), false)
         }
