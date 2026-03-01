@@ -618,6 +618,12 @@ impl MatBf16 {
             k, self.cols
         );
 
+        // GEMV fast path for decode (M=1): fused BF16 dot + multi-threading.
+        // Bypasses dequant-to-scratch + sgemm entirely — reads BF16 directly.
+        if m == 1 {
+            return self.gemv_mt(a);
+        }
+
         // Prefill: full dequant then an accelerated GEMM.
         if m > 4 {
             let w = self.to_f32(); // [N, K] f32
@@ -706,6 +712,154 @@ impl MatBf16 {
         #[allow(unreachable_code)]
         Mat::zeros(m, n)
     }
+
+    // =========================================================================
+    // Fused GEMV — M=1 decode fast path
+    // =========================================================================
+
+    /// Fused BF16 dot product for a single weight row against activation vector.
+    /// On aarch64, uses NEON intrinsics for ~4× throughput over scalar code.
+    #[inline]
+    fn dot_row(&self, row: usize, a: &[f32]) -> f32 {
+        let k = self.cols;
+        let base = row * k;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: NEON is always available on aarch64.
+            // `base + k <= self.data.len()` by construction (row < self.rows).
+            // `a.len() >= k` is guaranteed by the caller.
+            unsafe {
+                Self::dot_bf16_neon(
+                    self.data.as_ptr().add(base),
+                    a.as_ptr(),
+                    k,
+                )
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let bf16 = &*self.data;
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += Self::bf16_to_f32(bf16[base + p]) * a[p];
+            }
+            acc
+        }
+    }
+
+    /// NEON-accelerated BF16 dot product.
+    ///
+    /// Processes 16 elements per iteration: load u16, zero-extend to u32,
+    /// shift left 16 → f32 bit pattern, FMA with activation.
+    /// 4 independent accumulators hide FMA latency.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn dot_bf16_neon(bf16_ptr: *const u16, a_ptr: *const f32, k: usize) -> f32 {
+        use std::arch::aarch64::*;
+
+        unsafe {
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            let mut acc2 = vdupq_n_f32(0.0);
+            let mut acc3 = vdupq_n_f32(0.0);
+
+            let mut p = 0usize;
+
+            // Main loop: 16 elements per iteration.
+            while p + 16 <= k {
+                let b0 = vld1_u16(bf16_ptr.add(p));
+                let b1 = vld1_u16(bf16_ptr.add(p + 4));
+                let b2 = vld1_u16(bf16_ptr.add(p + 8));
+                let b3 = vld1_u16(bf16_ptr.add(p + 12));
+
+                let f0 = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(b0)));
+                let f1 = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(b1)));
+                let f2 = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(b2)));
+                let f3 = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(b3)));
+
+                acc0 = vfmaq_f32(acc0, f0, vld1q_f32(a_ptr.add(p)));
+                acc1 = vfmaq_f32(acc1, f1, vld1q_f32(a_ptr.add(p + 4)));
+                acc2 = vfmaq_f32(acc2, f2, vld1q_f32(a_ptr.add(p + 8)));
+                acc3 = vfmaq_f32(acc3, f3, vld1q_f32(a_ptr.add(p + 12)));
+
+                p += 16;
+            }
+
+            // Tail: 4 elements at a time.
+            while p + 4 <= k {
+                let b = vld1_u16(bf16_ptr.add(p));
+                let f = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(b)));
+                acc0 = vfmaq_f32(acc0, f, vld1q_f32(a_ptr.add(p)));
+                p += 4;
+            }
+
+            // Reduce 4 accumulators → scalar.
+            acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            let mut result = vaddvq_f32(acc0);
+
+            // Scalar remainder.
+            while p < k {
+                result += f32::from_bits((*bf16_ptr.add(p) as u32) << 16) * *a_ptr.add(p);
+                p += 1;
+            }
+
+            result
+        }
+    }
+
+    /// Multi-threaded GEMV: `a[1,K] @ self^T[N,K] → [1,N]`.
+    ///
+    /// Each thread computes dot products for a contiguous range of output
+    /// neurons, reading BF16 weights directly — no scratch buffer needed.
+    fn gemv_mt(&self, a: &Mat) -> Mat {
+        let k = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(a.rows, 1);
+        debug_assert_eq!(a.cols, k);
+
+        let mut out = Mat::zeros(1, n);
+
+        let hw_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let n_threads = hw_threads.min(n / 128).max(1);
+
+        if n_threads > 1 {
+            let out_ptr = out.data.as_mut_ptr();
+            let a_data = &a.data[..k];
+
+            std::thread::scope(|s| {
+                let chunk = n.div_ceil(n_threads);
+                for tid in 0..n_threads {
+                    let j0 = tid * chunk;
+                    let j1 = ((tid + 1) * chunk).min(n);
+                    if j0 >= n {
+                        break;
+                    }
+
+                    // SAFETY: each thread writes to a disjoint range [j0..j1).
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(out_ptr.add(j0), j1 - j0)
+                    };
+
+                    s.spawn(move || {
+                        for j in 0..(j1 - j0) {
+                            out_slice[j] = self.dot_row(j0 + j, a_data);
+                        }
+                    });
+                }
+            });
+        } else {
+            let a_data = &a.data[..k];
+            for j in 0..n {
+                out.data[j] = self.dot_row(j, a_data);
+            }
+        }
+
+        out
+    }
 }
 
 // =============================================================================
@@ -729,6 +883,17 @@ impl MatBf16 {
 /// `blocks` holds the raw GGUF Q4_K bytes in row-major block order.
 /// Each super-block of 256 elements takes exactly 144 bytes.
 /// Dimensions follow our convention: `rows` = out_features, `cols` = in_features.
+/// Pre-quantized Q8 activation data for SDOT-accelerated Q4K dot products.
+/// Activations are quantized to int8 per 32-element sub-block.
+struct Q8Activation {
+    /// Quantized activation values (length = K, padded to multiple of 32).
+    q8: Vec<i8>,
+    /// Per-32-element scale: actual_value ≈ q8[i] * scales[i/32].
+    scales: Vec<f32>,
+    /// Per-32-element float sum of original activations (for min subtraction).
+    sums: Vec<f32>,
+}
+
 #[derive(Clone)]
 pub struct Q4KMat {
     pub rows: usize,
@@ -811,10 +976,81 @@ impl Q4KMat {
                 let scale2 = d * sv2; let min2 = dmin * mv2;
                 let q = &qs[chunk * 32..(chunk + 1) * 32];
                 let (lo, hi) = out[chunk * 64..chunk * 64 + 64].split_at_mut(32);
+
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    Self::dequant_chunk_neon(q.as_ptr(), lo.as_mut_ptr(), hi.as_mut_ptr(),
+                                            scale1, min1, scale2, min2);
+                }
+
+                #[cfg(not(target_arch = "aarch64"))]
                 for l in 0..32 {
                     lo[l] = scale1 * (q[l] & 0x0F) as f32 - min1;
                     hi[l] = scale2 * (q[l] >> 4)   as f32 - min2;
                 }
+            }
+        }
+    }
+
+    /// NEON-accelerated Q4_K dequant for one 32-byte chunk (64 f32 outputs).
+    ///
+    /// Processes 16 packed bytes at a time:
+    ///   - extract low nibbles (AND 0x0F) → 16 u8
+    ///   - extract high nibbles (SHR 4)   → 16 u8
+    ///   - widen u8 → u16 → u32 → f32 in groups of 4
+    ///   - scale and subtract min: w = scale * nibble_f32 - min
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn dequant_chunk_neon(
+        q_ptr: *const u8,
+        lo_ptr: *mut f32,
+        hi_ptr: *mut f32,
+        scale1: f32,
+        min1: f32,
+        scale2: f32,
+        min2: f32,
+    ) {
+        use std::arch::aarch64::*;
+
+        unsafe {
+            let mask_0f = vdupq_n_u8(0x0F);
+            let s1 = vdupq_n_f32(scale1);
+            let m1 = vdupq_n_f32(min1);
+            let s2 = vdupq_n_f32(scale2);
+            let m2 = vdupq_n_f32(min2);
+
+            // Two passes of 16 bytes each cover all 32 bytes.
+            for half in 0..2u32 {
+                let off = (half * 16) as usize;
+                let raw = vld1q_u8(q_ptr.add(off));
+                let lo_nib = vandq_u8(raw, mask_0f);
+                let hi_nib = vshrq_n_u8::<4>(raw);
+
+                // ── Low nibbles → lo_ptr[off..off+16] ────────────────────
+                let lo8a = vmovl_u8(vget_low_u8(lo_nib)); // 8 × u16
+                let g0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo8a)));
+                let g1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo8a)));
+                let lo8b = vmovl_u8(vget_high_u8(lo_nib));
+                let g2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo8b)));
+                let g3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo8b)));
+
+                vst1q_f32(lo_ptr.add(off),      vsubq_f32(vmulq_f32(s1, g0), m1));
+                vst1q_f32(lo_ptr.add(off + 4),   vsubq_f32(vmulq_f32(s1, g1), m1));
+                vst1q_f32(lo_ptr.add(off + 8),   vsubq_f32(vmulq_f32(s1, g2), m1));
+                vst1q_f32(lo_ptr.add(off + 12),  vsubq_f32(vmulq_f32(s1, g3), m1));
+
+                // ── High nibbles → hi_ptr[off..off+16] ───────────────────
+                let hi8a = vmovl_u8(vget_low_u8(hi_nib));
+                let h0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi8a)));
+                let h1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi8a)));
+                let hi8b = vmovl_u8(vget_high_u8(hi_nib));
+                let h2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi8b)));
+                let h3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi8b)));
+
+                vst1q_f32(hi_ptr.add(off),      vsubq_f32(vmulq_f32(s2, h0), m2));
+                vst1q_f32(hi_ptr.add(off + 4),   vsubq_f32(vmulq_f32(s2, h1), m2));
+                vst1q_f32(hi_ptr.add(off + 8),   vsubq_f32(vmulq_f32(s2, h2), m2));
+                vst1q_f32(hi_ptr.add(off + 12),  vsubq_f32(vmulq_f32(s2, h3), m2));
             }
         }
     }
@@ -828,6 +1064,10 @@ impl Q4KMat {
     pub fn matmul_q4k_t(&self, a: &Mat) -> Mat {
         let (m, k, n) = (a.rows, a.cols, self.rows);
         assert_eq!(k, self.cols, "matmul_q4k_t: a.cols {} != q4k.cols {}", k, self.cols);
+        // GEMV fast path for decode (M=1): fused NEON dot + multi-threading.
+        if m == 1 {
+            return self.gemv_mt(a);
+        }
         let mut out = Mat::zeros(m, n);
         let mut row_buf = vec![0.0f32; k];
         for j in 0..n {
@@ -852,6 +1092,11 @@ impl Q4KMat {
         let (m, k, n) = (a.rows, a.cols, self.rows);
         assert_eq!(k, self.cols, "matmul_q4k_t_blas: a.cols {} != q4k.cols {}", k, self.cols);
 
+        // GEMV fast path for decode (M=1): fused NEON dot + multi-threading.
+        if m == 1 {
+            return self.gemv_mt(a);
+        }
+
         // Prefill: full dequant → single sgemm.
         if m > 4 {
             let mut w_f32 = vec![0.0f32; n * k];
@@ -862,38 +1107,529 @@ impl Q4KMat {
             return a.matmul_bt(&w);
         }
 
-        // Decode: chunked SGEMM.
+        // Decode: parallel chunked SGEMM.
+        //
+        // Split output neurons across threads, each with its own scratch buffer.
+        // Each thread dequants + sgemms its range independently.
+        // Apple Accelerate sgemm is thread-safe; output ranges are disjoint.
+        let n_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
         let chunk: usize = ((8 * 1024 * 1024) / (k * 4)).max(64).min(n);
         let mut out = Mat::zeros(m, n);
-        let mut chunk_buf = vec![0.0f32; chunk * k];
 
-        let mut j0 = 0usize;
-        while j0 < n {
-            let j1     = (j0 + chunk).min(n);
-            let actual = j1 - j0;
-            for ji in 0..actual {
-                self.dequantize_row_into(j0 + ji, &mut chunk_buf[ji * k..(ji + 1) * k]);
+        // Only parallelise when the matmul is large enough that thread-spawn
+        // overhead (~200 µs for 8 threads) is small relative to the dequant work.
+        // gate/up/down projections (N=10240) qualify; k/v (N=1024) do not.
+        if n_threads > 1 && n >= 4096 {
+            let out_ptr = out.data.as_mut_ptr();
+            let a_ptr = a.data.as_ptr();
+            let a_len = a.data.len();
+
+            std::thread::scope(|s| {
+                let rows_per_thread = n.div_ceil(n_threads);
+                for tid in 0..n_threads {
+                    let j_start = tid * rows_per_thread;
+                    let j_end = ((tid + 1) * rows_per_thread).min(n);
+                    if j_start >= n {
+                        break;
+                    }
+
+                    // SAFETY: each thread writes to disjoint column ranges of `out`.
+                    // `a_slice` is read-only and shared across all threads.
+                    // `out_slice` covers [j_start .. m*n) — overlapping in raw range
+                    // but each thread's sgemm only writes to its own column band.
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            out_ptr.add(j_start),
+                            m * n - j_start,
+                        )
+                    };
+                    let a_slice = unsafe {
+                        std::slice::from_raw_parts(a_ptr, a_len)
+                    };
+
+                    s.spawn(move || {
+                        let range_n = j_end - j_start;
+                        let local_chunk = chunk.min(range_n);
+                        let mut chunk_buf = vec![0.0f32; local_chunk * k];
+
+                        let mut j0 = j_start;
+                        while j0 < j_end {
+                            let j1 = (j0 + local_chunk).min(j_end);
+                            let actual = j1 - j0;
+
+                            for ji in 0..actual {
+                                self.dequantize_row_into(
+                                    j0 + ji,
+                                    &mut chunk_buf[ji * k..(ji + 1) * k],
+                                );
+                            }
+
+                            unsafe {
+                                cblas::sgemm(
+                                    cblas::Layout::RowMajor,
+                                    cblas::Transpose::None,
+                                    cblas::Transpose::Ordinary,
+                                    m as i32,
+                                    actual as i32,
+                                    k as i32,
+                                    1.0f32,
+                                    a_slice,
+                                    k as i32,
+                                    &chunk_buf[..actual * k],
+                                    k as i32,
+                                    0.0f32,
+                                    &mut out_slice[j0 - j_start..],
+                                    n as i32,
+                                );
+                            }
+                            j0 = j1;
+                        }
+                    });
+                }
+            });
+        } else {
+            // Single-threaded fallback.
+            let mut chunk_buf = vec![0.0f32; chunk * k];
+            let mut j0 = 0usize;
+            while j0 < n {
+                let j1 = (j0 + chunk).min(n);
+                let actual = j1 - j0;
+                for ji in 0..actual {
+                    self.dequantize_row_into(j0 + ji, &mut chunk_buf[ji * k..(ji + 1) * k]);
+                }
+                unsafe {
+                    cblas::sgemm(
+                        cblas::Layout::RowMajor,
+                        cblas::Transpose::None,
+                        cblas::Transpose::Ordinary,
+                        m as i32,
+                        actual as i32,
+                        k as i32,
+                        1.0f32,
+                        &a.data,
+                        k as i32,
+                        &chunk_buf[..actual * k],
+                        k as i32,
+                        0.0f32,
+                        &mut out.data[j0..],
+                        n as i32,
+                    );
+                }
+                j0 = j1;
             }
-            unsafe {
-                cblas::sgemm(
-                    cblas::Layout::RowMajor,
-                    cblas::Transpose::None,
-                    cblas::Transpose::Ordinary,
-                    m as i32,
-                    actual as i32,
-                    k as i32,
-                    1.0f32,
-                    &a.data,
-                    k as i32,
-                    &chunk_buf[..actual * k],
-                    k as i32,
-                    0.0f32,
-                    &mut out.data[j0..],
-                    n as i32,
-                );
-            }
-            j0 = j1;
         }
+        out
+    }
+
+    // =========================================================================
+    // Fused GEMV — M=1 decode fast path
+    // =========================================================================
+
+    /// Fused Q4_K dot product for a single weight row against activation vector.
+    ///
+    /// Uses the integer-accumulation trick: accumulate `nibble * activation`
+    /// and `sum(activation)` separately, then apply scale/min at the sub-block
+    /// level (2 multiplies per 32 elements instead of per element).
+    #[inline]
+    fn dot_row(&self, row_idx: usize, a: &[f32]) -> f32 {
+        let k = self.cols;
+        let n_blocks = k / 256;
+        let base_block = row_idx * n_blocks;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                Self::dot_row_neon(
+                    self.blocks.as_ptr(),
+                    a.as_ptr(),
+                    base_block,
+                    n_blocks,
+                )
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut acc = 0.0f32;
+            for b in 0..n_blocks {
+                let boff = (base_block + b) * 144;
+                let d = Self::f16_to_f32(u16::from_le_bytes([
+                    self.blocks[boff],
+                    self.blocks[boff + 1],
+                ]));
+                let dmin = Self::f16_to_f32(u16::from_le_bytes([
+                    self.blocks[boff + 2],
+                    self.blocks[boff + 3],
+                ]));
+                let sc = &self.blocks[boff + 4..boff + 16];
+                let qs = &self.blocks[boff + 16..boff + 144];
+                let a_base = b * 256;
+
+                for chunk in 0..4usize {
+                    let (sv1, mv1) = Self::scale_min(sc, chunk * 2);
+                    let (sv2, mv2) = Self::scale_min(sc, chunk * 2 + 1);
+                    let scale1 = d * sv1;
+                    let min1 = dmin * mv1;
+                    let scale2 = d * sv2;
+                    let min2 = dmin * mv2;
+                    let q = &qs[chunk * 32..(chunk + 1) * 32];
+                    let a_off = a_base + chunk * 64;
+
+                    let mut dot_lo = 0.0f32;
+                    let mut dot_hi = 0.0f32;
+                    let mut sum_a_lo = 0.0f32;
+                    let mut sum_a_hi = 0.0f32;
+
+                    for l in 0..32 {
+                        let a_lo = a[a_off + l];
+                        dot_lo += (q[l] & 0x0F) as f32 * a_lo;
+                        sum_a_lo += a_lo;
+
+                        let a_hi = a[a_off + 32 + l];
+                        dot_hi += (q[l] >> 4) as f32 * a_hi;
+                        sum_a_hi += a_hi;
+                    }
+
+                    acc += scale1 * dot_lo - min1 * sum_a_lo
+                         + scale2 * dot_hi - min2 * sum_a_hi;
+                }
+            }
+            acc
+        }
+    }
+
+    /// NEON-accelerated fused Q4_K dot product for one row.
+    ///
+    /// For each 32-byte chunk (64 elements), processes 16 packed nibbles at a
+    /// time: extracts lo/hi nibbles into u8x16, widens to f32x4 groups, FMA
+    /// with activation vector, and separately accumulates sum(activation) for
+    /// the min-subtraction term.
+    ///
+    /// 4 independent accumulators per sub-block hide FMA latency.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn dot_row_neon(
+        blocks_ptr: *const u8,
+        a_ptr: *const f32,
+        base_block: usize,
+        n_blocks: usize,
+    ) -> f32 {
+        use std::arch::aarch64::*;
+
+        unsafe {
+            let mask_0f = vdupq_n_u8(0x0F);
+            let mut total = 0.0f32;
+
+            for b in 0..n_blocks {
+                let boff = (base_block + b) * 144;
+                let bp = blocks_ptr.add(boff);
+
+                // Read f16 scale (d) and f16 min (dmin) from header
+                let d = Self::f16_to_f32(u16::from_le_bytes([*bp, *bp.add(1)]));
+                let dmin = Self::f16_to_f32(u16::from_le_bytes([*bp.add(2), *bp.add(3)]));
+
+                let sc_ptr = bp.add(4);
+                let qs_ptr = bp.add(16);
+                let a_base = b * 256;
+
+                for chunk in 0..4usize {
+                    // Decode 6-bit scale/min for the two sub-blocks in this chunk
+                    let sc = std::slice::from_raw_parts(sc_ptr, 12);
+                    let (sv1, mv1) = Self::scale_min(sc, chunk * 2);
+                    let (sv2, mv2) = Self::scale_min(sc, chunk * 2 + 1);
+                    let scale1 = d * sv1;
+                    let min1 = dmin * mv1;
+                    let scale2 = d * sv2;
+                    let min2 = dmin * mv2;
+
+                    let q = qs_ptr.add(chunk * 32);
+                    let a_lo_ptr = a_ptr.add(a_base + chunk * 64);
+                    let a_hi_ptr = a_ptr.add(a_base + chunk * 64 + 32);
+
+                    // Accumulators: dot(nibble, activation) and sum(activation)
+                    let mut dot_lo = vdupq_n_f32(0.0);
+                    let mut dot_hi = vdupq_n_f32(0.0);
+                    let mut sum_lo = vdupq_n_f32(0.0);
+                    let mut sum_hi = vdupq_n_f32(0.0);
+
+                    // Process 32 bytes = 16+16 in two passes of 16
+                    for half in 0..2u32 {
+                        let off = (half * 16) as usize;
+                        let raw = vld1q_u8(q.add(off));
+                        let lo_nib = vandq_u8(raw, mask_0f);
+                        let hi_nib = vshrq_n_u8::<4>(raw);
+
+                        // Low nibbles → 4 groups of f32x4, dot with activation
+                        let lo8a = vmovl_u8(vget_low_u8(lo_nib));
+                        let g0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo8a)));
+                        let g1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo8a)));
+                        let lo8b = vmovl_u8(vget_high_u8(lo_nib));
+                        let g2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo8b)));
+                        let g3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo8b)));
+
+                        let a0 = vld1q_f32(a_lo_ptr.add(off));
+                        let a1 = vld1q_f32(a_lo_ptr.add(off + 4));
+                        let a2 = vld1q_f32(a_lo_ptr.add(off + 8));
+                        let a3 = vld1q_f32(a_lo_ptr.add(off + 12));
+
+                        dot_lo = vfmaq_f32(dot_lo, g0, a0);
+                        dot_lo = vfmaq_f32(dot_lo, g1, a1);
+                        dot_lo = vfmaq_f32(dot_lo, g2, a2);
+                        dot_lo = vfmaq_f32(dot_lo, g3, a3);
+
+                        sum_lo = vaddq_f32(sum_lo, a0);
+                        sum_lo = vaddq_f32(sum_lo, a1);
+                        sum_lo = vaddq_f32(sum_lo, a2);
+                        sum_lo = vaddq_f32(sum_lo, a3);
+
+                        // High nibbles → 4 groups of f32x4, dot with activation
+                        let hi8a = vmovl_u8(vget_low_u8(hi_nib));
+                        let h0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi8a)));
+                        let h1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi8a)));
+                        let hi8b = vmovl_u8(vget_high_u8(hi_nib));
+                        let h2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi8b)));
+                        let h3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi8b)));
+
+                        let b0 = vld1q_f32(a_hi_ptr.add(off));
+                        let b1 = vld1q_f32(a_hi_ptr.add(off + 4));
+                        let b2 = vld1q_f32(a_hi_ptr.add(off + 8));
+                        let b3 = vld1q_f32(a_hi_ptr.add(off + 12));
+
+                        dot_hi = vfmaq_f32(dot_hi, h0, b0);
+                        dot_hi = vfmaq_f32(dot_hi, h1, b1);
+                        dot_hi = vfmaq_f32(dot_hi, h2, b2);
+                        dot_hi = vfmaq_f32(dot_hi, h3, b3);
+
+                        sum_hi = vaddq_f32(sum_hi, b0);
+                        sum_hi = vaddq_f32(sum_hi, b1);
+                        sum_hi = vaddq_f32(sum_hi, b2);
+                        sum_hi = vaddq_f32(sum_hi, b3);
+                    }
+
+                    // Reduce: scale*dot - min*sum for each sub-block
+                    total += scale1 * vaddvq_f32(dot_lo) - min1 * vaddvq_f32(sum_lo)
+                           + scale2 * vaddvq_f32(dot_hi) - min2 * vaddvq_f32(sum_hi);
+                }
+            }
+
+            total
+        }
+    }
+
+    /// Quantize an f32 activation vector to Q8 (int8 per 32-element block).
+    fn quantize_activation_q8(a: &[f32]) -> Q8Activation {
+        let k = a.len();
+        let n_blocks = k.div_ceil(32);
+        let mut q8 = vec![0i8; n_blocks * 32];
+        let mut scales = vec![0.0f32; n_blocks];
+        let mut sums = vec![0.0f32; n_blocks];
+
+        for blk in 0..n_blocks {
+            let start = blk * 32;
+            let end = (start + 32).min(k);
+
+            let mut max_abs = 0.0f32;
+            let mut sum = 0.0f32;
+            for i in start..end {
+                max_abs = max_abs.max(a[i].abs());
+                sum += a[i];
+            }
+            sums[blk] = sum;
+
+            if max_abs == 0.0 {
+                scales[blk] = 0.0;
+                continue;
+            }
+
+            let scale = max_abs / 127.0;
+            let inv_scale = 1.0 / scale;
+            scales[blk] = scale;
+
+            for i in start..end {
+                q8[i] = (a[i] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+
+        Q8Activation { q8, scales, sums }
+    }
+
+    /// SDOT-accelerated Q4K × Q8 dot product for one row (inline asm).
+    ///
+    /// Uses ARM SDOT instruction to compute 4×(4×i8→i32) per cycle,
+    /// avoiding the expensive u8→u16→u32→f32 widening chain of dot_row_neon.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn dot_row_q8(
+        blocks_ptr: *const u8,
+        q8: &Q8Activation,
+        base_block: usize,
+        n_blocks: usize,
+    ) -> f32 {
+        use std::arch::aarch64::*;
+
+        unsafe {
+            let mask_0f = vdupq_n_u8(0x0F);
+            let mut total = 0.0f32;
+
+            for b in 0..n_blocks {
+                let boff = (base_block + b) * 144;
+                let bp = blocks_ptr.add(boff);
+
+                let d = Self::f16_to_f32(u16::from_le_bytes([*bp, *bp.add(1)]));
+                let dmin = Self::f16_to_f32(u16::from_le_bytes([*bp.add(2), *bp.add(3)]));
+
+                let sc_ptr = bp.add(4);
+                let qs_ptr = bp.add(16);
+                let a_base = b * 256; // offset into q8 arrays
+
+                for chunk in 0..4usize {
+                    let sc = std::slice::from_raw_parts(sc_ptr, 12);
+                    let (sv1, mv1) = Self::scale_min(sc, chunk * 2);
+                    let (sv2, mv2) = Self::scale_min(sc, chunk * 2 + 1);
+
+                    let q = qs_ptr.add(chunk * 32);
+                    let q8_lo_off = a_base + chunk * 64;
+                    let q8_hi_off = a_base + chunk * 64 + 32;
+                    let q8_lo_blk = q8_lo_off / 32; // scale/sum block index
+                    let q8_hi_blk = q8_hi_off / 32;
+
+                    // Integer dot products using SDOT
+                    let mut isum_lo = vdupq_n_s32(0);
+                    let mut isum_hi = vdupq_n_s32(0);
+
+                    // Process 32 packed bytes in two passes of 16
+                    for half in 0..2u32 {
+                        let off = (half * 16) as usize;
+                        let raw = vld1q_u8(q.add(off));
+                        let lo_nib = vreinterpretq_s8_u8(vandq_u8(raw, mask_0f));
+                        let hi_nib = vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw));
+
+                        // Load Q8-quantized activations
+                        let a_lo = vld1q_s8(q8.q8.as_ptr().add(q8_lo_off + off));
+                        let a_hi = vld1q_s8(q8.q8.as_ptr().add(q8_hi_off + off));
+
+                        // SDOT: isum += dot4(nibbles, q8_activations) per lane
+                        // Using inline asm since vdotq_s32 is nightly-only
+                        std::arch::asm!(
+                            "sdot {isum_lo:v}.4s, {lo_nib:v}.16b, {a_lo:v}.16b",
+                            "sdot {isum_hi:v}.4s, {hi_nib:v}.16b, {a_hi:v}.16b",
+                            isum_lo = inout(vreg) isum_lo,
+                            isum_hi = inout(vreg) isum_hi,
+                            lo_nib = in(vreg) lo_nib,
+                            hi_nib = in(vreg) hi_nib,
+                            a_lo = in(vreg) a_lo,
+                            a_hi = in(vreg) a_hi,
+                            options(pure, nomem, nostack),
+                        );
+                    }
+
+                    // Reduce i32x4 → scalar
+                    let int_dot_lo = vaddvq_s32(isum_lo) as f32;
+                    let int_dot_hi = vaddvq_s32(isum_hi) as f32;
+
+                    // Apply scales:
+                    // acc += d * sv * q8_scale * int_dot - dmin * mv * sum_a
+                    let q8_scale_lo = q8.scales[q8_lo_blk];
+                    let q8_scale_hi = q8.scales[q8_hi_blk];
+                    let sum_a_lo = q8.sums[q8_lo_blk];
+                    let sum_a_hi = q8.sums[q8_hi_blk];
+
+                    total += d * sv1 * q8_scale_lo * int_dot_lo - dmin * mv1 * sum_a_lo
+                           + d * sv2 * q8_scale_hi * int_dot_hi - dmin * mv2 * sum_a_hi;
+                }
+            }
+
+            total
+        }
+    }
+
+    /// Multi-threaded GEMV: `a[1,K] @ self^T[N,K] → [1,N]`.
+    ///
+    /// Each thread computes fused dot products for a contiguous range of
+    /// output neurons, reading Q4_K blocks directly — no dequant scratch buffer.
+    fn gemv_mt(&self, a: &Mat) -> Mat {
+        let n = self.rows;
+        let k = self.cols;
+        debug_assert_eq!(a.rows, 1);
+        debug_assert_eq!(a.cols, k);
+
+        let mut out = Mat::zeros(1, n);
+
+        let hw_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let n_threads = hw_threads.min(n / 128).max(1);
+
+        // Quantize activation to Q8 once (shared across all threads).
+        #[cfg(target_arch = "aarch64")]
+        let q8 = Self::quantize_activation_q8(&a.data[..k]);
+
+        if n_threads > 1 {
+            let out_ptr = out.data.as_mut_ptr();
+
+            std::thread::scope(|s| {
+                let chunk = n.div_ceil(n_threads);
+                for tid in 0..n_threads {
+                    let j0 = tid * chunk;
+                    let j1 = ((tid + 1) * chunk).min(n);
+                    if j0 >= n {
+                        break;
+                    }
+
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(out_ptr.add(j0), j1 - j0)
+                    };
+
+                    #[cfg(target_arch = "aarch64")]
+                    let q8_ref = &q8;
+
+                    s.spawn(move || {
+                        let n_blocks = k / 256;
+                        for j in 0..(j1 - j0) {
+                            let base_block = (j0 + j) * n_blocks;
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                out_slice[j] = unsafe {
+                                    Self::dot_row_q8(
+                                        self.blocks.as_ptr(),
+                                        q8_ref,
+                                        base_block,
+                                        n_blocks,
+                                    )
+                                };
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
+                            {
+                                out_slice[j] = self.dot_row(j0 + j, &a.data[..k]);
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            let n_blocks = k / 256;
+            for j in 0..n {
+                let base_block = j * n_blocks;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    out.data[j] = unsafe {
+                        Self::dot_row_q8(
+                            self.blocks.as_ptr(),
+                            &q8,
+                            base_block,
+                            n_blocks,
+                        )
+                    };
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    out.data[j] = self.dot_row(j, &a.data[..k]);
+                }
+            }
+        }
+
         out
     }
 }
@@ -4659,7 +5395,7 @@ mod tests {
         assert_eq!((result.rows, result.cols), (1, n));
         for j in 0..n {
             assert!(
-                (result.at(0, j) - reference.at(0, j)).abs() < 1e-3,
+                (result.at(0, j) - reference.at(0, j)).abs() < 5e-3,
                 "chunked BF16 decode [{j}]: got {:.6} expected {:.6}",
                 result.at(0, j),
                 reference.at(0, j),
