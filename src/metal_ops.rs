@@ -49,11 +49,12 @@ mod inner {
         MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
         MTLDevice, MTLFunction, MTLLibrary, MTLResourceOptions, MTLSize,
     };
-    use std::cell::OnceCell;
+    use std::cell::{OnceCell, RefCell};
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
-    use crate::autograd2::Mat;
+    use crate::autograd2::{Mat, MatBf16, Q4KMat};
 
     // -------------------------------------------------------------------------
     // Minimum ops before using Metal (M*K*N flops).
@@ -244,6 +245,141 @@ kernel void matmul_q4_t(
 "#;
 
     // -------------------------------------------------------------------------
+    // MSL source — Q4_K fused dequantize + GEMV
+    //
+    // Computes C[1,N] = A[1,K] @ dequant(Q4K[N,K])^T
+    // where Q4K is stored as super-blocks of 256 elements (144 bytes each):
+    //   [0..2)    f16 d       (super-block scale)
+    //   [2..4)    f16 dmin    (super-block min)
+    //   [4..16)   12 bytes    (packed 6-bit scale/min for 8 sub-blocks)
+    //   [16..144) 128 bytes   (packed 4-bit nibbles, 2 per byte)
+    //
+    // One threadgroup (32 threads = one SIMD group) per output element.
+    // Each thread strides over super-blocks, dequantizes on-the-fly.
+    // -------------------------------------------------------------------------
+    const GEMV_Q4K_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define Q4K_BLOCK_BYTES 144u
+#define Q4K_BLOCK_ELEMS 256u
+#define TG_K 32u
+
+// Extract 6-bit scale and min for sub-block j (0..8) from 12-byte array.
+inline float2 scale_min(device const uchar* sc, uint j) {
+    float sv, mv;
+    if (j < 4u) {
+        sv = float(sc[j] & 0x3Fu);
+        mv = float(sc[j + 4u] & 0x3Fu);
+    } else {
+        sv = float((sc[j + 4u] & 0x0Fu) | ((sc[j - 4u] >> 6u) << 4u));
+        mv = float((sc[j + 4u] >> 4u)   | ((sc[j]      >> 6u) << 4u));
+    }
+    return float2(sv, mv);
+}
+
+kernel void gemv_q4k_t(
+    device const float* A         [[ buffer(0) ]],
+    device const uchar* blocks    [[ buffer(1) ]],
+    device       float* C         [[ buffer(2) ]],
+    constant     uint&  K         [[ buffer(3) ]],
+    constant     uint&  N         [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    uint n_sb = K / Q4K_BLOCK_ELEMS;
+    float acc = 0.0f;
+
+    for (uint b = lid; b < n_sb; b += TG_K) {
+        uint boff = (j * n_sb + b) * Q4K_BLOCK_BYTES;
+        device const uchar* bp = blocks + boff;
+
+        ushort d_bits    = ushort(bp[0]) | (ushort(bp[1]) << 8u);
+        ushort dmin_bits = ushort(bp[2]) | (ushort(bp[3]) << 8u);
+        float d    = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        device const uchar* sc = bp + 4u;
+        device const uchar* qs = bp + 16u;
+        uint a_base = b * Q4K_BLOCK_ELEMS;
+
+        for (uint chunk = 0u; chunk < 4u; chunk++) {
+            float2 sm1 = scale_min(sc, chunk * 2u);
+            float2 sm2 = scale_min(sc, chunk * 2u + 1u);
+            float scale1 = d * sm1.x;  float min1 = dmin * sm1.y;
+            float scale2 = d * sm2.x;  float min2 = dmin * sm2.y;
+
+            device const uchar* q = qs + chunk * 32u;
+            uint a_off = a_base + chunk * 64u;
+
+            float dot_lo = 0.0f, dot_hi = 0.0f;
+            float sum_lo = 0.0f, sum_hi = 0.0f;
+
+            for (uint l = 0u; l < 32u; l++) {
+                float a_lo = A[a_off + l];
+                float a_hi = A[a_off + 32u + l];
+                dot_lo += float(q[l] & 0x0Fu) * a_lo;
+                dot_hi += float(q[l] >> 4u)   * a_hi;
+                sum_lo += a_lo;
+                sum_hi += a_hi;
+            }
+
+            acc += scale1 * dot_lo - min1 * sum_lo
+                 + scale2 * dot_hi - min2 * sum_hi;
+        }
+    }
+
+    acc = simd_sum(acc);
+
+    if (lid == 0u)
+        C[j] = acc;
+}
+"#;
+
+    // -------------------------------------------------------------------------
+    // MSL source — BF16 GEMV
+    //
+    // Computes C[1,N] = A[1,K] @ BF16[N,K]^T
+    // where BF16 weights are stored as u16 (upper 16 bits of f32).
+    // -------------------------------------------------------------------------
+    const GEMV_BF16_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define TG_K_BF16 32u
+
+kernel void gemv_bf16_t(
+    device const float*  A      [[ buffer(0) ]],
+    device const ushort* W      [[ buffer(1) ]],
+    device       float*  C      [[ buffer(2) ]],
+    constant     uint&   K      [[ buffer(3) ]],
+    constant     uint&   N      [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    float acc = 0.0f;
+    uint row_start = j * K;
+
+    for (uint p = lid; p < K; p += TG_K_BF16) {
+        ushort bits = W[row_start + p];
+        float w = as_type<float>(uint(bits) << 16u);
+        acc += A[p] * w;
+    }
+
+    acc = simd_sum(acc);
+
+    if (lid == 0u)
+        C[j] = acc;
+}
+"#;
+
+    // -------------------------------------------------------------------------
     // Cached Metal objects — one per thread
     // -------------------------------------------------------------------------
     pub struct MetalContext {
@@ -252,10 +388,21 @@ kernel void matmul_q4_t(
         pub pipeline:          Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pub pipeline_batched:  Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pub pipeline_q4:       Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pub pipeline_q4k:      Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pub pipeline_bf16:     Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        /// Persistent weight buffer cache. Key: (data_ptr, byte_len).
+        pub weight_cache:      HashMap<(usize, usize), Retained<ProtocolObject<dyn MTLBuffer>>>,
+        /// Pre-allocated scratch buffers for GEMV to avoid per-call allocation.
+        /// activation: max K f32 values; output: max N f32 values; dims: 2 u32s.
+        pub scratch_act:       Retained<ProtocolObject<dyn MTLBuffer>>,
+        pub scratch_out:       Retained<ProtocolObject<dyn MTLBuffer>>,
+        pub scratch_dims:      Retained<ProtocolObject<dyn MTLBuffer>>,
+        pub scratch_act_cap:   usize,  // capacity in f32 elements
+        pub scratch_out_cap:   usize,  // capacity in f32 elements
     }
 
     thread_local! {
-        static METAL_CTX: OnceCell<MetalContext> = OnceCell::new();
+        static METAL_CTX: OnceCell<RefCell<MetalContext>> = OnceCell::new();
     }
 
     fn init_context() -> MetalContext {
@@ -283,8 +430,31 @@ kernel void matmul_q4_t(
         let pipeline         = make_pipeline_from_src(MATMUL_MSL, "matmul_tiled");
         let pipeline_batched = make_pipeline_from_src(MATMUL_MSL, "matmul_tiled_batched");
         let pipeline_q4      = make_pipeline_from_src(MATMUL_Q4_MSL, "matmul_q4_t");
+        let pipeline_q4k     = make_pipeline_from_src(GEMV_Q4K_MSL, "gemv_q4k_t");
+        let pipeline_bf16    = make_pipeline_from_src(GEMV_BF16_MSL, "gemv_bf16_t");
 
-        MetalContext { device, queue, pipeline, pipeline_batched, pipeline_q4 }
+        // Pre-allocate scratch buffers for GEMV fast path.
+        // These sizes cover all Gemma3-4b dimensions; they'll be grown if needed.
+        let act_cap = 10240;  // max K (down_proj input)
+        let out_cap = 262144; // max N (lm_head)
+        let scratch_act = device.newBufferWithLength_options(
+            act_cap * 4, MTLResourceOptions::StorageModeShared,
+        ).expect("Metal: scratch_act allocation failed");
+        let scratch_out = device.newBufferWithLength_options(
+            out_cap * 4, MTLResourceOptions::StorageModeShared,
+        ).expect("Metal: scratch_out allocation failed");
+        // dims: [K, N] as two u32s
+        let scratch_dims = device.newBufferWithLength_options(
+            8, MTLResourceOptions::StorageModeShared,
+        ).expect("Metal: scratch_dims allocation failed");
+
+        MetalContext {
+            device, queue, pipeline, pipeline_batched, pipeline_q4,
+            pipeline_q4k, pipeline_bf16,
+            weight_cache: HashMap::new(),
+            scratch_act, scratch_out, scratch_dims,
+            scratch_act_cap: act_cap, scratch_out_cap: out_cap,
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -378,7 +548,8 @@ kernel void matmul_q4_t(
         }
 
         METAL_CTX.with(|cell| {
-            let ctx = cell.get_or_init(init_context);
+            let ctx_cell = cell.get_or_init(|| RefCell::new(init_context()));
+            let ctx = ctx_cell.borrow();
 
             // Upload inputs and allocate output.
             let buf_a = upload(&ctx.device, &a.data);
@@ -475,7 +646,8 @@ kernel void matmul_q4_t(
         }
 
         METAL_CTX.with(|cell| {
-            let ctx = cell.get_or_init(init_context);
+            let ctx_cell = cell.get_or_init(|| RefCell::new(init_context()));
+            let ctx = ctx_cell.borrow();
 
             // Pack all A slices contiguously, then all B slices.
             let a_flat: Vec<f32> = pairs.iter().flat_map(|(a, _)| a.data.iter().cloned()).collect();
@@ -549,7 +721,8 @@ kernel void matmul_q4_t(
         }
 
         METAL_CTX.with(|cell| {
-            let ctx = cell.get_or_init(init_context);
+            let ctx_cell = cell.get_or_init(|| RefCell::new(init_context()));
+            let ctx = ctx_cell.borrow();
 
             let buf_a      = upload(&ctx.device, &a.data);
             let buf_packed = upload_bytes(&ctx.device, &q4.packed);
@@ -592,6 +765,183 @@ kernel void matmul_q4_t(
                 std::slice::from_raw_parts(ptr, m * n).to_vec()
             };
             Mat::new(out_data, m, n)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Q4K GEMV entry point
+    // -------------------------------------------------------------------------
+
+    /// Ensure scratch_act can hold `k` f32 values, growing if needed.
+    fn ensure_scratch_act(ctx: &mut MetalContext, k: usize) {
+        if k > ctx.scratch_act_cap {
+            ctx.scratch_act = ctx.device.newBufferWithLength_options(
+                k * 4, MTLResourceOptions::StorageModeShared,
+            ).expect("Metal: scratch_act realloc failed");
+            ctx.scratch_act_cap = k;
+        }
+    }
+
+    /// Ensure scratch_out can hold `n` f32 values, growing if needed.
+    fn ensure_scratch_out(ctx: &mut MetalContext, n: usize) {
+        if n > ctx.scratch_out_cap {
+            ctx.scratch_out = ctx.device.newBufferWithLength_options(
+                n * 4, MTLResourceOptions::StorageModeShared,
+            ).expect("Metal: scratch_out realloc failed");
+            ctx.scratch_out_cap = n;
+        }
+    }
+
+    /// GPU-accelerated Q4K GEMV: `C[1,N] = A[1,K] @ dequant(Q4K[N,K])^T`.
+    ///
+    /// Weight blocks are cached as persistent Metal buffers on first call.
+    /// Uses pre-allocated scratch buffers to avoid per-call allocation.
+    pub fn metal_gemv_q4k_t(a: &Mat, q4k: &Q4KMat) -> Mat {
+        debug_assert_eq!(a.rows, 1, "metal_gemv_q4k_t: only M=1 supported");
+        let k = a.cols;
+        let n = q4k.rows;
+        assert_eq!(k, q4k.cols,
+            "metal_gemv_q4k_t: a.cols {} != q4k.cols {}", k, q4k.cols);
+
+        METAL_CTX.with(|cell| {
+            let ctx_cell = cell.get_or_init(|| RefCell::new(init_context()));
+            let mut ctx = ctx_cell.borrow_mut();
+
+            // Ensure weight buffer is in cache (upload once, reuse forever).
+            let cache_key = (q4k.blocks.as_ptr() as usize, q4k.blocks.len());
+            if !ctx.weight_cache.contains_key(&cache_key) {
+                let buf = upload_bytes(&ctx.device, &q4k.blocks);
+                ctx.weight_cache.insert(cache_key, buf);
+            }
+
+            // Write activation into pre-allocated scratch buffer (memcpy, no alloc).
+            ensure_scratch_act(&mut ctx, k);
+            ensure_scratch_out(&mut ctx, n);
+            unsafe {
+                let act_ptr = ctx.scratch_act.contents().as_ptr() as *mut f32;
+                std::ptr::copy_nonoverlapping(a.data.as_ptr(), act_ptr, k);
+                let dims_ptr = ctx.scratch_dims.contents().as_ptr() as *mut u32;
+                *dims_ptr = k as u32;
+                *dims_ptr.add(1) = n as u32;
+            }
+
+            let cmd_buf = ctx.queue
+                .commandBuffer()
+                .expect("Metal: commandBuffer() failed");
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .expect("Metal: computeCommandEncoder() failed");
+
+            encoder.setComputePipelineState(&ctx.pipeline_q4k);
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_act),              0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.weight_cache[&cache_key]), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_out),              0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_dims),             0, 3);  // K
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_dims),             4, 4);  // N (offset 4 bytes)
+            }
+
+            let tg_size   = MTLSize { width: 32, height: 1, depth: 1 };
+            let grid_size = MTLSize { width: n,  height: 1, depth: 1 };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
+            encoder.endEncoding();
+
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+
+            // Read output directly from scratch_out (no allocation, just copy to Vec).
+            let ptr = ctx.scratch_out.contents().as_ptr() as *const f32;
+            let out_data: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(ptr, n).to_vec()
+            };
+            Mat::new(out_data, 1, n)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // BF16 GEMV entry point
+    // -------------------------------------------------------------------------
+
+    /// Upload a &[u16] slice as bytes to a new MTLBuffer.
+    fn upload_u16(device: &ProtocolObject<dyn MTLDevice>, data: &[u16])
+        -> Retained<ProtocolObject<dyn MTLBuffer>>
+    {
+        let byte_len = data.len() * 2;
+        let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();
+        unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    byte_len,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("Metal: buffer allocation failed")
+        }
+    }
+
+    /// GPU-accelerated BF16 GEMV: `C[1,N] = A[1,K] @ BF16[N,K]^T`.
+    ///
+    /// Weight data is cached as a persistent Metal buffer on first call.
+    /// Uses pre-allocated scratch buffers to avoid per-call allocation.
+    pub fn metal_gemv_bf16_t(a: &Mat, bf16: &MatBf16) -> Mat {
+        debug_assert_eq!(a.rows, 1, "metal_gemv_bf16_t: only M=1 supported");
+        let k = a.cols;
+        let n = bf16.rows;
+        assert_eq!(k, bf16.cols,
+            "metal_gemv_bf16_t: a.cols {} != bf16.cols {}", k, bf16.cols);
+
+        METAL_CTX.with(|cell| {
+            let ctx_cell = cell.get_or_init(|| RefCell::new(init_context()));
+            let mut ctx = ctx_cell.borrow_mut();
+
+            // Ensure weight buffer is in cache.
+            let cache_key = (bf16.data.as_ptr() as usize, bf16.data.len() * 2);
+            if !ctx.weight_cache.contains_key(&cache_key) {
+                let buf = upload_u16(&ctx.device, &bf16.data);
+                ctx.weight_cache.insert(cache_key, buf);
+            }
+
+            ensure_scratch_act(&mut ctx, k);
+            ensure_scratch_out(&mut ctx, n);
+            unsafe {
+                let act_ptr = ctx.scratch_act.contents().as_ptr() as *mut f32;
+                std::ptr::copy_nonoverlapping(a.data.as_ptr(), act_ptr, k);
+                let dims_ptr = ctx.scratch_dims.contents().as_ptr() as *mut u32;
+                *dims_ptr = k as u32;
+                *dims_ptr.add(1) = n as u32;
+            }
+
+            let cmd_buf = ctx.queue
+                .commandBuffer()
+                .expect("Metal: commandBuffer() failed");
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .expect("Metal: computeCommandEncoder() failed");
+
+            encoder.setComputePipelineState(&ctx.pipeline_bf16);
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_act),              0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.weight_cache[&cache_key]), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_out),              0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_dims),             0, 3);  // K
+                encoder.setBuffer_offset_atIndex(Some(&ctx.scratch_dims),             4, 4);  // N (offset 4 bytes)
+            }
+
+            let tg_size   = MTLSize { width: 32, height: 1, depth: 1 };
+            let grid_size = MTLSize { width: n,  height: 1, depth: 1 };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
+            encoder.endEncoding();
+
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+
+            let ptr = ctx.scratch_out.contents().as_ptr() as *const f32;
+            let out_data: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(ptr, n).to_vec()
+            };
+            Mat::new(out_data, 1, n)
         })
     }
 
@@ -750,8 +1100,212 @@ kernel void matmul_q4_t(
                 }}
             }
         }
+
+        // --- Q4K GEMV tests ---
+
+        /// Convert f32 to IEEE 754 f16 bits (truncation, good enough for tests).
+        fn f32_to_f16_bits(val: f32) -> u16 {
+            let bits = val.to_bits();
+            let sign = (bits >> 31) & 1;
+            let exp  = ((bits >> 23) & 0xFF) as i32;
+            let mant = bits & 0x7FFFFF;
+            if exp == 0 { return (sign << 15) as u16; }
+            let new_exp = exp - 127 + 15;
+            if new_exp <= 0 { return (sign << 15) as u16; }
+            if new_exp >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+            let new_mant = mant >> 13;
+            ((sign << 15) | (new_exp as u32) << 10 | new_mant) as u16
+        }
+
+        /// Build a Q4KMat with known values for testing.
+        fn make_test_q4k(n_rows: usize, k: usize) -> Q4KMat {
+            assert_eq!(k % 256, 0);
+            let n_blocks_per_row = k / 256;
+            let total_blocks = n_rows * n_blocks_per_row;
+            let mut blocks = vec![0u8; total_blocks * 144];
+
+            for j in 0..n_rows {
+                for b in 0..n_blocks_per_row {
+                    let boff = (j * n_blocks_per_row + b) * 144;
+                    // d = 0.1, dmin = 0.05 as f16
+                    let d_bits = f32_to_f16_bits(0.1);
+                    let dmin_bits = f32_to_f16_bits(0.05);
+                    blocks[boff]   = d_bits as u8;
+                    blocks[boff+1] = (d_bits >> 8) as u8;
+                    blocks[boff+2] = dmin_bits as u8;
+                    blocks[boff+3] = (dmin_bits >> 8) as u8;
+
+                    // Scales: sub-blocks 0-3: scale=2, min=1
+                    for i in 0..4 { blocks[boff + 4 + i] = 2; }
+                    for i in 4..8 { blocks[boff + 4 + i] = 1; }
+                    // Sub-blocks 4-7: set to 0
+                    for i in 8..12 { blocks[boff + 4 + i] = 0; }
+
+                    // Nibbles: all 0x55 (low=5, high=5)
+                    for i in 0..128 {
+                        blocks[boff + 16 + i] = 0x55;
+                    }
+                }
+            }
+
+            Q4KMat { rows: n_rows, cols: k, blocks }
+        }
+
+        #[test]
+        fn test_metal_gemv_q4k_matches_cpu() {
+            // Small Q4K: 4 rows, K=256 (one super-block per row)
+            let k = 256;
+            let n = 4;
+            let q4k = make_test_q4k(n, k);
+            let a = Mat::from_fn(1, k, |_, c| (c as f32 + 1.0) * 0.01);
+
+            // CPU reference: dequantize each row and compute dot product
+            let mut expected = Mat::zeros(1, n);
+            for j in 0..n {
+                let mut row = vec![0.0f32; k];
+                q4k.dequantize_row_into(j, &mut row);
+                let dot: f32 = row.iter().zip(a.data.iter()).map(|(w, x)| w * x).sum();
+                expected.data[j] = dot;
+            }
+
+            let got = metal_gemv_q4k_t(&a, &q4k);
+            assert_eq!(got.rows, 1);
+            assert_eq!(got.cols, n);
+            for j in 0..n {
+                let diff = (got.data[j] - expected.data[j]).abs();
+                let rel = diff / (expected.data[j].abs() + 1e-6);
+                assert!(rel < 1e-3,
+                    "Q4K GEMV mismatch at col {j}: got {:.6} expected {:.6} (rel {:.6})",
+                    got.data[j], expected.data[j], rel);
+            }
+        }
+
+        #[test]
+        fn test_metal_gemv_q4k_larger() {
+            // Realistic-ish: 64 rows, K=512
+            let k = 512;
+            let n = 64;
+            let q4k = make_test_q4k(n, k);
+            let a = Mat::from_fn(1, k, |_, c| ((c % 7) as f32 - 3.0) * 0.1);
+
+            let mut expected = Mat::zeros(1, n);
+            for j in 0..n {
+                let mut row = vec![0.0f32; k];
+                q4k.dequantize_row_into(j, &mut row);
+                let dot: f32 = row.iter().zip(a.data.iter()).map(|(w, x)| w * x).sum();
+                expected.data[j] = dot;
+            }
+
+            let got = metal_gemv_q4k_t(&a, &q4k);
+            for j in 0..n {
+                let diff = (got.data[j] - expected.data[j]).abs();
+                let rel = diff / (expected.data[j].abs() + 1e-6);
+                assert!(rel < 1e-3,
+                    "Q4K GEMV mismatch at col {j}: got {:.6} expected {:.6}",
+                    got.data[j], expected.data[j]);
+            }
+        }
+
+        #[test]
+        fn test_metal_gemv_q4k_cache_reuse() {
+            // Call twice with same Q4KMat — second call uses cached buffer
+            let k = 256;
+            let n = 4;
+            let q4k = make_test_q4k(n, k);
+            let a1 = Mat::from_fn(1, k, |_, c| c as f32 * 0.01);
+            let a2 = Mat::from_fn(1, k, |_, c| (k - c) as f32 * 0.01);
+
+            let r1 = metal_gemv_q4k_t(&a1, &q4k);
+            let r2 = metal_gemv_q4k_t(&a2, &q4k);
+
+            // Results should differ (different activations)
+            assert!(r1.data[0] != r2.data[0] || r1.data[1] != r2.data[1],
+                "cache reuse: results should differ for different activations");
+
+            // Both should match CPU reference
+            for (a, r) in [(&a1, &r1), (&a2, &r2)] {
+                for j in 0..n {
+                    let mut row = vec![0.0f32; k];
+                    q4k.dequantize_row_into(j, &mut row);
+                    let dot: f32 = row.iter().zip(a.data.iter()).map(|(w, x)| w * x).sum();
+                    let diff = (r.data[j] - dot).abs();
+                    assert!(diff / (dot.abs() + 1e-6) < 1e-3);
+                }
+            }
+        }
+
+        // --- BF16 GEMV tests ---
+
+        #[test]
+        fn test_metal_gemv_bf16_matches_cpu() {
+            let k = 64;
+            let n = 8;
+            // Create BF16 weight matrix [N, K]
+            let w_f32: Vec<f32> = (0..n*k).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+            let w_bf16: Vec<u16> = w_f32.iter().map(|&v| MatBf16::f32_to_bf16(v)).collect();
+            let bf16 = MatBf16 {
+                data: std::sync::Arc::new(w_bf16),
+                rows: n,
+                cols: k,
+            };
+            let a = Mat::from_fn(1, k, |_, c| (c as f32 + 1.0) * 0.05);
+
+            // CPU reference: dequant BF16 to f32, dot product
+            let mut expected = Mat::zeros(1, n);
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for p in 0..k {
+                    let w = MatBf16::bf16_to_f32(bf16.data[j * k + p]);
+                    dot += w * a.data[p];
+                }
+                expected.data[j] = dot;
+            }
+
+            let got = metal_gemv_bf16_t(&a, &bf16);
+            assert_eq!(got.rows, 1);
+            assert_eq!(got.cols, n);
+            for j in 0..n {
+                let diff = (got.data[j] - expected.data[j]).abs();
+                assert!(diff < 1e-2,
+                    "BF16 GEMV mismatch at col {j}: got {:.6} expected {:.6}",
+                    got.data[j], expected.data[j]);
+            }
+        }
+
+        #[test]
+        fn test_metal_gemv_bf16_larger() {
+            let k = 256;
+            let n = 128;
+            let w_f32: Vec<f32> = (0..n*k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+            let w_bf16: Vec<u16> = w_f32.iter().map(|&v| MatBf16::f32_to_bf16(v)).collect();
+            let bf16 = MatBf16 {
+                data: std::sync::Arc::new(w_bf16),
+                rows: n,
+                cols: k,
+            };
+            let a = Mat::from_fn(1, k, |_, c| ((c % 13) as f32 - 6.0) * 0.1);
+
+            let mut expected = Mat::zeros(1, n);
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for p in 0..k {
+                    let w = MatBf16::bf16_to_f32(bf16.data[j * k + p]);
+                    dot += w * a.data[p];
+                }
+                expected.data[j] = dot;
+            }
+
+            let got = metal_gemv_bf16_t(&a, &bf16);
+            for j in 0..n {
+                let diff = (got.data[j] - expected.data[j]).abs();
+                assert!(diff < 1e-2,
+                    "BF16 GEMV mismatch at col {j}: got {:.6} expected {:.6}",
+                    got.data[j], expected.data[j]);
+            }
+        }
     }
 }
 
 #[cfg(feature = "metal")]
-pub use inner::{metal_matmul, metal_matmul_batched, metal_matmul_q4_t};
+pub use inner::{metal_matmul, metal_matmul_batched, metal_matmul_q4_t,
+                metal_gemv_q4k_t, metal_gemv_bf16_t};

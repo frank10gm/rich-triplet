@@ -620,6 +620,11 @@ impl MatBf16 {
 
         // GEMV fast path for decode (M=1): fused BF16 dot + multi-threading.
         // Bypasses dequant-to-scratch + sgemm entirely — reads BF16 directly.
+        //
+        // Note: Metal GPU GEMV was tested but is slower than CPU NEON on Apple
+        // Silicon due to shared memory bandwidth and per-dispatch overhead (~0.5ms).
+        // See metal_ops::metal_gemv_bf16_t for the GPU kernel (kept for potential
+        // future graph-based execution).
         if m == 1 {
             return self.gemv_mt(a);
         }
