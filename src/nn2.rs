@@ -217,6 +217,16 @@ impl Linear2 {
         }
     }
 
+    /// Quantize BF16 weights to Q4_K format and free the BF16 data.
+    pub fn quantize_bf16_to_q4k(&mut self) {
+        if let Some(ref bf16) = self.bf16_weight {
+            let f32_mat = bf16.to_f32();
+            self.q4k_weight = Some(Q4KMat::quantize(&f32_mat));
+            self.bf16_weight = None;
+            self.weight.set_data(Mat::zeros(0, 0));
+        }
+    }
+
     /// input: [T, in_features]  →  output: [T, out_features]
     pub fn forward(&self, input: &TensorNode) -> TensorNode {
         self.fused_linear(input)

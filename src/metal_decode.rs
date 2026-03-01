@@ -547,6 +547,8 @@ kernel void gemv_bf16_t(
         /// May differ from config.vocab_size when the GGUF embed table is
         /// smaller than the config's vocab_size (e.g. 262144 vs 262208).
         lm_head_vocab: usize,
+        /// Whether lm_head weights are BF16 (true) or Q4K (false).
+        lm_head_is_bf16: bool,
     }
 
     // =========================================================================
@@ -728,22 +730,42 @@ kernel void gemv_bf16_t(
             // same data as embed_bf16.  Upload it (or reuse embed_buf).
             // Track the actual row count — may differ from config.vocab_size
             // when GGUF embed table is smaller (e.g. 262144 vs 262208).
-            let (lm_head_buf, lm_head_vocab) = if let Some(ref bf16) = model.lm_head.bf16_weight {
+            //
+            // When q4k-lm-head feature is enabled, re-quantize BF16 → Q4K for
+            // ~3.5x less memory bandwidth and faster GEMV.
+            let (lm_head_buf, lm_head_vocab, lm_head_is_bf16) = if let Some(ref bf16) = model.lm_head.bf16_weight {
                 let rows = bf16.rows;
-                // Check if it's the same Arc as embed_bf16
-                let buf = if model.embed_bf16.is_some()
-                    && std::sync::Arc::ptr_eq(&bf16.data, &model.embed_bf16.as_ref().unwrap().data)
+                #[cfg(feature = "q4k-lm-head")]
                 {
-                    embed_buf.clone()
-                } else {
-                    upload_u16(&device, &bf16.data)
-                };
-                (buf, rows)
+                    let t_q = std::time::Instant::now();
+                    let f32_mat = bf16.to_f32();
+                    let q4k = crate::autograd2::Q4KMat::quantize(&f32_mat);
+                    let buf = upload_bytes(&device, &q4k.blocks);
+                    eprintln!(
+                        "[ Metal ] lm_head re-quantized BF16→Q4K in {:.0} ms ({} rows × {} cols, {:.1} MB → {:.1} MB)",
+                        t_q.elapsed().as_millis(), rows, bf16.cols,
+                        (bf16.data.len() * 2) as f64 / 1e6,
+                        q4k.blocks.len() as f64 / 1e6,
+                    );
+                    (buf, rows, false)
+                }
+                #[cfg(not(feature = "q4k-lm-head"))]
+                {
+                    // Check if it's the same Arc as embed_bf16
+                    let buf = if model.embed_bf16.is_some()
+                        && std::sync::Arc::ptr_eq(&bf16.data, &model.embed_bf16.as_ref().unwrap().data)
+                    {
+                        embed_buf.clone()
+                    } else {
+                        upload_u16(&device, &bf16.data)
+                    };
+                    (buf, rows, true)
+                }
             } else if let Some(ref q4k) = model.lm_head.q4k_weight {
-                (upload_bytes(&device, &q4k.blocks), q4k.rows)
+                (upload_bytes(&device, &q4k.blocks), q4k.rows, false)
             } else {
                 let w = model.lm_head.weight.data();
-                (upload_f32(&device, &w.data), w.rows)
+                (upload_f32(&device, &w.data), w.rows, true)
             };
 
             // Final norm gamma
@@ -833,6 +855,7 @@ kernel void gemv_bf16_t(
                 config: cfg.clone(),
                 max_seq_len,
                 lm_head_vocab,
+                lm_head_is_bf16,
             }
         }
     }
@@ -1425,16 +1448,17 @@ kernel void gemv_bf16_t(
                 self.config.hidden_size,
             );
 
-            // 4. lm_head: normed → logits (BF16, weight-tied to embed in Gemma3)
+            // 4. lm_head: normed → logits
             // Use lm_head_vocab (actual embed table rows) instead of config.vocab_size
             // to avoid out-of-bounds reads when GGUF embed is smaller than config.
-            self.dispatch_gemv_bf16(
+            self.dispatch_gemv(
                 &encoder,
                 &self.buf_normed,
                 &self.lm_head_buf,
                 &self.buf_logits,
                 self.config.hidden_size,
                 self.lm_head_vocab,
+                self.lm_head_is_bf16,
             );
 
             // End encoding, commit, wait

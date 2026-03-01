@@ -951,6 +951,160 @@ impl Q4KMat {
         (sv as f32, mv as f32)
     }
 
+    /// Convert f32 to IEEE 754 half-precision (f16) bits.
+    /// Inverse of `f16_to_f32`. Rounds to nearest, ties to even.
+    #[inline(always)]
+    fn f32_to_f16(val: f32) -> u16 {
+        let bits = val.to_bits();
+        let sign = (bits >> 16) & 0x8000;
+        let exp = ((bits >> 23) & 0xFF) as i32;
+        let mant = bits & 0x7FFFFF;
+
+        if exp == 0xFF {
+            // Inf / NaN
+            return (sign | 0x7C00 | (mant >> 13) as u32) as u16;
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 0x1F {
+            // Overflow → Inf
+            return (sign | 0x7C00) as u16;
+        }
+        if new_exp <= 0 {
+            // Denormal or zero
+            if new_exp < -10 {
+                return sign as u16; // too small
+            }
+            let m = mant | 0x800000;
+            let shift = (1 - new_exp) as u32 + 13;
+            return (sign | (m >> shift) as u32) as u16;
+        }
+        (sign | ((new_exp as u32) << 10) | (mant >> 13)) as u16
+    }
+
+    /// Pack 6-bit scale and min values into the 12-byte scales array.
+    /// `sv[0..8]` are 6-bit scale values, `mv[0..8]` are 6-bit min values.
+    fn pack_scales(sv: &[u8; 8], mv: &[u8; 8]) -> [u8; 12] {
+        let mut sc = [0u8; 12];
+        // Indices 0..3: low 6 bits of sv[0..3] and mv[0..3], high 2 bits
+        // stored in sv[4..7] and mv[4..7] high positions.
+        for j in 0..4 {
+            sc[j]     = (sv[j] & 0x3F) | ((sv[j + 4] & 0x30) << 2);  // bits 4-5 of sv[j+4] → bits 6-7
+            sc[j + 4] = (mv[j] & 0x3F) | ((mv[j + 4] & 0x30) << 2);  // bits 4-5 of mv[j+4] → bits 6-7
+        }
+        // Indices 8..11: low 4 bits of sv[4..7] in low nibble, low 4 bits of mv[4..7] in high nibble
+        for j in 0..4 {
+            sc[8 + j] = (sv[j + 4] & 0x0F) | ((mv[j + 4] & 0x0F) << 4);
+        }
+        sc
+    }
+
+    /// Quantize an f32 matrix to Q4_K format.
+    ///
+    /// `mat` must have cols divisible by 256. Each super-block of 256 elements
+    /// is quantized into 144 bytes following the GGML Q4_K layout.
+    pub fn quantize(mat: &Mat) -> Self {
+        let (rows, cols) = (mat.rows, mat.cols);
+        assert_eq!(cols % 256, 0, "Q4KMat::quantize: cols must be multiple of 256, got {}", cols);
+        let n_blocks_per_row = cols / 256;
+        let total_blocks = rows * n_blocks_per_row;
+        let mut blocks = vec![0u8; total_blocks * 144];
+
+        for row in 0..rows {
+            let row_data = &mat.data[row * cols..(row + 1) * cols];
+            for b in 0..n_blocks_per_row {
+                let block_data = &row_data[b * 256..(b + 1) * 256];
+                let boff = (row * n_blocks_per_row + b) * 144;
+
+                // Step 1: compute per-sub-block scale and min (8 sub-blocks of 32 elements)
+                // Dequant formula: value = d * sv * nibble - dmin * mv
+                // When min >= 0, Q4K can't represent positive offsets, so we use
+                // min = 0 and scale = max / 15 (covering [0, max]).
+                let mut sub_scales = [0.0f32; 8];
+                let mut sub_mins = [0.0f32; 8];
+                for sb in 0..8 {
+                    let sub = &block_data[sb * 32..(sb + 1) * 32];
+                    let mut smin = f32::INFINITY;
+                    let mut smax = f32::NEG_INFINITY;
+                    for &v in sub {
+                        if v < smin { smin = v; }
+                        if v > smax { smax = v; }
+                    }
+                    if smin >= 0.0 {
+                        // All non-negative: offset = 0, scale covers [0, max]
+                        sub_mins[sb] = 0.0;
+                        sub_scales[sb] = if smax > 0.0 { smax / 15.0 } else { 0.0 };
+                    } else {
+                        sub_mins[sb] = smin; // negative
+                        sub_scales[sb] = if smax > smin { (smax - smin) / 15.0 } else { 0.0 };
+                    }
+                }
+
+                // Step 2: find super-block d and dmin
+                // d = max_sub_scale / 63, so that sv values use full 6-bit range (0-63)
+                // dmin = max(-sub_mins) / 63, same for min values
+                let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
+                let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max);
+                let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+                let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
+
+                // Step 3: quantize sub-block scales and mins to 6-bit
+                let mut sv = [0u8; 8];
+                let mut mv = [0u8; 8];
+                if d > 0.0 {
+                    let inv_d = 1.0 / d;
+                    for j in 0..8 {
+                        sv[j] = ((sub_scales[j] * inv_d + 0.5) as u8).min(63);
+                    }
+                }
+                if dmin > 0.0 {
+                    let inv_dmin = 1.0 / dmin;
+                    for j in 0..8 {
+                        mv[j] = (((-sub_mins[j]) * inv_dmin + 0.5) as u8).min(63);
+                    }
+                }
+
+                // Step 4: store d and dmin as f16
+                let d_f16 = Self::f32_to_f16(d);
+                let dmin_f16 = Self::f32_to_f16(dmin);
+                blocks[boff..boff + 2].copy_from_slice(&d_f16.to_le_bytes());
+                blocks[boff + 2..boff + 4].copy_from_slice(&dmin_f16.to_le_bytes());
+
+                // Step 5: pack 6-bit scales/mins into 12-byte array
+                let sc = Self::pack_scales(&sv, &mv);
+                blocks[boff + 4..boff + 16].copy_from_slice(&sc);
+
+                // Step 6: quantize values into 4-bit nibbles
+                // Layout: 4 chunks of 32 bytes (64 elements each)
+                //   chunk c: qs[c*32..(c+1)*32]
+                //     low nibble → sub-block 2c (scale sv[2c], min mv[2c])
+                //     high nibble → sub-block 2c+1 (scale sv[2c+1], min mv[2c+1])
+                let d_val = Self::f16_to_f32(d_f16);
+                let dmin_val = Self::f16_to_f32(dmin_f16);
+                for chunk in 0..4 {
+                    let scale1 = d_val * sv[chunk * 2] as f32;
+                    let min1   = dmin_val * mv[chunk * 2] as f32;
+                    let scale2 = d_val * sv[chunk * 2 + 1] as f32;
+                    let min2   = dmin_val * mv[chunk * 2 + 1] as f32;
+
+                    let lo_data = &block_data[chunk * 64..chunk * 64 + 32];
+                    let hi_data = &block_data[chunk * 64 + 32..chunk * 64 + 64];
+
+                    for l in 0..32 {
+                        let q_lo = if scale1 > 0.0 {
+                            (((lo_data[l] + min1) / scale1 + 0.5) as u8).min(15)
+                        } else { 0 };
+                        let q_hi = if scale2 > 0.0 {
+                            (((hi_data[l] + min2) / scale2 + 0.5) as u8).min(15)
+                        } else { 0 };
+                        blocks[boff + 16 + chunk * 32 + l] = q_lo | (q_hi << 4);
+                    }
+                }
+            }
+        }
+
+        Q4KMat { rows, cols, blocks }
+    }
+
     /// Dequantize row `row_idx` (in [0, rows)) into `buf` (length >= cols).
     ///
     /// `cols` must be a multiple of 256 (true for all Gemma3 weight matrices),
@@ -5214,6 +5368,100 @@ mod tests {
                 c,
                 m2.at(0, c),
                 m.at(0, c)
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Q4K quantize round-trip tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_q4k_quantize_dequantize_roundtrip() {
+        // Create a matrix with varied values; cols must be multiple of 256
+        let m = Mat::from_fn(4, 256, |r, c| {
+            ((r * 256 + c) as f32 / 1024.0) * 2.0 - 1.0
+        });
+        let q = Q4KMat::quantize(&m);
+
+        // Verify block count
+        let expected_blocks = 4; // 4 rows * (256/256) blocks per row
+        assert_eq!(q.blocks.len(), expected_blocks * 144);
+        assert_eq!(q.rows, 4);
+        assert_eq!(q.cols, 256);
+
+        // Dequantize and check round-trip error
+        let mut buf = vec![0.0f32; 256];
+        let mut max_err = 0.0f32;
+        for r in 0..4 {
+            q.dequantize_row_into(r, &mut buf);
+            for c in 0..256 {
+                let err = (buf[c] - m.at(r, c)).abs();
+                max_err = max_err.max(err);
+            }
+        }
+        assert!(
+            max_err < 0.15,
+            "Q4K round-trip max error {} should be < 0.15",
+            max_err
+        );
+    }
+
+    #[test]
+    fn test_q4k_quantize_zeros() {
+        let m = Mat::zeros(2, 256);
+        let q = Q4KMat::quantize(&m);
+        let mut buf = vec![0.0f32; 256];
+        for r in 0..2 {
+            q.dequantize_row_into(r, &mut buf);
+            for c in 0..256 {
+                assert!(
+                    buf[c].abs() < 1e-6,
+                    "Q4K zeros: row {} col {} got {}",
+                    r, c, buf[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_q4k_quantize_large_matrix() {
+        // Simulate lm_head-like dimensions (smaller scale)
+        let m = Mat::from_fn(16, 512, |r, c| {
+            ((r * 512 + c) as f32 * 0.001).sin()
+        });
+        let q = Q4KMat::quantize(&m);
+        assert_eq!(q.rows, 16);
+        assert_eq!(q.cols, 512);
+
+        let mut buf = vec![0.0f32; 512];
+        let mut max_err = 0.0f32;
+        for r in 0..16 {
+            q.dequantize_row_into(r, &mut buf);
+            for c in 0..512 {
+                let err = (buf[c] - m.at(r, c)).abs();
+                max_err = max_err.max(err);
+            }
+        }
+        assert!(
+            max_err < 0.15,
+            "Q4K large matrix round-trip max error {} should be < 0.15",
+            max_err
+        );
+    }
+
+    #[test]
+    fn test_f16_roundtrip() {
+        // Test the f32→f16→f32 round-trip
+        for v in [0.0f32, 1.0, -1.0, 0.5, 65504.0, -65504.0, 0.001, 100.0] {
+            let bits = Q4KMat::f32_to_f16(v);
+            let back = Q4KMat::f16_to_f32(bits);
+            let err = (back - v).abs();
+            let tol = v.abs() * 0.002 + 1e-6; // ~0.1% relative tolerance
+            assert!(
+                err < tol,
+                "f16 round-trip for {}: got {} (err {})",
+                v, back, err
             );
         }
     }
