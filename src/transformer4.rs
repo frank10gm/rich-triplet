@@ -486,9 +486,10 @@ impl Gemma3Model {
             .map(|i| Gemma3Block::new_for_inference(&cfg, i))
             .collect();
         let norm = RmsNorm2::new_with_eps(cfg.hidden_size, cfg.rms_norm_eps);
+        // lm_head has no bias in Gemma3 — use zero-sized placeholder to save ~1 MB.
         let lm_head = Linear2 {
             weight: embed.clone(),
-            bias: TensorNode::leaf(Mat::zeros(1, cfg.vocab_size)),
+            bias: TensorNode::leaf(Mat::zeros(0, 0)),
             in_features: cfg.hidden_size,
             out_features: cfg.vocab_size,
             q4_weight: None,
@@ -653,11 +654,17 @@ impl Gemma3Model {
                 continue;
             }
 
-            let bytes =
-                std::fs::read(&path).map_err(|e| format!("cannot read {:?}: {}", path, e))?;
-
-            let tensors = crate::transformer3::parse_safetensors_skip_bf16_f32(&bytes)
-                .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
+            // Parse shard and drop raw bytes before applying tensors.
+            // This avoids holding ~1-4 GB of file bytes simultaneously with
+            // the parsed tensor data (~1-2 GB), reducing peak RAM.
+            let tensors = {
+                let bytes =
+                    std::fs::read(&path).map_err(|e| format!("cannot read {:?}: {}", path, e))?;
+                let t = crate::transformer3::parse_safetensors_skip_bf16_f32(&bytes)
+                    .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
+                t
+                // `bytes` dropped here — parsed tensors own their data
+            };
 
             for t in tensors {
                 loaded_tensors += 1;
@@ -807,34 +814,30 @@ impl Gemma3Model {
                     }
                     GgufType::F16 => {
                         let f32s = gguf.decode_f16_to_f32(idx)?;
-                        let bits: Vec<u16> =
-                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        let bits = f32s_to_bf16_and_drop(f32s);
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::F32 => {
                         let f32s = gguf.decode_f32(idx)?;
-                        let bits: Vec<u16> =
-                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        let bits = f32s_to_bf16_and_drop(f32s);
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::Q4_0 => {
-                        // Dequantize Q4_0 embedding to f32, then convert to BF16 for storage.
-                        // Memory order: flat[tok * hidden + col] — no transpose needed.
+                        // Dequantize Q4_0 embedding to f32, convert to BF16 in chunks
+                        // to avoid holding the full f32 + bf16 arrays simultaneously
+                        // (~4 GB peak for 262K×2560 embed).
                         let f32s = gguf.decode_q4_0_to_f32(idx)?;
-                        let bits: Vec<u16> =
-                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        let bits = f32s_to_bf16_and_drop(f32s);
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::Q4K => {
                         let f32s = gguf.decode_q4k_to_f32(idx)?;
-                        let bits: Vec<u16> =
-                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        let bits = f32s_to_bf16_and_drop(f32s);
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     GgufType::Q6K => {
                         let f32s = gguf.decode_q6k_to_f32(idx)?;
-                        let bits: Vec<u16> =
-                            f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+                        let bits = f32s_to_bf16_and_drop(f32s);
                         model_set_embed_bf16(self, bits, vocab, hidden);
                     }
                     _ => {
@@ -1065,6 +1068,29 @@ impl Gemma3Model {
 // GGUF loading helpers (free functions)
 // ============================================================================
 
+/// Convert a Vec<f32> to Vec<u16> (BF16) while minimizing peak memory.
+///
+/// Reuses the f32 buffer's allocation: since each u16 is 2 bytes and each f32
+/// is 4 bytes, we write BF16 values into the front half of the same allocation.
+/// Peak overhead: zero extra bytes beyond the original f32 vec.
+///
+/// Safety: the write at position i (byte offset 2i) can only corrupt f32 at
+/// position floor(i/2), which was already read at step floor(i/2) < i.
+/// The resulting Vec<u16> reuses the original allocation (alignment 4 >= 2);
+/// macOS malloc/free does not require matching alignment on dealloc.
+fn f32s_to_bf16_and_drop(f32s: Vec<f32>) -> Vec<u16> {
+    use crate::autograd2::MatBf16;
+    let n = f32s.len();
+    let mut raw = std::mem::ManuallyDrop::new(f32s);
+    let ptr = raw.as_mut_ptr() as *mut u16;
+    let cap_u16 = raw.capacity() * 2;
+    for i in 0..n {
+        let f = unsafe { std::ptr::read(raw.as_ptr().add(i)) };
+        unsafe { std::ptr::write(ptr.add(i), MatBf16::f32_to_bf16(f)) };
+    }
+    unsafe { Vec::from_raw_parts(ptr, n, cap_u16) }
+}
+
 fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, hidden: usize) {
     use crate::autograd2::MatBf16;
     // Wrap in Arc once so embed_bf16 and lm_head share the same allocation (no clone).
@@ -1116,7 +1142,7 @@ fn load_linear_from_gguf(
         }
         GgufType::F16 => {
             let f32s = gguf.decode_f16_to_f32(idx)?;
-            let bits: Vec<u16> = f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+            let bits = f32s_to_bf16_and_drop(f32s);
             linear.load_bf16(bits, rows, cols);
         }
         GgufType::F32 => {
@@ -1137,7 +1163,7 @@ fn load_linear_from_gguf(
         }
         GgufType::Q6K => {
             let f32s = gguf.decode_q6k_to_f32(idx)?;
-            let bits: Vec<u16> = f32s.iter().map(|&f| MatBf16::f32_to_bf16(f)).collect();
+            let bits = f32s_to_bf16_and_drop(f32s);
             linear.load_bf16(bits, rows, cols);
         }
         _ => {

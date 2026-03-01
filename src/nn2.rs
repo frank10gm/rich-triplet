@@ -167,10 +167,11 @@ impl Linear2 {
     /// Used for inference-only paths where weights will be loaded from GGUF/safetensors.
     /// Avoids the expensive random-initialization allocation — saves ~12 GB peak RAM for
     /// Gemma3-4b (34 layers × ~375 MB per layer).
+    /// Bias is zero-sized (not allocated) — `fused_linear` skips the bias addition.
     pub fn new_no_bias_zeros(in_features: usize, out_features: usize) -> Self {
         Linear2 {
             weight: TensorNode::leaf(Mat::zeros(0, 0)),
-            bias: TensorNode::leaf(Mat::zeros(1, out_features)),
+            bias: TensorNode::leaf(Mat::zeros(0, 0)),
             in_features,
             out_features,
             q4_weight: None,
@@ -271,11 +272,10 @@ impl Linear2 {
         // input and weight — avoiding a separate transpose node.
         let x = input.data().clone();
         let b = self.bias.data().clone();
+        let has_bias = b.rows > 0 && b.cols > 0;
 
         // Forward matmul priority: Q4 > Q4K > BF16 > f32.
         let out_data = if let Some(ref q4) = self.q4_weight {
-            // Q4_0 path: chunked SGEMM decode or full-dequant sgemm for prefill.
-            // See Q4Mat::matmul_q4_t_blas for the dispatch strategy.
             assert_eq!(
                 x.cols, q4.cols,
                 "Linear (q4): input cols {} != weight cols {}",
@@ -285,42 +285,44 @@ impl Linear2 {
             let mut o = q4.matmul_q4_t_blas(&x);
             #[cfg(not(feature = "blas"))]
             let mut o = q4.matmul_q4_t(&x);
-            for r in 0..o.rows {
-                for c in 0..o.cols {
-                    *o.at_mut(r, c) += b.at(0, c);
+            if has_bias {
+                for r in 0..o.rows {
+                    for c in 0..o.cols {
+                        *o.at_mut(r, c) += b.at(0, c);
+                    }
                 }
             }
             o
         } else if let Some(ref q4k) = self.q4k_weight {
-            // Q4_K path: chunked SGEMM decode or full-dequant sgemm for prefill.
-            // See Q4KMat::matmul_q4k_t_blas for the dispatch strategy.
             assert_eq!(
                 x.cols, q4k.cols,
                 "Linear (q4k): input cols {} != weight cols {}",
                 x.cols, q4k.cols
             );
-#[cfg(feature = "blas")]
+            #[cfg(feature = "blas")]
             let mut o = q4k.matmul_q4k_t_blas(&x);
             #[cfg(not(feature = "blas"))]
             let mut o = q4k.matmul_q4k_t(&x);
-            for r in 0..o.rows {
-                for c in 0..o.cols {
-                    *o.at_mut(r, c) += b.at(0, c);
+            if has_bias {
+                for r in 0..o.rows {
+                    for c in 0..o.cols {
+                        *o.at_mut(r, c) += b.at(0, c);
+                    }
                 }
             }
             o
         } else if let Some(ref bf16) = self.bf16_weight {
-            // BF16 path: chunked SGEMM decode or full-dequant sgemm for prefill.
-            // See MatBf16::matmul_by_t for the dispatch strategy.
             assert_eq!(
                 x.cols, bf16.cols,
                 "Linear (bf16): input cols {} != weight cols {}",
                 x.cols, bf16.cols
             );
             let mut o = bf16.matmul_by_t(&x);
-            for r in 0..o.rows {
-                for c in 0..o.cols {
-                    *o.at_mut(r, c) += b.at(0, c);
+            if has_bias {
+                for r in 0..o.rows {
+                    for c in 0..o.cols {
+                        *o.at_mut(r, c) += b.at(0, c);
+                    }
                 }
             }
             o
@@ -333,9 +335,11 @@ impl Linear2 {
             );
             let wt = w.transpose();
             let mut o = x.matmul(&wt);
-            for r in 0..o.rows {
-                for c in 0..o.cols {
-                    *o.at_mut(r, c) += b.at(0, c);
+            if has_bias {
+                for r in 0..o.rows {
+                    for c in 0..o.cols {
+                        *o.at_mut(r, c) += b.at(0, c);
+                    }
                 }
             }
             o
