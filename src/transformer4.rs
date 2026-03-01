@@ -2020,7 +2020,8 @@ impl Gemma3Model {
                 let logits_vec = metal_ctx.decode_step(prev, metal_seq_len);
                 t_metal_us += t_m.elapsed().as_micros();
                 metal_seq_len += 1;
-                Mat::new(logits_vec, 1, self.config.vocab_size)
+                let n = logits_vec.len();
+                Mat::new(logits_vec, 1, n)
             } else {
                 unreachable!()
             };
@@ -2690,7 +2691,7 @@ fn sample_token(
     // Top-k
     if params.top_k > 0 && params.top_k < v {
         let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         for i in params.top_k..v {
             probs[indexed[i].0] = 0.0;
         }
@@ -2740,7 +2741,7 @@ fn sample_token(
             .iter()
             .cloned()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i)
             .unwrap_or(0);
     }

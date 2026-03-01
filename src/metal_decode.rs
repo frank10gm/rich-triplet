@@ -543,6 +543,10 @@ kernel void gemv_bf16_t(
         config: Config4,
         #[allow(dead_code)]
         max_seq_len: usize,
+        /// Actual number of rows in lm_head weight buffer.
+        /// May differ from config.vocab_size when the GGUF embed table is
+        /// smaller than the config's vocab_size (e.g. 262144 vs 262208).
+        lm_head_vocab: usize,
     }
 
     // =========================================================================
@@ -722,19 +726,24 @@ kernel void gemv_bf16_t(
             // lm_head: weight-tied to embed_tokens in Gemma3
             // The lm_head Linear2 should have a bf16_weight that points to the
             // same data as embed_bf16.  Upload it (or reuse embed_buf).
-            let lm_head_buf = if let Some(ref bf16) = model.lm_head.bf16_weight {
+            // Track the actual row count — may differ from config.vocab_size
+            // when GGUF embed table is smaller (e.g. 262144 vs 262208).
+            let (lm_head_buf, lm_head_vocab) = if let Some(ref bf16) = model.lm_head.bf16_weight {
+                let rows = bf16.rows;
                 // Check if it's the same Arc as embed_bf16
-                if model.embed_bf16.is_some()
+                let buf = if model.embed_bf16.is_some()
                     && std::sync::Arc::ptr_eq(&bf16.data, &model.embed_bf16.as_ref().unwrap().data)
                 {
                     embed_buf.clone()
                 } else {
                     upload_u16(&device, &bf16.data)
-                }
+                };
+                (buf, rows)
             } else if let Some(ref q4k) = model.lm_head.q4k_weight {
-                upload_bytes(&device, &q4k.blocks)
+                (upload_bytes(&device, &q4k.blocks), q4k.rows)
             } else {
-                upload_f32(&device, &model.lm_head.weight.data().data)
+                let w = model.lm_head.weight.data();
+                (upload_f32(&device, &w.data), w.rows)
             };
 
             // Final norm gamma
@@ -746,8 +755,6 @@ kernel void gemv_bf16_t(
             let nkv = cfg.num_key_value_heads;
             let d = cfg.head_dim;
             let inter = cfg.intermediate_size;
-            let vocab = cfg.vocab_size;
-
             let buf_hidden = alloc_buf(&device, h * 4);
             let buf_hidden2 = alloc_buf(&device, h * 4);
             let buf_normed = alloc_buf(&device, h * 4);
@@ -765,7 +772,7 @@ kernel void gemv_bf16_t(
             let buf_gate_act = alloc_buf(&device, inter * 4);
             let buf_mlp_hidden = alloc_buf(&device, inter * 4);
             let buf_down_out = alloc_buf(&device, h * 4);
-            let buf_logits = alloc_buf(&device, vocab * 4);
+            let buf_logits = alloc_buf(&device, lm_head_vocab * 4);
 
             // KV cache buffers
             let max_seq_len = cfg.max_position_embeddings.min(8192); // cap for memory
@@ -825,6 +832,7 @@ kernel void gemv_bf16_t(
                 kv_v_bufs,
                 config: cfg.clone(),
                 max_seq_len,
+                lm_head_vocab,
             }
         }
     }
@@ -1418,13 +1426,15 @@ kernel void gemv_bf16_t(
             );
 
             // 4. lm_head: normed → logits (BF16, weight-tied to embed in Gemma3)
+            // Use lm_head_vocab (actual embed table rows) instead of config.vocab_size
+            // to avoid out-of-bounds reads when GGUF embed is smaller than config.
             self.dispatch_gemv_bf16(
                 &encoder,
                 &self.buf_normed,
                 &self.lm_head_buf,
                 &self.buf_logits,
                 self.config.hidden_size,
-                self.config.vocab_size,
+                self.lm_head_vocab,
             );
 
             // End encoding, commit, wait
@@ -1433,9 +1443,8 @@ kernel void gemv_bf16_t(
             cmd_buf.waitUntilCompleted();
 
             // Read logits from shared memory
-            let vocab = self.config.vocab_size;
             let ptr = self.buf_logits.contents().as_ptr() as *const f32;
-            unsafe { std::slice::from_raw_parts(ptr, vocab).to_vec() }
+            unsafe { std::slice::from_raw_parts(ptr, self.lm_head_vocab).to_vec() }
         }
     }
 
