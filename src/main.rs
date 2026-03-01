@@ -4,6 +4,8 @@ mod dataset;
 mod gguf_loader;
 #[cfg(feature = "metal")]
 mod metal_ops;
+#[cfg(feature = "metal")]
+mod metal_decode;
 mod ndarray;
 mod nn;
 mod nn2;

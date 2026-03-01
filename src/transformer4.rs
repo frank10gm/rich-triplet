@@ -1971,61 +1971,106 @@ impl Gemma3Model {
             return;
         }
 
+        // ── Metal GPU decode path ────────────────────────────────────────
+        // When the `metal` feature is enabled, create a MetalDecodeContext
+        // that encodes the entire forward pass in a single command buffer.
+        // This eliminates ~120ms of per-dispatch overhead.
+        #[cfg(feature = "metal")]
+        let use_metal = true;
+        #[cfg(not(feature = "metal"))]
+        let use_metal = false;
+
+        #[cfg(feature = "metal")]
+        let mut metal_ctx = {
+            let mut ctx = crate::metal_decode::inner::MetalDecodeContext::new(self);
+            // Warmup: run one dummy decode step to trigger GPU shader JIT compilation.
+            // This avoids a ~25s stall on the first real decode step.
+            // Must run BEFORE sync_kv_from_cpu since warmup writes to KV cache at pos 0.
+            let t_warmup = std::time::Instant::now();
+            let _ = ctx.decode_step(0, 0);
+            eprintln!("[ Metal ] GPU warmup in {:.0} ms", t_warmup.elapsed().as_millis());
+            ctx.sync_kv_from_cpu(&cache);
+            ctx
+        };
+
         // ----- Decode loop -----
         let decode_start = std::time::Instant::now();
         let mut prev = first;
         let mut n_decoded = 1usize;
 
+        // Track current seq_len for the Metal path (CPU cache is not updated
+        // in the Metal path — the GPU maintains its own KV cache).
+        let mut metal_seq_len = t_prompt;
+
         // Timing accumulators for first-step profiling (printed after step 1).
+        #[allow(unused_mut)]
         let mut t_embed_us = 0u128;
+        #[allow(unused_mut)]
         let mut t_layers_us = 0u128;
+        #[allow(unused_mut)]
         let mut t_lmhead_us = 0u128;
+        #[allow(unused_mut)]
+        let mut t_metal_us = 0u128;
         let mut profile_printed = false;
 
         for step in 1..max_new {
-            let t0 = std::time::Instant::now();
-            let x_data = Mat {
-                data: embed_row(prev),
-                rows: 1,
-                cols: h,
+            #[cfg(feature = "metal")]
+            let logits_data = if use_metal {
+                let t_m = std::time::Instant::now();
+                let logits_vec = metal_ctx.decode_step(prev, metal_seq_len);
+                t_metal_us += t_m.elapsed().as_micros();
+                metal_seq_len += 1;
+                Mat::new(logits_vec, 1, self.config.vocab_size)
+            } else {
+                unreachable!()
             };
-            let mut x = TensorNode::leaf(x_data);
-            t_embed_us += t0.elapsed().as_micros();
 
-            let t1 = std::time::Instant::now();
-            for (i, layer) in self.layers.iter().enumerate() {
-                x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
-            }
-            t_layers_us += t1.elapsed().as_micros();
+            #[cfg(not(feature = "metal"))]
+            let logits_data = {
+                let t0 = std::time::Instant::now();
+                let x_data = Mat {
+                    data: embed_row(prev),
+                    rows: 1,
+                    cols: h,
+                };
+                let mut x = TensorNode::leaf(x_data);
+                t_embed_us += t0.elapsed().as_micros();
 
-            let t2 = std::time::Instant::now();
-            let normed_x = self.norm.forward_gemma3(&x);
-            let logits_node = self.lm_head.forward(&normed_x);
-            t_lmhead_us += t2.elapsed().as_micros();
+                let t1 = std::time::Instant::now();
+                for (i, layer) in self.layers.iter().enumerate() {
+                    x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+                }
+                t_layers_us += t1.elapsed().as_micros();
 
-            // ── Diagnostics for all decode steps ──────────────────────────
-            if debug {
-                let xd = x.data();
-                let xv = &xd.data;
-                let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
-                let nx = normed_x.data();
-                let nxv = &nx.data;
-                let nx_norm = (nxv.iter().map(|v| v * v).sum::<f32>() / nxv.len() as f32).sqrt();
+                let t2 = std::time::Instant::now();
+                let normed_x = self.norm.forward_gemma3(&x);
+                let logits_node = self.lm_head.forward(&normed_x);
+                t_lmhead_us += t2.elapsed().as_micros();
 
-                let ld = logits_node.data();
-                let lv = &ld.data;
-                let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
-                eprintln!(
-                    "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
-                    step, prev, x_norm, nx_norm, l_max, gap, top5
-                );
-            }
+                if debug {
+                    let xd = x.data();
+                    let xv = &xd.data;
+                    let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
+                    let nx = normed_x.data();
+                    let nxv = &nx.data;
+                    let nx_norm = (nxv.iter().map(|v| v * v).sum::<f32>() / nxv.len() as f32).sqrt();
 
-            prev = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
+                    let ld = logits_node.data();
+                    let lv = &ld.data;
+                    let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
+                    let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
+                    eprintln!(
+                        "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
+                        step, prev, x_norm, nx_norm, l_max, gap, top5
+                    );
+                }
+                logits_node.data().clone()
+            };
+
+            prev = sample_token(&logits_data, 0, &params, &seen, &mut rng);
             callback(prev);
             seen.push(prev);
             n_decoded += 1;
@@ -2034,12 +2079,19 @@ impl Gemma3Model {
             // see where time is actually being spent.
             if step == 1 && !profile_printed {
                 profile_printed = true;
-                eprintln!(
-                    "[ Gemma3 ] Step-1 breakdown: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
-                    t_embed_us as f64 / 1000.0,
-                    t_layers_us as f64 / 1000.0,
-                    t_lmhead_us as f64 / 1000.0,
-                );
+                if use_metal {
+                    eprintln!(
+                        "[ Gemma3 ] Step-1 (Metal graph): {:.1}ms",
+                        t_metal_us as f64 / 1000.0,
+                    );
+                } else {
+                    eprintln!(
+                        "[ Gemma3 ] Step-1 breakdown: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
+                        t_embed_us as f64 / 1000.0,
+                        t_layers_us as f64 / 1000.0,
+                        t_lmhead_us as f64 / 1000.0,
+                    );
+                }
             }
 
             if is_eos(prev) {
@@ -2057,12 +2109,19 @@ impl Gemma3Model {
         );
         // Print averaged breakdown if we ran more than one decode step.
         if n_decoded > 1 {
-            eprintln!(
-                "[ Gemma3 ] Avg/step: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
-                t_embed_us as f64 / (n_decoded as f64 * 1000.0),
-                t_layers_us as f64 / (n_decoded as f64 * 1000.0),
-                t_lmhead_us as f64 / (n_decoded as f64 * 1000.0),
-            );
+            if use_metal {
+                eprintln!(
+                    "[ Gemma3 ] Avg/step (Metal graph): {:.1}ms",
+                    t_metal_us as f64 / (n_decoded as f64 * 1000.0),
+                );
+            } else {
+                eprintln!(
+                    "[ Gemma3 ] Avg/step: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
+                    t_embed_us as f64 / (n_decoded as f64 * 1000.0),
+                    t_layers_us as f64 / (n_decoded as f64 * 1000.0),
+                    t_lmhead_us as f64 / (n_decoded as f64 * 1000.0),
+                );
+            }
         }
     }
 }
