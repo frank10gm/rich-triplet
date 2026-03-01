@@ -797,7 +797,7 @@ kernel void gemv_bf16_t(
             let buf_logits = alloc_buf(&device, lm_head_vocab * 4);
 
             // KV cache buffers
-            let max_seq_len = cfg.max_position_embeddings.min(8192); // cap for memory
+            let max_seq_len = cfg.max_position_embeddings.min(2048); // cap for memory (matches CPU cache)
             let kv_dim = nkv * d;
             let mut kv_k_bufs = Vec::with_capacity(cfg.num_hidden_layers);
             let mut kv_v_bufs = Vec::with_capacity(cfg.num_hidden_layers);

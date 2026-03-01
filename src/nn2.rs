@@ -227,6 +227,17 @@ impl Linear2 {
         }
     }
 
+    /// Free all CPU-side weight data (Q4K blocks, BF16 data, f32 weight).
+    ///
+    /// Call after weights have been uploaded to GPU Metal buffers.
+    /// The GPU buffers hold their own copy, so the CPU data is redundant.
+    pub fn clear_weight_data(&mut self) {
+        self.q4k_weight = None;
+        self.bf16_weight = None;
+        self.q4_weight = None;
+        self.weight.set_data(Mat::zeros(0, 0));
+    }
+
     /// input: [T, in_features]  →  output: [T, out_features]
     pub fn forward(&self, input: &TensorNode) -> TensorNode {
         self.fused_linear(input)

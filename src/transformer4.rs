@@ -505,6 +505,31 @@ impl Gemma3Model {
         }
     }
 
+    /// Free all CPU-side weight data after Metal GPU upload.
+    ///
+    /// Clears Q4K blocks, BF16 data, and f32 weights from all layer
+    /// projections + embedding table + lm_head.  Call after
+    /// `MetalDecodeContext::new()` has copied everything into GPU buffers.
+    /// Saves ~1.8 GB (Q4K layers) + ~1.3 GB (embed BF16) of duplicate RAM.
+    pub fn clear_cpu_weights(&mut self) {
+        for layer in &mut self.layers {
+            layer.self_attn.q_proj.clear_weight_data();
+            layer.self_attn.k_proj.clear_weight_data();
+            layer.self_attn.v_proj.clear_weight_data();
+            layer.self_attn.o_proj.clear_weight_data();
+            layer.mlp.gate_proj.clear_weight_data();
+            layer.mlp.up_proj.clear_weight_data();
+            layer.mlp.down_proj.clear_weight_data();
+            // Norm gamma vectors are tiny (2560 f32 = 10 KB each) — not worth clearing.
+        }
+        // Free embedding table (262144 × 2560 × 2 = ~1.3 GB BF16)
+        self.embed_bf16 = None;
+        self.embed_tokens.set_data(Mat::zeros(0, 0));
+        // Free lm_head (weight-tied, but clear its own references too)
+        self.lm_head.clear_weight_data();
+        eprintln!("[ Metal ] Freed CPU-side weight data (~3 GB)");
+    }
+
     // -------------------------------------------------------------------------
     // Forward
     // -------------------------------------------------------------------------
@@ -1750,6 +1775,17 @@ impl Gemma3KvCache {
             layer.borrow_mut().seq_len = 0;
         }
     }
+
+    /// Free all KV cache memory. Call after syncing to GPU Metal buffers.
+    /// Replaces each layer's K/V mats with zero-sized placeholders.
+    pub fn free(&mut self) {
+        for layer in &mut self.layers {
+            let mut lc = layer.borrow_mut();
+            lc.k = Mat::zeros(0, 0);
+            lc.v = Mat::zeros(0, 0);
+            lc.seq_len = 0;
+        }
+    }
 }
 
 // ============================================================================
@@ -1865,7 +1901,7 @@ impl Gemma3Model {
     /// Decode: run 1 token per step.  K/V is appended to the cache; local
     /// layers attend to the last `window` entries, global layers to all.
     pub fn generate_cached_streaming(
-        &self,
+        &mut self,
         token_ids: &[usize],
         max_new: usize,
         temperature: f32,
@@ -1892,7 +1928,7 @@ impl Gemma3Model {
         // Gemma 3 uses two EOS token ids: 1 (<eos>) and 106 (<end_of_turn>).
         let is_eos = |tok: usize| tok == 1 || tok == 106;
 
-        let cache = Gemma3KvCache::new(&self.config);
+        let mut cache = Gemma3KvCache::new(&self.config);
         let h = self.config.hidden_size;
         let scale = (h as f32).sqrt();
         let mut rng = LcgRng::new(seed);
@@ -1905,24 +1941,26 @@ impl Gemma3Model {
         // generating garbage until max_new is reached.
         let mut seen: Vec<usize> = Vec::new();
 
-        // Helper: look up one embedding row from BF16 table (preferred) or f32.
-        let embed_row = |tok: usize| -> Vec<f32> {
-            if let Some(ref bf16) = self.embed_bf16 {
-                use crate::autograd2::MatBf16;
-                (0..h)
-                    .map(|c| MatBf16::bf16_to_f32(bf16.data[tok * h + c]) * scale)
-                    .collect()
-            } else {
-                let te = self.embed_tokens.data();
-                (0..h).map(|c| te.at(tok, c) * scale).collect()
-            }
-        };
-
         // ----- Prefill -----
         let t_prompt = token_ids.len();
         let prefill_start = std::time::Instant::now();
 
-        let embed_data: Vec<f32> = token_ids.iter().flat_map(|&tok| embed_row(tok)).collect();
+        // Embed lookup for prefill — scoped so borrow of self is released before
+        // Metal context creation / weight clearing.
+        let embed_data: Vec<f32> = {
+            let embed_row = |tok: usize| -> Vec<f32> {
+                if let Some(ref bf16) = self.embed_bf16 {
+                    use crate::autograd2::MatBf16;
+                    (0..h)
+                        .map(|c| MatBf16::bf16_to_f32(bf16.data[tok * h + c]) * scale)
+                        .collect()
+                } else {
+                    let te = self.embed_tokens.data();
+                    (0..h).map(|c| te.at(tok, c) * scale).collect()
+                }
+            };
+            token_ids.iter().flat_map(|&tok| embed_row(tok)).collect()
+        };
 
         let x_data = Mat {
             data: embed_data,
@@ -1990,6 +2028,12 @@ impl Gemma3Model {
             let _ = ctx.decode_step(0, 0);
             eprintln!("[ Metal ] GPU warmup in {:.0} ms", t_warmup.elapsed().as_millis());
             ctx.sync_kv_from_cpu(&cache);
+
+            // Free CPU-side duplicates now that everything is in GPU buffers.
+            // Saves ~3 GB (layer weights) + ~0.5 GB (CPU KV cache).
+            self.clear_cpu_weights();
+            cache.free();
+
             ctx
         };
 
@@ -2029,8 +2073,17 @@ impl Gemma3Model {
             #[cfg(not(feature = "metal"))]
             let logits_data = {
                 let t0 = std::time::Instant::now();
+                let embed_vec: Vec<f32> = if let Some(ref bf16) = self.embed_bf16 {
+                    use crate::autograd2::MatBf16;
+                    (0..h)
+                        .map(|c| MatBf16::bf16_to_f32(bf16.data[prev * h + c]) * scale)
+                        .collect()
+                } else {
+                    let te = self.embed_tokens.data();
+                    (0..h).map(|c| te.at(prev, c) * scale).collect()
+                };
                 let x_data = Mat {
-                    data: embed_row(prev),
+                    data: embed_vec,
                     rows: 1,
                     cols: h,
                 };
@@ -3054,7 +3107,7 @@ mod tests {
     fn test_generate_cached_streaming_produces_tokens() {
         let cfg = tiny_cfg();
         let mut rng = InitRng::new(7);
-        let model = Gemma3Model::new(cfg, &mut rng);
+        let mut model = Gemma3Model::new(cfg, &mut rng);
         let mut generated = Vec::new();
         model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, false, |tok| {
             generated.push(tok);
@@ -3069,7 +3122,7 @@ mod tests {
         // identical whether we use the cached or the non-cached path.
         let cfg = tiny_cfg();
         let mut rng = InitRng::new(42);
-        let model = Gemma3Model::new(cfg.clone(), &mut rng);
+        let mut model = Gemma3Model::new(cfg.clone(), &mut rng);
         let prompt = vec![0usize, 1, 2, 3];
 
         // Non-cached: full forward, greedy argmax on last row
@@ -3100,7 +3153,7 @@ mod tests {
         // windowed attention path in local layers.
         let cfg = tiny_cfg(); // window=8
         let mut rng = InitRng::new(11);
-        let model = Gemma3Model::new(cfg.clone(), &mut rng);
+        let mut model = Gemma3Model::new(cfg.clone(), &mut rng);
         let prompt: Vec<usize> = (0..20).map(|i| i % cfg.vocab_size).collect();
         let mut toks = Vec::new();
         model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, |t| toks.push(t));
