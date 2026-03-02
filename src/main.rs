@@ -478,6 +478,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
             model.save_cache(&cache_path).expect("failed to save cache");
             eprintln!("[ Gemma3 ] Cache saved.");
         }
+        crate::transformer4::release_memory_to_os();
     }
 
     if args.quantize {

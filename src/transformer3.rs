@@ -1631,6 +1631,101 @@ fn parse_tensor_value_flags(name: String, value_json: String, data_section: &[u8
     Some(SafeTensor { name, shape, data, bf16_data })
 }
 
+/// Metadata for one tensor entry parsed from the safetensors header.
+pub struct SafeTensorEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// Parse only the safetensors header from a file, returning tensor metadata.
+/// Does NOT read any tensor data — callers seek+read per tensor.
+pub fn parse_safetensors_header(file: &mut std::fs::File) -> Result<(usize, Vec<SafeTensorEntry>), String> {
+    use std::io::Read;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf).map_err(|e| format!("safetensors: cannot read header length: {}", e))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let data_start = 8 + header_len;
+
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes).map_err(|e| format!("safetensors: cannot read header: {}", e))?;
+    let header_json = std::str::from_utf8(&header_bytes)
+        .map_err(|e| format!("safetensors: invalid header UTF-8: {}", e))?;
+
+    let mut entries = Vec::new();
+    for (name, value_json) in iter_top_level_pairs(header_json) {
+        if name == "__metadata__" { continue; }
+        let dtype = match extract_quoted_value(&value_json, "dtype") {
+            Some(d) => d,
+            None => continue,
+        };
+        let shape = match extract_int_array(&value_json, "shape") {
+            Some(s) => s.iter().map(|&v| v as usize).collect(),
+            None => continue,
+        };
+        let offsets = match extract_int_array(&value_json, "data_offsets") {
+            Some(o) if o.len() == 2 => o,
+            _ => continue,
+        };
+        entries.push(SafeTensorEntry {
+            name,
+            dtype,
+            shape,
+            byte_start: offsets[0] as usize,
+            byte_end: offsets[1] as usize,
+        });
+    }
+    Ok((data_start, entries))
+}
+
+/// Read a single tensor's data from a safetensors file at its data offset.
+/// Returns a SafeTensor with bf16_data for BF16 tensors (no f32 conversion).
+pub fn read_safetensor_from_file(
+    file: &mut std::fs::File,
+    data_start: usize,
+    entry: &SafeTensorEntry,
+) -> Result<SafeTensor, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let byte_len = entry.byte_end - entry.byte_start;
+    file.seek(SeekFrom::Start((data_start + entry.byte_start) as u64))
+        .map_err(|e| format!("safetensors: seek error for {}: {}", entry.name, e))?;
+
+    let mut raw = vec![0u8; byte_len];
+    file.read_exact(&mut raw)
+        .map_err(|e| format!("safetensors: read error for {}: {}", entry.name, e))?;
+
+    let (data, bf16_data) = match entry.dtype.as_str() {
+        "F32" => {
+            let f32s: Vec<f32> = raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            (f32s, None)
+        }
+        "BF16" => {
+            let bits: Vec<u16> = raw.chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            (Vec::new(), Some(bits))
+        }
+        "F16" => {
+            let f32s: Vec<f32> = raw.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                .collect();
+            (f32s, None)
+        }
+        other => return Err(format!("safetensors: unsupported dtype {} for {}", other, entry.name)),
+    };
+
+    Ok(SafeTensor {
+        name: entry.name.clone(),
+        shape: entry.shape.clone(),
+        data,
+        bf16_data,
+    })
+}
+
 /// Extract the string value of `"key":"value"` from a JSON object string.
 fn extract_quoted_value(json: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{}\":", key);

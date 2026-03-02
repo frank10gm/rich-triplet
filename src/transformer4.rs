@@ -654,19 +654,18 @@ impl Gemma3Model {
                 continue;
             }
 
-            // Parse shard and drop raw bytes before applying tensors.
-            // This avoids holding ~1-4 GB of file bytes simultaneously with
-            // the parsed tensor data (~1-2 GB), reducing peak RAM.
-            let tensors = {
-                let bytes =
-                    std::fs::read(&path).map_err(|e| format!("cannot read {:?}: {}", path, e))?;
-                let t = crate::transformer3::parse_safetensors_skip_bf16_f32(&bytes)
+            // Stream tensors one at a time from the file: read header, then
+            // seek+read each tensor individually. Only one tensor's data lives
+            // in memory at a time (~200 MB max), avoiding the ~4.6 GB full-file read.
+            let mut file = std::fs::File::open(&path)
+                .map_err(|e| format!("cannot open {:?}: {}", path, e))?;
+            let (data_start, tensor_entries) =
+                crate::transformer3::parse_safetensors_header(&mut file)
                     .map_err(|e| format!("parse error in {:?}: {}", path, e))?;
-                t
-                // `bytes` dropped here — parsed tensors own their data
-            };
 
-            for t in tensors {
+            for te in &tensor_entries {
+                let t = crate::transformer3::read_safetensor_from_file(&mut file, data_start, te)
+                    .map_err(|e| format!("read error in {:?}: {}", path, e))?;
                 loaded_tensors += 1;
                 if apply_tensor(self, t) {
                     matched += 1;
@@ -1451,84 +1450,75 @@ impl Gemma3Model {
     /// Load weights from a binary cache file (fast path).
     /// Returns false if the file doesn't exist or has wrong magic.
     pub fn load_cache(&mut self, path: &str) -> std::io::Result<bool> {
-        use std::io::Read;
-        let mut f = match std::fs::File::open(path) {
+        use std::io::{BufReader, Read};
+        let f = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[ Cache ] No cache file at {}: {}", path, e);
                 return Ok(false);
             }
         };
-        eprintln!("[ Cache ] Reading cache file {}...", path);
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        eprintln!("[ Cache ] Read {} MB", buf.len() / 1_048_576);
+        let file_len = f.metadata()?.len();
+        eprintln!("[ Cache ] Streaming cache file {} ({} MB)...", path, file_len / 1_048_576);
+        let mut r = BufReader::new(f);
 
-        if buf.len() < 12 || &buf[..8] != CACHE_MAGIC {
-            eprintln!("[ Cache ] Bad magic or too short, ignoring cache.");
+        let mut hdr = [0u8; 12];
+        r.read_exact(&mut hdr)?;
+        if &hdr[..8] != CACHE_MAGIC {
+            eprintln!("[ Cache ] Bad magic, ignoring cache.");
             return Ok(false);
         }
 
-        let n_records = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let n_records = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
         eprintln!("[ Cache ] Loading {} records...", n_records);
-        let mut pos = 12usize;
 
-        let read_u32 = |buf: &[u8], p: &mut usize| -> u32 {
-            let v = u32::from_le_bytes(buf[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            v
+        let mut u32_buf = [0u8; 4];
+        let mut read_u32 = |r: &mut BufReader<std::fs::File>| -> std::io::Result<u32> {
+            r.read_exact(&mut u32_buf)?;
+            Ok(u32::from_le_bytes(u32_buf))
         };
 
         for _ in 0..n_records {
-            let name_len = read_u32(&buf, &mut pos) as usize;
-            let name = std::str::from_utf8(&buf[pos..pos + name_len])
-                .unwrap()
-                .to_string();
-            pos += name_len;
-            let dtype = buf[pos];
-            pos += 1;
-            let rows = read_u32(&buf, &mut pos) as usize;
-            let cols = read_u32(&buf, &mut pos) as usize;
-            let n_elems = rows * cols;
-            let elem_bytes = if dtype == 0 { 4 } else { 2 };
-            let data_bytes = &buf[pos..pos + n_elems * elem_bytes];
-            pos += n_elems * elem_bytes;
+            let name_len = read_u32(&mut r)? as usize;
+            let mut name_bytes = vec![0u8; name_len];
+            r.read_exact(&mut name_bytes)?;
+            let name = String::from_utf8(name_bytes).unwrap();
 
-            // Synthesize a SafeTensor and reuse apply_tensor
-            let mut st = crate::transformer3::SafeTensor {
-                name: name,
-                shape: vec![rows, cols],
-                data: Vec::new(),
-                bf16_data: None,
-            };
-            if dtype == 0 {
-                // f32
+            let mut dtype_buf = [0u8; 1];
+            r.read_exact(&mut dtype_buf)?;
+            let dtype = dtype_buf[0];
+
+            let rows = read_u32(&mut r)? as usize;
+            let cols = read_u32(&mut r)? as usize;
+            let n_elems = rows * cols;
+
+            let st = if dtype == 0 {
+                // f32: read directly into Vec<f32>
                 let mut f32s = vec![0.0f32; n_elems];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data_bytes.as_ptr(),
-                        f32s.as_mut_ptr() as *mut u8,
-                        data_bytes.len(),
-                    );
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(f32s.as_mut_ptr() as *mut u8, n_elems * 4)
+                };
+                r.read_exact(byte_slice)?;
+                crate::transformer3::SafeTensor {
+                    name,
+                    shape: vec![rows, cols],
+                    data: f32s,
+                    bf16_data: None,
                 }
-                st.data = f32s;
             } else {
-                // bf16
+                // bf16: read directly into Vec<u16>, skip f32 conversion
                 let mut u16s = vec![0u16; n_elems];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data_bytes.as_ptr(),
-                        u16s.as_mut_ptr() as *mut u8,
-                        data_bytes.len(),
-                    );
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(u16s.as_mut_ptr() as *mut u8, n_elems * 2)
+                };
+                r.read_exact(byte_slice)?;
+                crate::transformer3::SafeTensor {
+                    name,
+                    shape: vec![rows, cols],
+                    data: Vec::new(),
+                    bf16_data: Some(u16s),
                 }
-                // Also fill f32 data for the f32 fallback path
-                st.data = u16s
-                    .iter()
-                    .map(|&b| crate::autograd2::MatBf16::bf16_to_f32(b))
-                    .collect();
-                st.bf16_data = Some(u16s);
-            }
+            };
             apply_tensor(self, st);
         }
         Ok(true)
