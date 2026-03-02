@@ -804,6 +804,7 @@ kernel void gemv_bf16_t(
             // Free embed + lm_head CPU data now that Metal buffers hold copies
             model.embed_bf16 = None;
             model.lm_head.clear_weight_data();
+            crate::transformer4::release_memory_to_os();
 
             // Final norm gamma
             let final_norm_gamma = upload_f32(&device, &model.norm.gamma.data().data);

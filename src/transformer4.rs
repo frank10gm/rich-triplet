@@ -1088,8 +1088,27 @@ fn f32s_to_bf16_and_drop(f32s: Vec<f32>) -> Vec<u16> {
         let f = unsafe { std::ptr::read(raw.as_ptr().add(i)) };
         unsafe { std::ptr::write(ptr.add(i), MatBf16::f32_to_bf16(f)) };
     }
-    unsafe { Vec::from_raw_parts(ptr, n, cap_u16) }
+    let mut v = unsafe { Vec::from_raw_parts(ptr, n, cap_u16) };
+    v.shrink_to_fit(); // Release the unused 50% of capacity (was 2× needed)
+    v
 }
+
+/// Hint macOS to release cached free pages back to the OS.
+/// Call after large drops (e.g. after GGUF load, after Metal weight upload).
+#[cfg(target_os = "macos")]
+pub fn release_memory_to_os() {
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_default_zone() -> *mut std::ffi::c_void;
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        let zone = malloc_default_zone();
+        malloc_zone_pressure_relief(zone, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn release_memory_to_os() {}
 
 fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, hidden: usize) {
     use crate::autograd2::MatBf16;

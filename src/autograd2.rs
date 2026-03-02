@@ -1292,8 +1292,7 @@ impl Q4KMat {
 
     /// BLAS-accelerated matmul: `a [M, K] @ self^T [N, K] → [M, N]`.
     ///
-    /// Decode path (M ≤ 4): chunked SGEMM (target ~8 MB scratch).
-    /// Prefill path (M > 4): full dequant + single SGEMM.
+    /// Chunked SGEMM with ~8 MB scratch (prefill and decode).
     #[cfg(feature = "blas")]
     pub fn matmul_q4k_t_blas(&self, a: &Mat) -> Mat {
         let (m, k, n) = (a.rows, a.cols, self.rows);
@@ -1304,17 +1303,7 @@ impl Q4KMat {
             return self.gemv_mt(a);
         }
 
-        // Prefill: full dequant → single sgemm.
-        if m > 4 {
-            let mut w_f32 = vec![0.0f32; n * k];
-            for j in 0..n {
-                self.dequantize_row_into(j, &mut w_f32[j * k..(j + 1) * k]);
-            }
-            let w = Mat { data: w_f32, rows: n, cols: k };
-            return a.matmul_bt(&w);
-        }
-
-        // Decode: parallel chunked SGEMM.
+        // Chunked SGEMM for both prefill and decode.
         //
         // Split output neurons across threads, each with its own scratch buffer.
         // Each thread dequants + sgemms its range independently.

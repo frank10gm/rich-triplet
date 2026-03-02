@@ -461,6 +461,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         model
             .load_weights_from_gguf(weights_path)
             .expect("failed to load GGUF weights");
+        crate::transformer4::release_memory_to_os();
     } else {
         // --- Safetensors path: try cache first, then load + save cache ---
         let cache_path = format!("{}/gemma3-{}.cache", weights_dir, model_name);
