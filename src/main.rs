@@ -124,6 +124,8 @@ struct CliArgs {
     quantize: bool,
     /// --debug : enable per-step diagnostic logging (h_rms, logit gaps, top-5 tokens)
     debug: bool,
+    /// --draft-len N : max speculative draft tokens per step (default 4, 0 = disabled)
+    draft_len: usize,
 }
 
 impl CliArgs {
@@ -149,6 +151,7 @@ impl CliArgs {
             benchmark: false,
             quantize: false,
             debug: false,
+            draft_len: 4,
         };
         let mut i = 0;
         while i < args.len() {
@@ -266,6 +269,12 @@ impl CliArgs {
                 }
                 "--debug" => {
                     a.debug = true;
+                }
+                "--draft-len" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.draft_len = args[i].parse().unwrap_or(4);
+                    }
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -524,6 +533,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         args.rep_penalty,
         args.seed,
         args.debug,
+        args.draft_len,
         |tok_id| {
             let text = tok.decode(&[tok_id as u32]);
             print!("{}", text);

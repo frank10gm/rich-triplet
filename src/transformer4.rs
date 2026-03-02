@@ -1796,12 +1796,10 @@ pub struct Gemma3KvCache {
 }
 
 impl Gemma3KvCache {
-    pub fn new(config: &Config4) -> Self {
+    pub fn new(config: &Config4, max_tokens: usize) -> Self {
         let nkv = config.num_key_value_heads;
         let d = config.head_dim;
-        // Cap at 2048 tokens for typical generation — the full 32768 would
-        // pre-allocate ~7 GB for Gemma3-4b before any token is processed.
-        let max = config.max_position_embeddings.min(2048);
+        let max = max_tokens.min(config.max_position_embeddings);
         let layers = (0..config.num_hidden_layers)
             .map(|_| RefCell::new(Gemma3LayerKvCache::new(nkv, d, max)))
             .collect();
@@ -1928,6 +1926,54 @@ impl Gemma3Model {
     }
 }
 
+/// N-gram draft engine for speculative decoding.
+///
+/// Searches the token generation history for the longest n-gram that matches
+/// the most recent tokens, then returns the continuation as draft tokens.
+struct NgramDraftEngine {
+    history: Vec<usize>,
+    max_n: usize,
+    max_draft: usize,
+}
+
+impl NgramDraftEngine {
+    fn new(max_n: usize, max_draft: usize) -> Self {
+        NgramDraftEngine { history: Vec::new(), max_n, max_draft }
+    }
+
+    fn record(&mut self, token: usize) {
+        self.history.push(token);
+    }
+
+    fn record_many(&mut self, tokens: &[usize]) {
+        self.history.extend_from_slice(tokens);
+    }
+
+    /// Search history for the longest n-gram match of the last N tokens.
+    /// Returns the continuation (up to max_draft tokens).
+    fn draft(&self) -> Vec<usize> {
+        let len = self.history.len();
+        if len < 2 { return Vec::new(); }
+
+        // Try decreasing n-gram lengths: max_n, max_n-1, ..., 2
+        for n in (2..=self.max_n.min(len)).rev() {
+            let suffix = &self.history[len - n..];
+            // Search history for this n-gram (excluding the last occurrence)
+            for start in 0..len - n {
+                if self.history[start..start + n] == *suffix {
+                    // Found a match — return continuation tokens
+                    let cont_start = start + n;
+                    let cont_end = (cont_start + self.max_draft).min(len);
+                    if cont_start < cont_end {
+                        return self.history[cont_start..cont_end].to_vec();
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+}
+
 impl Gemma3Model {
     /// Generate `max_new` tokens using a KV cache.
     ///
@@ -1949,6 +1995,7 @@ impl Gemma3Model {
         repetition_penalty: f32,
         seed: u64,
         debug: bool,
+        draft_len: usize,
         mut callback: impl FnMut(usize),
     ) {
         use crate::transformer3::SamplingParams;
@@ -1964,10 +2011,23 @@ impl Gemma3Model {
             presence_penalty: 0.0,
         };
 
+        let mut ngram = NgramDraftEngine::new(4, draft_len);
+        // Seed the n-gram history with prompt tokens so early-generation
+        // n-gram matches against the prompt are possible.
+        ngram.record_many(token_ids);
+
         // Gemma 3 uses two EOS token ids: 1 (<eos>) and 106 (<end_of_turn>).
         let is_eos = |tok: usize| tok == 1 || tok == 106;
 
-        let mut cache = Gemma3KvCache::new(&self.config);
+        // When Metal is active, the CPU KV cache is only used for prefill
+        // and then freed — so size it to just the prompt.  Without Metal,
+        // the CPU cache serves the full generation.
+        let cache_cap = if cfg!(feature = "metal") {
+            token_ids.len()
+        } else {
+            token_ids.len() + max_new
+        };
+        let mut cache = Gemma3KvCache::new(&self.config, cache_cap);
         let h = self.config.hidden_size;
         let scale = (h as f32).sqrt();
         let mut rng = LcgRng::new(seed);
@@ -2043,6 +2103,7 @@ impl Gemma3Model {
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
         callback(first);
         seen.push(first);
+        ngram.record(first);
         if is_eos(first) {
             eprintln!("[ Gemma3 ] EOS after first token — generation complete.");
             return;
@@ -2096,99 +2157,207 @@ impl Gemma3Model {
         let mut t_metal_us = 0u128;
         let mut profile_printed = false;
 
-        for step in 1..max_new {
+        // Speculative decoding stats
+        let mut spec_attempts = 0u64;
+        let mut spec_accepted = 0u64;
+        let mut spec_drafted = 0u64;
+
+        let mut step = 1usize;
+        let mut hit_eos = false;
+
+        while step < max_new && !hit_eos {
+            // Try speculative decoding if draft_len > 0 and Metal is active
             #[cfg(feature = "metal")]
-            let logits_data = if use_metal {
-                let t_m = std::time::Instant::now();
-                let logits_vec = metal_ctx.decode_step(prev, metal_seq_len);
-                t_metal_us += t_m.elapsed().as_micros();
-                metal_seq_len += 1;
-                let n = logits_vec.len();
-                Mat::new(logits_vec, 1, n)
+            let did_speculate = if use_metal && draft_len > 0 {
+                let draft = ngram.draft();
+                if !draft.is_empty() {
+                    let k = draft.len().min(max_new - step);
+                    // Build verify batch: [prev] + draft[0..k-1]
+                    // verify_tokens[i] → logits[i] predicts the token after verify_tokens[i]
+                    let mut verify_tokens = Vec::with_capacity(k + 1);
+                    verify_tokens.push(prev);
+                    for i in 0..k.saturating_sub(1) {
+                        verify_tokens.push(draft[i]);
+                    }
+                    let m = verify_tokens.len(); // = k (prev + k-1 drafts)
+
+                    let t_m = std::time::Instant::now();
+                    let all_logits = metal_ctx.decode_step_batch(
+                        &verify_tokens, metal_seq_len,
+                    );
+                    t_metal_us += t_m.elapsed().as_micros();
+
+                    let vocab = metal_ctx.lm_head_vocab;
+                    spec_attempts += 1;
+                    spec_drafted += k as u64;
+
+                    let mut accepted = 0usize;
+                    for i in 0..k {
+                        // Build a Mat view for logits row i
+                        let row_start = i * vocab;
+                        let row_data = all_logits[row_start..row_start + vocab].to_vec();
+                        let logits_mat = Mat::new(row_data, 1, vocab);
+                        let sampled = sample_token(&logits_mat, 0, &params, &seen, &mut rng);
+
+                        if i < k && sampled == draft[i] {
+                            // Draft token accepted
+                            callback(sampled);
+                            seen.push(sampled);
+                            ngram.record(sampled);
+                            prev = sampled;
+                            accepted += 1;
+                        } else {
+                            // Diverged — emit the sampled token as bonus
+                            callback(sampled);
+                            seen.push(sampled);
+                            ngram.record(sampled);
+                            prev = sampled;
+                            accepted += 1;
+                            break;
+                        }
+                    }
+
+                    // If all K drafts were accepted, we get a bonus token from
+                    // the last logits row (which corresponds to draft[k-1]).
+                    if accepted == k && m == k {
+                        // The last row logits predict the token after draft[k-1],
+                        // but we only have m=k rows, so the last row is index k-1.
+                        // Actually verify_tokens has k entries, producing k logit rows.
+                        // Row k-1 predicts the token after verify_tokens[k-1] = draft[k-2].
+                        // We already accepted draft[k-1] from row k-1... wait.
+                        // Let me re-check: verify_tokens = [prev, draft[0], ..., draft[k-2]]
+                        // Logits row 0 → predicts after prev → should be draft[0]
+                        // Logits row 1 → predicts after draft[0] → should be draft[1]
+                        // ...
+                        // Logits row k-1 → predicts after draft[k-2] → should be draft[k-1]
+                        // So if all k drafts matched, row k-1 verified draft[k-1].
+                        // We don't have logits for "after draft[k-1]" since verify_tokens
+                        // only had k entries. No bonus token possible.
+                    }
+
+                    spec_accepted += accepted as u64;
+                    n_decoded += accepted;
+                    metal_seq_len += accepted;
+                    step += accepted;
+
+                    if is_eos(prev) { hit_eos = true; }
+
+                    if !profile_printed {
+                        profile_printed = true;
+                        eprintln!(
+                            "[ Gemma3 ] Step-1 (Metal speculative, {}→{} accepted): {:.1}ms",
+                            k, accepted, t_metal_us as f64 / 1000.0,
+                        );
+                    }
+
+                    true  // did_speculate
+                } else {
+                    false
+                }
             } else {
-                unreachable!()
+                false
             };
 
             #[cfg(not(feature = "metal"))]
-            let logits_data = {
-                let t0 = std::time::Instant::now();
-                let embed_vec: Vec<f32> = if let Some(ref bf16) = self.embed_bf16 {
-                    use crate::autograd2::MatBf16;
-                    (0..h)
-                        .map(|c| MatBf16::bf16_to_f32(bf16.data[prev * h + c]) * scale)
-                        .collect()
+            let did_speculate = false;
+
+            if hit_eos { break; }
+
+            if !did_speculate {
+                // Normal single-token decode
+                #[cfg(feature = "metal")]
+                let logits_data = if use_metal {
+                    let t_m = std::time::Instant::now();
+                    let logits_vec = metal_ctx.decode_step(prev, metal_seq_len);
+                    t_metal_us += t_m.elapsed().as_micros();
+                    metal_seq_len += 1;
+                    let n = logits_vec.len();
+                    Mat::new(logits_vec, 1, n)
                 } else {
-                    let te = self.embed_tokens.data();
-                    (0..h).map(|c| te.at(prev, c) * scale).collect()
+                    unreachable!()
                 };
-                let x_data = Mat {
-                    data: embed_vec,
-                    rows: 1,
-                    cols: h,
+
+                #[cfg(not(feature = "metal"))]
+                let logits_data = {
+                    let t0 = std::time::Instant::now();
+                    let embed_vec: Vec<f32> = if let Some(ref bf16) = self.embed_bf16 {
+                        use crate::autograd2::MatBf16;
+                        (0..h)
+                            .map(|c| MatBf16::bf16_to_f32(bf16.data[prev * h + c]) * scale)
+                            .collect()
+                    } else {
+                        let te = self.embed_tokens.data();
+                        (0..h).map(|c| te.at(prev, c) * scale).collect()
+                    };
+                    let x_data = Mat {
+                        data: embed_vec,
+                        rows: 1,
+                        cols: h,
+                    };
+                    let mut x = TensorNode::leaf(x_data);
+                    t_embed_us += t0.elapsed().as_micros();
+
+                    let t1 = std::time::Instant::now();
+                    for (i, layer) in self.layers.iter().enumerate() {
+                        x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+                    }
+                    t_layers_us += t1.elapsed().as_micros();
+
+                    let t2 = std::time::Instant::now();
+                    let normed_x = self.norm.forward_gemma3(&x);
+                    let logits_node = self.lm_head.forward(&normed_x);
+                    t_lmhead_us += t2.elapsed().as_micros();
+
+                    if debug {
+                        let xd = x.data();
+                        let xv = &xd.data;
+                        let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
+                        let nx = normed_x.data();
+                        let nxv = &nx.data;
+                        let nx_norm = (nxv.iter().map(|v| v * v).sum::<f32>() / nxv.len() as f32).sqrt();
+
+                        let ld = logits_node.data();
+                        let lv = &ld.data;
+                        let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
+                        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
+                        let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
+                        eprintln!(
+                            "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
+                            step, prev, x_norm, nx_norm, l_max, gap, top5
+                        );
+                    }
+                    logits_node.data().clone()
                 };
-                let mut x = TensorNode::leaf(x_data);
-                t_embed_us += t0.elapsed().as_micros();
 
-                let t1 = std::time::Instant::now();
-                for (i, layer) in self.layers.iter().enumerate() {
-                    x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
+                prev = sample_token(&logits_data, 0, &params, &seen, &mut rng);
+                callback(prev);
+                seen.push(prev);
+                ngram.record(prev);
+                n_decoded += 1;
+                step += 1;
+
+                if !profile_printed {
+                    profile_printed = true;
+                    if use_metal {
+                        eprintln!(
+                            "[ Gemma3 ] Step-1 (Metal graph): {:.1}ms",
+                            t_metal_us as f64 / 1000.0,
+                        );
+                    } else {
+                        eprintln!(
+                            "[ Gemma3 ] Step-1 breakdown: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
+                            t_embed_us as f64 / 1000.0,
+                            t_layers_us as f64 / 1000.0,
+                            t_lmhead_us as f64 / 1000.0,
+                        );
+                    }
                 }
-                t_layers_us += t1.elapsed().as_micros();
 
-                let t2 = std::time::Instant::now();
-                let normed_x = self.norm.forward_gemma3(&x);
-                let logits_node = self.lm_head.forward(&normed_x);
-                t_lmhead_us += t2.elapsed().as_micros();
-
-                if debug {
-                    let xd = x.data();
-                    let xv = &xd.data;
-                    let x_norm = (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt();
-                    let nx = normed_x.data();
-                    let nxv = &nx.data;
-                    let nx_norm = (nxv.iter().map(|v| v * v).sum::<f32>() / nxv.len() as f32).sqrt();
-
-                    let ld = logits_node.data();
-                    let lv = &ld.data;
-                    let l_max = lv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut indexed: Vec<(usize, f32)> = lv.iter().cloned().enumerate().collect();
-                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                    let gap = if indexed.len() >= 2 { indexed[0].1 - indexed[1].1 } else { 0.0 };
-                    eprintln!(
-                        "[ Gemma3-dbg ] step={} prev_tok={}  h_rms={:.2}  hn_rms={:.2}  logit_max={:.2}  gap={:.2}  top-5: {:?}",
-                        step, prev, x_norm, nx_norm, l_max, gap, top5
-                    );
+                if is_eos(prev) {
+                    break;
                 }
-                logits_node.data().clone()
-            };
-
-            prev = sample_token(&logits_data, 0, &params, &seen, &mut rng);
-            callback(prev);
-            seen.push(prev);
-            n_decoded += 1;
-
-            // After the first decode step, print a breakdown so the user can
-            // see where time is actually being spent.
-            if step == 1 && !profile_printed {
-                profile_printed = true;
-                if use_metal {
-                    eprintln!(
-                        "[ Gemma3 ] Step-1 (Metal graph): {:.1}ms",
-                        t_metal_us as f64 / 1000.0,
-                    );
-                } else {
-                    eprintln!(
-                        "[ Gemma3 ] Step-1 breakdown: embed={:.1}ms  layers={:.1}ms  lm_head={:.1}ms",
-                        t_embed_us as f64 / 1000.0,
-                        t_layers_us as f64 / 1000.0,
-                        t_lmhead_us as f64 / 1000.0,
-                    );
-                }
-            }
-
-            if is_eos(prev) {
-                break;
             }
         }
 
@@ -2215,6 +2384,13 @@ impl Gemma3Model {
                     t_lmhead_us as f64 / (n_decoded as f64 * 1000.0),
                 );
             }
+        }
+        if spec_attempts > 0 {
+            let accept_rate = spec_accepted as f64 / spec_drafted as f64;
+            eprintln!(
+                "[ Gemma3 ] Speculative: {} attempts, {}/{} accepted ({:.0}%)",
+                spec_attempts, spec_accepted, spec_drafted, accept_rate * 100.0,
+            );
         }
     }
 }
@@ -3112,7 +3288,7 @@ mod tests {
     #[test]
     fn test_gemma3_kv_cache_new_and_clear() {
         let cfg = tiny_cfg();
-        let cache = Gemma3KvCache::new(&cfg);
+        let cache = Gemma3KvCache::new(&cfg, 2048);
         assert_eq!(cache.layers.len(), cfg.num_hidden_layers);
         cache.layers[0].borrow_mut().seq_len = 42;
         cache.clear();
@@ -3148,7 +3324,7 @@ mod tests {
         let mut rng = InitRng::new(7);
         let mut model = Gemma3Model::new(cfg, &mut rng);
         let mut generated = Vec::new();
-        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, false, |tok| {
+        model.generate_cached_streaming(&[0usize, 1, 2], 5, 1.0, 0, 1.0, 1.0, 42, false, 0, |tok| {
             generated.push(tok);
         });
         assert!(!generated.is_empty());
@@ -3175,7 +3351,7 @@ mod tests {
 
         // Cached: greedy (temperature=0)
         let mut cached_tok = usize::MAX;
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, |tok| {
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, 0, |tok| {
             cached_tok = tok;
         });
 
@@ -3195,8 +3371,44 @@ mod tests {
         let mut model = Gemma3Model::new(cfg.clone(), &mut rng);
         let prompt: Vec<usize> = (0..20).map(|i| i % cfg.vocab_size).collect();
         let mut toks = Vec::new();
-        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, |t| toks.push(t));
+        model.generate_cached_streaming(&prompt, 1, 0.0, 0, 1.0, 1.0, 0, false, 0, |t| toks.push(t));
         assert_eq!(toks.len(), 1);
         assert!(toks[0] < cfg.vocab_size);
+    }
+
+    #[test]
+    fn test_ngram_draft_engine() {
+        let mut ng = super::NgramDraftEngine::new(4, 4);
+        // Empty history: no draft
+        assert!(ng.draft().is_empty());
+
+        // Record: A B C D A B C D E F
+        for &t in &[10, 20, 30, 40, 10, 20, 30, 40, 50, 60] {
+            ng.record(t);
+        }
+        // History ends with [...40, 50, 60]. The bigram (50, 60) doesn't repeat.
+        // But (30, 40) appears at indices 2..4 and 6..8.
+        // Current suffix of length 4 = [30, 40, 50, 60] — no match.
+        // Suffix of length 3 = [40, 50, 60] — no match.
+        // Suffix of length 2 = [50, 60] — no match.
+        assert!(ng.draft().is_empty());
+
+        // Now record: 10. History ends with [50, 60, 10].
+        // Suffix of length 2 = [60, 10] — no match.
+        ng.record(10);
+        // But suffix [10] is too short (min n=2).
+        // Check: suffix len 3 = [50, 60, 10] — no match.
+        // suffix len 2 = [60, 10] — no match.
+        assert!(ng.draft().is_empty());
+
+        // Record 20. History ends with [...60, 10, 20].
+        ng.record(20);
+        // Suffix of len 2 = [10, 20] — matches at index 0 and 4.
+        // Continuation from index 0+2=2: [30, 40, 10, 20] (up to 4 tokens).
+        // Wait, history[2..6] = [30, 40, 10, 20].
+        // Suffix of len 3 = [60, 10, 20] — no match (60 first appears at index 9).
+        // Suffix of len 2 = [10, 20] — matches at index 0: continuation = history[2..6] = [30, 40, 10, 20].
+        let draft = ng.draft();
+        assert_eq!(draft, vec![30, 40, 10, 20]);
     }
 }
