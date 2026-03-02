@@ -617,15 +617,21 @@ kernel void gemv_bf16_t(
         }
     }
 
-    fn compile_pipeline(
+    fn compile_library(
         device: &ProtocolObject<dyn MTLDevice>,
         source: &str,
+    ) -> Retained<ProtocolObject<dyn MTLLibrary>> {
+        let src = NSString::from_str(source);
+        device
+            .newLibraryWithSource_options_error(&src, None)
+            .expect("Metal: failed to compile MSL library")
+    }
+
+    fn pipeline_from_library(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
         func_name: &str,
     ) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
-        let src = NSString::from_str(source);
-        let library = device
-            .newLibraryWithSource_options_error(&src, None)
-            .expect(&format!("Metal: failed to compile MSL for {}", func_name));
         let name = NSString::from_str(func_name);
         let func = library
             .newFunctionWithName(&name)
@@ -633,6 +639,16 @@ kernel void gemv_bf16_t(
         device
             .newComputePipelineStateWithFunction_error(&func)
             .expect(&format!("Metal: pipeline creation failed for {}", func_name))
+    }
+
+    /// Convenience wrapper: compile source + extract one pipeline (used by tests).
+    fn compile_pipeline(
+        device: &ProtocolObject<dyn MTLDevice>,
+        source: &str,
+        func_name: &str,
+    ) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
+        let lib = compile_library(device, source);
+        pipeline_from_library(device, &lib, func_name)
     }
 
     // =========================================================================
@@ -643,9 +659,9 @@ kernel void gemv_bf16_t(
         /// Create a new Metal decode context by uploading all model weights
         /// and allocating activation buffers.
         ///
-        /// Call after model weights are loaded.  The `model` is borrowed
-        /// read-only; its weight data is copied into persistent Metal buffers.
-        pub fn new(model: &Gemma3Model) -> Self {
+        /// Call after model weights are loaded.  CPU-side weight data is freed
+        /// layer-by-layer during upload to avoid doubling peak memory.
+        pub fn new(model: &mut Gemma3Model) -> Self {
             let t_start = std::time::Instant::now();
             let cfg = &model.config;
             let device = MTLCreateSystemDefaultDevice()
@@ -654,22 +670,26 @@ kernel void gemv_bf16_t(
                 .newCommandQueue()
                 .expect("Metal: command queue creation failed");
 
-            // Compile all pipelines from the combined MSL source
-            let pipe_rms_norm = compile_pipeline(&device, DECODE_MSL, "rms_norm_gemma3");
-            let pipe_rms_norm_per_head = compile_pipeline(&device, DECODE_MSL, "rms_norm_per_head");
-            let pipe_rope_neox = compile_pipeline(&device, DECODE_MSL, "rope_neox");
-            let pipe_gelu_tanh = compile_pipeline(&device, DECODE_MSL, "gelu_tanh_kernel");
-            let pipe_elem_mul = compile_pipeline(&device, DECODE_MSL, "elem_mul_kernel");
-            let pipe_vec_add = compile_pipeline(&device, DECODE_MSL, "vec_add_kernel");
-            let pipe_attention_decode = compile_pipeline(&device, DECODE_MSL, "attention_decode");
-            let pipe_kv_append = compile_pipeline(&device, DECODE_MSL, "kv_cache_append");
-            let pipe_embed_bf16 = compile_pipeline(&device, DECODE_MSL, "embed_bf16_lookup");
-            let pipe_gemv_q4k = compile_pipeline(&device, DECODE_MSL, "gemv_q4k_t");
-            let pipe_gemv_bf16 = compile_pipeline(&device, DECODE_MSL, "gemv_bf16_t");
+            // Compile MSL source once, then extract all 11 pipelines from it
+            let t_msl = std::time::Instant::now();
+            let library = compile_library(&device, DECODE_MSL);
+            let pipe_rms_norm = pipeline_from_library(&device, &library, "rms_norm_gemma3");
+            let pipe_rms_norm_per_head = pipeline_from_library(&device, &library, "rms_norm_per_head");
+            let pipe_rope_neox = pipeline_from_library(&device, &library, "rope_neox");
+            let pipe_gelu_tanh = pipeline_from_library(&device, &library, "gelu_tanh_kernel");
+            let pipe_elem_mul = pipeline_from_library(&device, &library, "elem_mul_kernel");
+            let pipe_vec_add = pipeline_from_library(&device, &library, "vec_add_kernel");
+            let pipe_attention_decode = pipeline_from_library(&device, &library, "attention_decode");
+            let pipe_kv_append = pipeline_from_library(&device, &library, "kv_cache_append");
+            let pipe_embed_bf16 = pipeline_from_library(&device, &library, "embed_bf16_lookup");
+            let pipe_gemv_q4k = pipeline_from_library(&device, &library, "gemv_q4k_t");
+            let pipe_gemv_bf16 = pipeline_from_library(&device, &library, "gemv_bf16_t");
+            eprintln!("[ Metal ]   MSL compile + pipelines: {} ms", t_msl.elapsed().as_millis());
 
-            // Upload per-layer weights
+            let t_upload = std::time::Instant::now();
             let mut layer_weights = Vec::with_capacity(cfg.num_hidden_layers);
-            for (_i, layer) in model.layers.iter().enumerate() {
+            let mut total_upload_bytes: usize = 0;
+            for layer in model.layers.iter_mut() {
                 let attn = &layer.self_attn;
                 let mlp = &layer.mlp;
 
@@ -681,14 +701,26 @@ kernel void gemv_bf16_t(
                 let (gate_proj, gate_is_bf16) = upload_linear_detect_type(&device, &mlp.gate_proj);
                 let (up_proj, up_is_bf16) = upload_linear_detect_type(&device, &mlp.up_proj);
                 let (down_proj, down_is_bf16) = upload_linear_detect_type(&device, &mlp.down_proj);
+                total_upload_bytes += q_proj.length() + k_proj.length() + v_proj.length()
+                    + o_proj.length() + gate_proj.length() + up_proj.length() + down_proj.length();
 
-                // Upload norm gamma vectors
+                // Free CPU weight data now that it's in Metal buffers.
+                // This prevents doubling peak memory (~4 GB saved).
+                layer.self_attn.q_proj.clear_weight_data();
+                layer.self_attn.k_proj.clear_weight_data();
+                layer.self_attn.v_proj.clear_weight_data();
+                layer.self_attn.o_proj.clear_weight_data();
+                layer.mlp.gate_proj.clear_weight_data();
+                layer.mlp.up_proj.clear_weight_data();
+                layer.mlp.down_proj.clear_weight_data();
+
+                // Upload norm gamma vectors (tiny, no need to clear)
                 let input_ln_g = upload_f32(&device, &layer.input_layernorm.gamma.data().data);
                 let post_attn_ln_g = upload_f32(&device, &layer.post_attention_layernorm.gamma.data().data);
                 let pre_ffn_ln_g = upload_f32(&device, &layer.pre_feedforward_layernorm.gamma.data().data);
                 let post_ffn_ln_g = upload_f32(&device, &layer.post_feedforward_layernorm.gamma.data().data);
-                let q_norm_g = upload_f32(&device, &attn.q_norm.gamma.data().data);
-                let k_norm_g = upload_f32(&device, &attn.k_norm.gamma.data().data);
+                let q_norm_g = upload_f32(&device, &layer.self_attn.q_norm.gamma.data().data);
+                let k_norm_g = upload_f32(&device, &layer.self_attn.k_norm.gamma.data().data);
 
                 layer_weights.push(LayerWeightBuffers {
                     q_proj,
@@ -711,38 +743,39 @@ kernel void gemv_bf16_t(
                     post_ffn_layernorm_gamma: post_ffn_ln_g,
                     q_norm_gamma: q_norm_g,
                     k_norm_gamma: k_norm_g,
-                    rope_theta: attn.rope_theta,
-                    rope_freq_scale: attn.rope_freq_scale,
-                    sliding_window: attn.sliding_window,
+                    rope_theta: layer.self_attn.rope_theta,
+                    rope_freq_scale: layer.self_attn.rope_freq_scale,
+                    sliding_window: layer.self_attn.sliding_window,
                 });
             }
 
+            let layers_ms = t_upload.elapsed().as_millis();
+
             // Upload embedding table (BF16)
+            let t_embed = std::time::Instant::now();
             let embed_buf = if let Some(ref bf16) = model.embed_bf16 {
                 upload_u16(&device, &bf16.data)
             } else {
                 // Fallback: upload f32 embed as-is (shouldn't happen in practice)
                 upload_f32(&device, &model.embed_tokens.data().data)
             };
+            let embed_bytes = embed_buf.length();
+            eprintln!(
+                "[ Metal ]   layer weights: {} ms ({:.1} MB), embed: {} ms ({:.1} MB)",
+                layers_ms, total_upload_bytes as f64 / 1e6,
+                t_embed.elapsed().as_millis(), embed_bytes as f64 / 1e6,
+            );
 
             // lm_head: weight-tied to embed_tokens in Gemma3
-            // The lm_head Linear2 should have a bf16_weight that points to the
-            // same data as embed_bf16.  Upload it (or reuse embed_buf).
-            // Track the actual row count — may differ from config.vocab_size
-            // when GGUF embed table is smaller (e.g. 262144 vs 262208).
-            //
-            // When q4k-lm-head feature is enabled, re-quantize BF16 → Q4K for
-            // ~3.5x less memory bandwidth and faster GEMV.
             let (lm_head_buf, lm_head_vocab, lm_head_is_bf16) = if let Some(ref bf16) = model.lm_head.bf16_weight {
                 let rows = bf16.rows;
                 #[cfg(feature = "q4k-lm-head")]
                 {
                     let t_q = std::time::Instant::now();
-                    let f32_mat = bf16.to_f32();
-                    let q4k = crate::autograd2::Q4KMat::quantize(&f32_mat);
+                    let q4k = crate::autograd2::Q4KMat::quantize_from_bf16(bf16);
                     let buf = upload_bytes(&device, &q4k.blocks);
                     eprintln!(
-                        "[ Metal ] lm_head re-quantized BF16→Q4K in {:.0} ms ({} rows × {} cols, {:.1} MB → {:.1} MB)",
+                        "[ Metal ]   lm_head re-quantized BF16→Q4K: {} ms ({} rows × {} cols, {:.1} MB → {:.1} MB)",
                         t_q.elapsed().as_millis(), rows, bf16.cols,
                         (bf16.data.len() * 2) as f64 / 1e6,
                         q4k.blocks.len() as f64 / 1e6,
@@ -767,6 +800,10 @@ kernel void gemv_bf16_t(
                 let w = model.lm_head.weight.data();
                 (upload_f32(&device, &w.data), w.rows, true)
             };
+
+            // Free embed + lm_head CPU data now that Metal buffers hold copies
+            model.embed_bf16 = None;
+            model.lm_head.clear_weight_data();
 
             // Final norm gamma
             let final_norm_gamma = upload_f32(&device, &model.norm.gamma.data().data);

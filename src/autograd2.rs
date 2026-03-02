@@ -1009,98 +1009,146 @@ impl Q4KMat {
         let total_blocks = rows * n_blocks_per_row;
         let mut blocks = vec![0u8; total_blocks * 144];
 
-        for row in 0..rows {
-            let row_data = &mat.data[row * cols..(row + 1) * cols];
-            for b in 0..n_blocks_per_row {
-                let block_data = &row_data[b * 256..(b + 1) * 256];
-                let boff = (row * n_blocks_per_row + b) * 144;
+        let n_threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4);
+        let rows_per_thread = rows.div_ceil(n_threads);
 
-                // Step 1: compute per-sub-block scale and min (8 sub-blocks of 32 elements)
-                // Dequant formula: value = d * sv * nibble - dmin * mv
-                // When min >= 0, Q4K can't represent positive offsets, so we use
-                // min = 0 and scale = max / 15 (covering [0, max]).
-                let mut sub_scales = [0.0f32; 8];
-                let mut sub_mins = [0.0f32; 8];
-                for sb in 0..8 {
-                    let sub = &block_data[sb * 32..(sb + 1) * 32];
-                    let mut smin = f32::INFINITY;
-                    let mut smax = f32::NEG_INFINITY;
-                    for &v in sub {
-                        if v < smin { smin = v; }
-                        if v > smax { smax = v; }
+        std::thread::scope(|s| {
+            for (chunk_idx, block_chunk) in blocks.chunks_mut(rows_per_thread * n_blocks_per_row * 144).enumerate() {
+                let row_start = chunk_idx * rows_per_thread;
+                let row_end = (row_start + rows_per_thread).min(rows);
+                let mat_data = &mat.data;
+                s.spawn(move || {
+                    for row in row_start..row_end {
+                        let row_data = &mat_data[row * cols..(row + 1) * cols];
+                        for b in 0..n_blocks_per_row {
+                            let block_data = &row_data[b * 256..(b + 1) * 256];
+                            let boff = ((row - row_start) * n_blocks_per_row + b) * 144;
+
+                            Self::quantize_block(block_data, &mut block_chunk[boff..boff + 144]);
+                        }
                     }
-                    if smin >= 0.0 {
-                        // All non-negative: offset = 0, scale covers [0, max]
-                        sub_mins[sb] = 0.0;
-                        sub_scales[sb] = if smax > 0.0 { smax / 15.0 } else { 0.0 };
-                    } else {
-                        sub_mins[sb] = smin; // negative
-                        sub_scales[sb] = if smax > smin { (smax - smin) / 15.0 } else { 0.0 };
-                    }
-                }
+                });
+            }
+        });
 
-                // Step 2: find super-block d and dmin
-                // d = max_sub_scale / 63, so that sv values use full 6-bit range (0-63)
-                // dmin = max(-sub_mins) / 63, same for min values
-                let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
-                let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max);
-                let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
-                let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
+        Q4KMat { rows, cols, blocks }
+    }
 
-                // Step 3: quantize sub-block scales and mins to 6-bit
-                let mut sv = [0u8; 8];
-                let mut mv = [0u8; 8];
-                if d > 0.0 {
-                    let inv_d = 1.0 / d;
-                    for j in 0..8 {
-                        sv[j] = ((sub_scales[j] * inv_d + 0.5) as u8).min(63);
-                    }
-                }
-                if dmin > 0.0 {
-                    let inv_dmin = 1.0 / dmin;
-                    for j in 0..8 {
-                        mv[j] = (((-sub_mins[j]) * inv_dmin + 0.5) as u8).min(63);
-                    }
-                }
-
-                // Step 4: store d and dmin as f16
-                let d_f16 = Self::f32_to_f16(d);
-                let dmin_f16 = Self::f32_to_f16(dmin);
-                blocks[boff..boff + 2].copy_from_slice(&d_f16.to_le_bytes());
-                blocks[boff + 2..boff + 4].copy_from_slice(&dmin_f16.to_le_bytes());
-
-                // Step 5: pack 6-bit scales/mins into 12-byte array
-                let sc = Self::pack_scales(&sv, &mv);
-                blocks[boff + 4..boff + 16].copy_from_slice(&sc);
-
-                // Step 6: quantize values into 4-bit nibbles
-                // Layout: 4 chunks of 32 bytes (64 elements each)
-                //   chunk c: qs[c*32..(c+1)*32]
-                //     low nibble → sub-block 2c (scale sv[2c], min mv[2c])
-                //     high nibble → sub-block 2c+1 (scale sv[2c+1], min mv[2c+1])
-                let d_val = Self::f16_to_f32(d_f16);
-                let dmin_val = Self::f16_to_f32(dmin_f16);
-                for chunk in 0..4 {
-                    let scale1 = d_val * sv[chunk * 2] as f32;
-                    let min1   = dmin_val * mv[chunk * 2] as f32;
-                    let scale2 = d_val * sv[chunk * 2 + 1] as f32;
-                    let min2   = dmin_val * mv[chunk * 2 + 1] as f32;
-
-                    let lo_data = &block_data[chunk * 64..chunk * 64 + 32];
-                    let hi_data = &block_data[chunk * 64 + 32..chunk * 64 + 64];
-
-                    for l in 0..32 {
-                        let q_lo = if scale1 > 0.0 {
-                            (((lo_data[l] + min1) / scale1 + 0.5) as u8).min(15)
-                        } else { 0 };
-                        let q_hi = if scale2 > 0.0 {
-                            (((hi_data[l] + min2) / scale2 + 0.5) as u8).min(15)
-                        } else { 0 };
-                        blocks[boff + 16 + chunk * 32 + l] = q_lo | (q_hi << 4);
-                    }
-                }
+    /// Quantize a single 256-element block into 144 bytes of Q4K format.
+    fn quantize_block(block_data: &[f32], out: &mut [u8]) {
+        // Step 1: compute per-sub-block scale and min (8 sub-blocks of 32 elements)
+        let mut sub_scales = [0.0f32; 8];
+        let mut sub_mins = [0.0f32; 8];
+        for sb in 0..8 {
+            let sub = &block_data[sb * 32..(sb + 1) * 32];
+            let mut smin = f32::INFINITY;
+            let mut smax = f32::NEG_INFINITY;
+            for &v in sub {
+                if v < smin { smin = v; }
+                if v > smax { smax = v; }
+            }
+            if smin >= 0.0 {
+                sub_mins[sb] = 0.0;
+                sub_scales[sb] = if smax > 0.0 { smax / 15.0 } else { 0.0 };
+            } else {
+                sub_mins[sb] = smin;
+                sub_scales[sb] = if smax > smin { (smax - smin) / 15.0 } else { 0.0 };
             }
         }
+
+        // Step 2: find super-block d and dmin
+        let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
+        let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max);
+        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+        let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
+
+        // Step 3: quantize sub-block scales and mins to 6-bit
+        let mut sv = [0u8; 8];
+        let mut mv = [0u8; 8];
+        if d > 0.0 {
+            let inv_d = 1.0 / d;
+            for j in 0..8 {
+                sv[j] = ((sub_scales[j] * inv_d + 0.5) as u8).min(63);
+            }
+        }
+        if dmin > 0.0 {
+            let inv_dmin = 1.0 / dmin;
+            for j in 0..8 {
+                mv[j] = (((-sub_mins[j]) * inv_dmin + 0.5) as u8).min(63);
+            }
+        }
+
+        // Step 4: store d and dmin as f16
+        let d_f16 = Self::f32_to_f16(d);
+        let dmin_f16 = Self::f32_to_f16(dmin);
+        out[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        out[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
+
+        // Step 5: pack 6-bit scales/mins into 12-byte array
+        let sc = Self::pack_scales(&sv, &mv);
+        out[4..16].copy_from_slice(&sc);
+
+        // Step 6: quantize values into 4-bit nibbles
+        let d_val = Self::f16_to_f32(d_f16);
+        let dmin_val = Self::f16_to_f32(dmin_f16);
+        for chunk in 0..4 {
+            let scale1 = d_val * sv[chunk * 2] as f32;
+            let min1   = dmin_val * mv[chunk * 2] as f32;
+            let scale2 = d_val * sv[chunk * 2 + 1] as f32;
+            let min2   = dmin_val * mv[chunk * 2 + 1] as f32;
+
+            let lo_data = &block_data[chunk * 64..chunk * 64 + 32];
+            let hi_data = &block_data[chunk * 64 + 32..chunk * 64 + 64];
+
+            for l in 0..32 {
+                let q_lo = if scale1 > 0.0 {
+                    (((lo_data[l] + min1) / scale1 + 0.5) as u8).min(15)
+                } else { 0 };
+                let q_hi = if scale2 > 0.0 {
+                    (((hi_data[l] + min2) / scale2 + 0.5) as u8).min(15)
+                } else { 0 };
+                out[16 + chunk * 32 + l] = q_lo | (q_hi << 4);
+            }
+        }
+    }
+
+    /// Quantize a BF16 matrix to Q4K without materializing the full f32 matrix.
+    ///
+    /// Uses a per-row f32 scratch buffer (~10 KB for cols=2560) instead of
+    /// allocating rows×cols×4 bytes (~2.7 GB for lm_head).
+    pub fn quantize_from_bf16(bf16: &crate::autograd2::MatBf16) -> Self {
+        let (rows, cols) = (bf16.rows, bf16.cols);
+        assert_eq!(cols % 256, 0, "Q4KMat::quantize_from_bf16: cols must be multiple of 256, got {}", cols);
+        let n_blocks_per_row = cols / 256;
+        let total_blocks = rows * n_blocks_per_row;
+        let mut blocks = vec![0u8; total_blocks * 144];
+
+        let n_threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4);
+        let rows_per_thread = rows.div_ceil(n_threads);
+
+        std::thread::scope(|s| {
+            for (chunk_idx, block_chunk) in blocks.chunks_mut(rows_per_thread * n_blocks_per_row * 144).enumerate() {
+                let row_start = chunk_idx * rows_per_thread;
+                let row_end = (row_start + rows_per_thread).min(rows);
+                let bf16_data = &bf16.data;
+                s.spawn(move || {
+                    let mut row_buf = vec![0.0f32; cols];
+                    for row in row_start..row_end {
+                        // Convert one row BF16→f32
+                        let src = &bf16_data[row * cols..(row + 1) * cols];
+                        for (o, &b) in row_buf.iter_mut().zip(src.iter()) {
+                            *o = MatBf16::bf16_to_f32(b);
+                        }
+                        // Quantize row into Q4K blocks
+                        for b in 0..n_blocks_per_row {
+                            let block_data = &row_buf[b * 256..(b + 1) * 256];
+                            let boff = ((row - row_start) * n_blocks_per_row + b) * 144;
+                            Self::quantize_block(block_data, &mut block_chunk[boff..boff + 144]);
+                        }
+                    }
+                });
+            }
+        });
 
         Q4KMat { rows, cols, blocks }
     }
