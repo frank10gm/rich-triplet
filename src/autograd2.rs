@@ -1153,6 +1153,39 @@ impl Q4KMat {
         Q4KMat { rows, cols, blocks }
     }
 
+    /// Convert a Q4_0 matrix (Q4Mat) to Q4K format.
+    /// Row-by-row dequant → requant with ~10 KB scratch per thread.
+    pub fn from_q4mat(q4: &Q4Mat) -> Self {
+        let (rows, cols) = (q4.rows, q4.cols);
+        assert_eq!(cols % 256, 0, "Q4KMat::from_q4mat: cols must be multiple of 256, got {}", cols);
+        let n_blocks_per_row = cols / 256;
+        let total_blocks = rows * n_blocks_per_row;
+        let mut blocks = vec![0u8; total_blocks * 144];
+
+        let n_threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4);
+        let rows_per_thread = rows.div_ceil(n_threads);
+
+        std::thread::scope(|s| {
+            for (chunk_idx, block_chunk) in blocks.chunks_mut(rows_per_thread * n_blocks_per_row * 144).enumerate() {
+                let row_start = chunk_idx * rows_per_thread;
+                let row_end = (row_start + rows_per_thread).min(rows);
+                s.spawn(move || {
+                    let mut row_buf = vec![0.0f32; cols];
+                    for row in row_start..row_end {
+                        q4.dequantize_row_into(row, &mut row_buf);
+                        for b in 0..n_blocks_per_row {
+                            let block_data = &row_buf[b * 256..(b + 1) * 256];
+                            let boff = ((row - row_start) * n_blocks_per_row + b) * 144;
+                            Self::quantize_block(block_data, &mut block_chunk[boff..boff + 144]);
+                        }
+                    }
+                });
+            }
+        });
+
+        Q4KMat { rows, cols, blocks }
+    }
+
     /// Dequantize row `row_idx` (in [0, rows)) into `buf` (length >= cols).
     ///
     /// `cols` must be a multiple of 256 (true for all Gemma3 weight matrices),

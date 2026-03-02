@@ -1150,8 +1150,12 @@ fn load_linear_from_gguf(
 
     match gtype {
         GgufType::Q4_0 => {
+            // Convert Q4_0 → Q4K: smaller in memory (0.56 vs 0.63 bytes/elem)
+            // and has native Metal GEMV + SDOT CPU paths.
             let q4 = gguf.decode_q4_0_to_q4mat(idx)?;
-            linear.q4_weight = Some(q4);
+            let q4k = crate::autograd2::Q4KMat::from_q4mat(&q4);
+            drop(q4);
+            linear.q4k_weight = Some(q4k);
             linear.bf16_weight = None;
             linear.weight.set_data(crate::autograd2::Mat::zeros(0, 0));
         }
