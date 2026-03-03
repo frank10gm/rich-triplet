@@ -629,22 +629,9 @@ impl MatBf16 {
             return self.gemv_mt(a);
         }
 
-        // Prefill: full dequant then an accelerated GEMM.
-        if m > 4 {
-            let w = self.to_f32(); // [N, K] f32
-
-            #[cfg(feature = "blas")]
-            {
-                return a.matmul_bt(&w);
-            }
-            #[cfg(not(feature = "blas"))]
-            {
-                return a.matmul(&w.transpose());
-            }
-        }
-
-        // ── Decode path (M ≤ 4): chunked SGEMM ───────────────────────────
+        // ── Chunked SGEMM for all M values (prefill & decode) ─────────────
         // Dequantise CHUNK weight rows → f32, call sgemm once per chunk.
+        // Uses ~8 MB scratch instead of full N×K f32 dequant.
         // The output-slice trick: pass &mut out.data[j0..] with ldc = n so
         // sgemm writes C[i, j] directly to out[i, j0 + j] via row stride n.
         #[cfg(feature = "blas")]
@@ -2710,6 +2697,42 @@ impl TensorNode {
         };
         if let Some(f) = fn_ptr {
             f();
+        }
+    }
+
+    /// Free the entire autograd graph reachable from this node.
+    ///
+    /// Many autograd operations (add, gelu_tanh, rms_norm_gemma3, etc.)
+    /// capture `out_c = out.clone()` in their backward closures, creating
+    /// Rc self-reference cycles.  These cycles prevent normal reference
+    /// counting from ever freeing the nodes.
+    ///
+    /// This method iteratively visits every reachable node and:
+    ///   1. Drops the backward closure (breaking the Rc cycle)
+    ///   2. Frees the grad Mat (never used during inference)
+    ///   3. Frees the data Mat
+    ///   4. Clears prev references (so child nodes can be freed too)
+    ///
+    /// After calling this, the node contains empty 0×0 data/grad.
+    /// Call this when the autograd graph is no longer needed (e.g., after
+    /// inference prefill) to reclaim all graph memory.
+    pub fn free_graph(&self) {
+        let mut stack = vec![self.clone()];
+        while let Some(node) = stack.pop() {
+            if let Ok(mut inner) = node.0.try_borrow_mut() {
+                // Skip leaf nodes: either model parameters (gamma weights,
+                // etc.) that must be preserved, or fused_linear output
+                // leaves that will be freed by Rc once references are gone.
+                if inner.backward_fn.is_none() && inner.prev.is_empty() {
+                    continue;
+                }
+                inner.backward_fn = None;
+                inner.grad = Mat::zeros(0, 0);
+                inner.data = Mat::zeros(0, 0);
+                let prev = std::mem::take(&mut inner.prev);
+                drop(inner);
+                stack.extend(prev);
+            }
         }
     }
 

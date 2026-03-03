@@ -1109,6 +1109,25 @@ pub fn release_memory_to_os() {
 #[cfg(not(target_os = "macos"))]
 pub fn release_memory_to_os() {}
 
+/// Print current process memory footprint in MB using Mach task_info.
+pub fn print_rss(label: &str) {
+    // Use ps to get actual RSS — most reliable on macOS
+    let pid = std::process::id();
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+    {
+        if let Ok(s) = std::str::from_utf8(&out.stdout) {
+            if let Ok(kb) = s.trim().parse::<u64>() {
+                let mb = kb as f64 / 1024.0;
+                eprintln!("[ RSS ] {}: {:.1} MB", label, mb);
+                return;
+            }
+        }
+    }
+    eprintln!("[ RSS ] {}: (failed to read)", label);
+}
+
 fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, hidden: usize) {
     use crate::autograd2::MatBf16;
     // Wrap in Arc once so embed_bf16 and lm_head share the same allocation (no clone).
@@ -2011,6 +2030,8 @@ impl Gemma3Model {
             presence_penalty: 0.0,
         };
 
+        print_rss("before KV cache alloc");
+
         let mut ngram = NgramDraftEngine::new(4, draft_len);
         // Seed the n-gram history with prompt tokens so early-generation
         // n-gram matches against the prompt are possible.
@@ -2084,6 +2105,7 @@ impl Gemma3Model {
             "[ Gemma3 ] Prefill: {} tokens in {:.0} ms ({:.1} tok/s)",
             t_prompt, prefill_ms, prefill_tps
         );
+        print_rss("after prefill");
 
         // ── Prefill logit diagnostics ──────────────────────────────────────
         if debug {
@@ -2101,6 +2123,14 @@ impl Gemma3Model {
         }
 
         let first = sample_token(&logits_node.data(), 0, &params, &seen, &mut rng);
+
+        // Free the prefill autograd graph.  Backward closures create Rc
+        // self-reference cycles that prevent normal deallocation.
+        // free_graph() breaks these cycles iteratively.
+        x.free_graph();
+        logits_node.free_graph();
+        release_memory_to_os();
+
         callback(first);
         seen.push(first);
         ngram.record(first);
@@ -2120,19 +2150,24 @@ impl Gemma3Model {
 
         #[cfg(feature = "metal")]
         let mut metal_ctx = {
-            let mut ctx = crate::metal_decode::inner::MetalDecodeContext::new(self);
+            let mut ctx = crate::metal_decode::inner::MetalDecodeContext::new(self, draft_len);
+            ctx.print_metal_memory();
+            print_rss("after MetalDecodeContext::new");
             // Warmup: run one dummy decode step to trigger GPU shader JIT compilation.
             // This avoids a ~25s stall on the first real decode step.
             // Must run BEFORE sync_kv_from_cpu since warmup writes to KV cache at pos 0.
             let t_warmup = std::time::Instant::now();
             let _ = ctx.decode_step(0, 0);
             eprintln!("[ Metal ] GPU warmup in {:.0} ms", t_warmup.elapsed().as_millis());
+            print_rss("after GPU warmup");
             ctx.sync_kv_from_cpu(&cache);
 
             // Free CPU-side duplicates now that everything is in GPU buffers.
             // Saves ~3 GB (layer weights) + ~0.5 GB (CPU KV cache).
             self.clear_cpu_weights();
             cache.free();
+            release_memory_to_os();
+            print_rss("after clear_cpu_weights + cache.free");
 
             ctx
         };
@@ -2164,6 +2199,7 @@ impl Gemma3Model {
 
         let mut step = 1usize;
         let mut hit_eos = false;
+        print_rss("decode loop start");
 
         while step < max_new && !hit_eos {
             // Try speculative decoding if draft_len > 0 and Metal is active

@@ -267,16 +267,10 @@ kernel void embed_bf16_lookup(
 
 #define TG_ATTN 32u
 
-// Online softmax attention with half-precision KV cache.
-// No fixed-size score buffer — unlimited context length.
-// Each thread owns a strided slice of d_head dimensions and accumulates
-// the weighted V sum in registers using the online softmax trick.
-//
-// Thread layout: TG_ATTN=32 threads per Q head.
-// Thread `lid` owns dimensions {lid, lid+32, lid+64, ...}.
-// For d_head=256: 8 dims per thread.  Works for any d_head.
-
-#define MAX_DIMS_PER_THREAD 8u  // d_head / TG_ATTN, max supported d_head=256
+// Score-buffer attention with half-precision KV cache.
+// Three-phase: compute scores → softmax → weighted V sum.
+// Uses threadgroup memory for scores (max 2048 context tokens).
+// One threadgroup per Q head, TG_ATTN=32 threads.
 
 kernel void attention_decode(
     device const float* q         [[ buffer(0)  ]],
@@ -301,54 +295,53 @@ kernel void attention_decode(
     uint kv_off = kvh * d_head;
     uint t_kv = k_end - k_start;
 
-    // How many dimensions this thread owns (strided by TG_ATTN=32)
-    uint my_dims = 0u;
-    for (uint di = lid; di < d_head; di += TG_ATTN) my_dims++;
+    // ── Phase 1: compute scores ──
+    threadgroup float tg_scores[2048];
 
-    // Online softmax state
-    float running_max = -INFINITY;
-    float running_sum = 0.0f;
-    float acc[MAX_DIMS_PER_THREAD];
-    for (uint i = 0u; i < MAX_DIMS_PER_THREAD; i++) acc[i] = 0.0f;
-
-    // Process one context token at a time
-    for (uint ci = 0u; ci < t_kv; ci++) {
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
         uint cache_row = k_start + ci;
         uint k_base = cache_row * kv_stride + kv_off;
-
-        // Partial dot product: each thread handles strided dimensions
-        float partial_dot = 0.0f;
-        for (uint di = lid; di < d_head; di += TG_ATTN) {
-            partial_dot += q[q_off + di] * float(k_cache[k_base + di]);
+        float dot = 0.0f;
+        for (uint di = 0u; di < d_head; di++) {
+            dot += q[q_off + di] * float(k_cache[k_base + di]);
         }
-        float score = simd_sum(partial_dot) * scale;
-
-        // Online softmax update
-        float new_max = max(running_max, score);
-        float correction = exp(running_max - new_max);
-        float exp_s = exp(score - new_max);
-
-        running_sum = running_sum * correction + exp_s;
-        for (uint i = 0u; i < my_dims; i++) {
-            acc[i] *= correction;
-        }
-        running_max = new_max;
-
-        // Add V contribution
-        uint v_base = cache_row * kv_stride + kv_off;
-        uint idx = 0u;
-        for (uint di = lid; di < d_head; di += TG_ATTN) {
-            acc[idx] += exp_s * float(v_cache[v_base + di]);
-            idx++;
-        }
+        tg_scores[ci] = dot * scale;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Write output: acc / running_sum (strided)
-    float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
-    uint idx = 0u;
-    for (uint di = lid; di < d_head; di += TG_ATTN) {
-        out[q_off + di] = acc[idx] * inv_sum;
-        idx++;
+    // ── Phase 2: softmax ──
+    float local_max = -INFINITY;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        local_max = max(local_max, tg_scores[ci]);
+    }
+    float max_s = simd_max(local_max);
+
+    float local_sum = 0.0f;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        float e = exp(tg_scores[ci] - max_s);
+        tg_scores[ci] = e;
+        local_sum += e;
+    }
+    float sum_exp = simd_sum(local_sum);
+
+    float inv_sum = 1.0f / sum_exp;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        tg_scores[ci] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 3: weighted V sum ──
+    for (uint di = 0u; di < d_head; di++) {
+        float partial = 0.0f;
+        for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+            uint cache_row = k_start + ci;
+            uint v_base = cache_row * kv_stride + kv_off;
+            partial += tg_scores[ci] * float(v_cache[v_base + di]);
+        }
+        float total = simd_sum(partial);
+        if (lid == 0u) {
+            out[q_off + di] = total;
+        }
     }
 }
 
@@ -370,14 +363,101 @@ inline float2 scale_min(device const uchar* sc, uint j) {
     return float2(sv, mv);
 }
 
-// Batch Q4K GEMV: C[M,N] = A[M,K] @ Q4K[N,K]^T
-// M=1 for normal decode, M>1 for speculative batch verify.
-// A is row-major [M, K], C is row-major [M, N].
-// One threadgroup per output column j, 32 threads stride over K blocks.
-// Each thread maintains M accumulators.
+// ── Fast M=1 Q4K GEMV: C[N] = A[K] @ Q4K[N,K]^T ─────────────────────
+// Single accumulator, no M loop — optimal register usage for decode.
+kernel void gemv_q4k_t(
+    device const float* A         [[ buffer(0) ]],
+    device const uchar* blocks    [[ buffer(1) ]],
+    device       float* C         [[ buffer(2) ]],
+    constant     uint&  K         [[ buffer(3) ]],
+    constant     uint&  N         [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    uint n_sb = K / Q4K_BLOCK_ELEMS;
+    float acc = 0.0f;
+
+    for (uint b = lid; b < n_sb; b += TG_K) {
+        uint boff = (j * n_sb + b) * Q4K_BLOCK_BYTES;
+        device const uchar* bp = blocks + boff;
+
+        ushort d_bits    = ushort(bp[0]) | (ushort(bp[1]) << 8u);
+        ushort dmin_bits = ushort(bp[2]) | (ushort(bp[3]) << 8u);
+        float d    = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        device const uchar* sc = bp + 4u;
+        device const uchar* qs = bp + 16u;
+        uint a_base = b * Q4K_BLOCK_ELEMS;
+
+        for (uint chunk = 0u; chunk < 4u; chunk++) {
+            float2 sm1 = scale_min(sc, chunk * 2u);
+            float2 sm2 = scale_min(sc, chunk * 2u + 1u);
+            float scale1 = d * sm1.x;  float min1 = dmin * sm1.y;
+            float scale2 = d * sm2.x;  float min2 = dmin * sm2.y;
+
+            device const uchar* qq = qs + chunk * 32u;
+            uint a_off = a_base + chunk * 64u;
+
+            float dot_lo = 0.0f, dot_hi = 0.0f;
+            float sum_lo = 0.0f, sum_hi = 0.0f;
+
+            for (uint l = 0u; l < 32u; l++) {
+                float a_lo = A[a_off + l];
+                float a_hi = A[a_off + 32u + l];
+                dot_lo += float(qq[l] & 0x0Fu) * a_lo;
+                dot_hi += float(qq[l] >> 4u)   * a_hi;
+                sum_lo += a_lo;
+                sum_hi += a_hi;
+            }
+
+            acc += scale1 * dot_lo - min1 * sum_lo
+                 + scale2 * dot_hi - min2 * sum_hi;
+        }
+    }
+
+    acc = simd_sum(acc);
+    if (lid == 0u)
+        C[j] = acc;
+}
+
+// ── Fast M=1 BF16 GEMV: C[N] = A[K] @ BF16[N,K]^T ──────────────────
+#define TG_K_BF16 32u
+
+kernel void gemv_bf16_t(
+    device const float*  A      [[ buffer(0) ]],
+    device const ushort* W      [[ buffer(1) ]],
+    device       float*  C      [[ buffer(2) ]],
+    constant     uint&   K      [[ buffer(3) ]],
+    constant     uint&   N      [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    float acc = 0.0f;
+    uint row_start = j * K;
+
+    for (uint p = lid; p < K; p += TG_K_BF16) {
+        ushort bits = W[row_start + p];
+        float w = as_type<float>(uint(bits) << 16u);
+        acc += A[p] * w;
+    }
+
+    acc = simd_sum(acc);
+    if (lid == 0u)
+        C[j] = acc;
+}
+
+// ── Batch Q4K GEMV: C[M,N] = A[M,K] @ Q4K[N,K]^T ───────────────────
+// M accumulators — used by speculative batch verify (M>1).
 #define MAX_BATCH 8u
 
-kernel void gemv_q4k_t(
+kernel void gemv_q4k_t_batch(
     device const float* A         [[ buffer(0) ]],
     device const uchar* blocks    [[ buffer(1) ]],
     device       float* C         [[ buffer(2) ]],
@@ -416,7 +496,6 @@ kernel void gemv_q4k_t(
             device const uchar* qq = qs + chunk * 32u;
             uint a_off = a_base + chunk * 64u;
 
-            // Read quantized nibbles once, apply to all M rows
             for (uint m = 0u; m < M; m++) {
                 uint a_row = m * K;
                 float dot_lo = 0.0f, dot_hi = 0.0f;
@@ -444,12 +523,8 @@ kernel void gemv_q4k_t(
     }
 }
 
-// ── BF16 GEMV (copied from metal_ops.rs) ─────────────────────────────────
-
-#define TG_K_BF16 32u
-
-// Batch BF16 GEMV: C[M,N] = A[M,K] @ BF16[N,K]^T
-kernel void gemv_bf16_t(
+// ── Batch BF16 GEMV: C[M,N] = A[M,K] @ BF16[N,K]^T ─────────────────
+kernel void gemv_bf16_t_batch(
     device const float*  A      [[ buffer(0) ]],
     device const ushort* W      [[ buffer(1) ]],
     device       float*  C      [[ buffer(2) ]],
@@ -694,14 +769,12 @@ kernel void kv_cache_append_batch(
         pipe_embed_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pipe_gemv_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pipe_gemv_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_gemv_q4k_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_gemv_bf16_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         pipe_f32_to_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
-        // Batch pipelines (speculative decoding)
-        pipe_embed_bf16_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        pipe_rms_norm_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        pipe_rms_norm_per_head_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        pipe_rope_neox_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        pipe_kv_append_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        // Batch state for speculative decoding (only allocated when draft_len > 0)
+        batch: Option<BatchState>,
 
         // Per-layer weights
         layer_weights: Vec<LayerWeightBuffers>,
@@ -740,30 +813,8 @@ kernel void kv_cache_append_batch(
         kv_k_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
         kv_v_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 
-        // Staging buffer for f32→f16 KV conversion during sync
-        buf_kv_staging: Retained<ProtocolObject<dyn MTLBuffer>>,
-
-        // Batch activation buffers for speculative decoding (MAX_BATCH=8 tokens)
-        buf_batch_hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_hidden2: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_q: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_k: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_v: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_q_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_k_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_q_roped: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_k_roped: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_attn_out: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_o_proj_out: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_gate: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_up: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_gate_act: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_mlp_hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_down_out: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_logits: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_token_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
-        buf_batch_positions: Retained<ProtocolObject<dyn MTLBuffer>>,
+        // Staging buffer for f32→f16 KV conversion during sync (freed after sync)
+        buf_kv_staging: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 
         // Model config
         config: Config4,
@@ -775,6 +826,36 @@ kernel void kv_cache_append_batch(
         pub lm_head_vocab: usize,
         /// Whether lm_head weights are BF16 (true) or Q4K (false).
         lm_head_is_bf16: bool,
+    }
+
+    /// Buffers and pipelines for batch/speculative decoding.
+    /// Only allocated when draft_len > 0.
+    struct BatchState {
+        pipe_embed_bf16_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_rms_norm_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_rms_norm_per_head_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_rope_neox_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        pipe_kv_append_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        buf_hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_hidden2: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_q: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_k: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_v: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_q_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_k_normed: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_q_roped: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_k_roped: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_attn_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_o_proj_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_up: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_gate_act: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_mlp_hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_down_out: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_logits: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_token_ids: Retained<ProtocolObject<dyn MTLBuffer>>,
+        buf_positions: Retained<ProtocolObject<dyn MTLBuffer>>,
     }
 
     // =========================================================================
@@ -887,7 +968,7 @@ kernel void kv_cache_append_batch(
         ///
         /// Call after model weights are loaded.  CPU-side weight data is freed
         /// layer-by-layer during upload to avoid doubling peak memory.
-        pub fn new(model: &mut Gemma3Model) -> Self {
+        pub fn new(model: &mut Gemma3Model, draft_len: usize) -> Self {
             let t_start = std::time::Instant::now();
             let cfg = &model.config;
             let device = MTLCreateSystemDefaultDevice()
@@ -910,12 +991,9 @@ kernel void kv_cache_append_batch(
             let pipe_embed_bf16 = pipeline_from_library(&device, &library, "embed_bf16_lookup");
             let pipe_gemv_q4k = pipeline_from_library(&device, &library, "gemv_q4k_t");
             let pipe_gemv_bf16 = pipeline_from_library(&device, &library, "gemv_bf16_t");
+            let pipe_gemv_q4k_batch = pipeline_from_library(&device, &library, "gemv_q4k_t_batch");
+            let pipe_gemv_bf16_batch = pipeline_from_library(&device, &library, "gemv_bf16_t_batch");
             let pipe_f32_to_f16 = pipeline_from_library(&device, &library, "f32_to_f16_convert");
-            let pipe_embed_bf16_batch = pipeline_from_library(&device, &library, "embed_bf16_lookup_batch");
-            let pipe_rms_norm_batch = pipeline_from_library(&device, &library, "rms_norm_gemma3_batch");
-            let pipe_rms_norm_per_head_batch = pipeline_from_library(&device, &library, "rms_norm_per_head_batch");
-            let pipe_rope_neox_batch = pipeline_from_library(&device, &library, "rope_neox_batch");
-            let pipe_kv_append_batch = pipeline_from_library(&device, &library, "kv_cache_append_batch");
             eprintln!("[ Metal ]   MSL compile + pipelines: {} ms", t_msl.elapsed().as_millis());
 
             let t_upload = std::time::Instant::now();
@@ -1066,28 +1144,39 @@ kernel void kv_cache_append_batch(
             let buf_down_out = alloc_buf(&device, h * 4);
             let buf_logits = alloc_buf(&device, lm_head_vocab * 4);
 
-            // Batch activation buffers for speculative decoding (MAX_BATCH=8)
-            let mb = 8usize;
-            let buf_batch_hidden = alloc_buf(&device, mb * h * 4);
-            let buf_batch_hidden2 = alloc_buf(&device, mb * h * 4);
-            let buf_batch_normed = alloc_buf(&device, mb * h * 4);
-            let buf_batch_q = alloc_buf(&device, mb * nq * d * 4);
-            let buf_batch_k = alloc_buf(&device, mb * nkv * d * 4);
-            let buf_batch_v = alloc_buf(&device, mb * nkv * d * 4);
-            let buf_batch_q_normed = alloc_buf(&device, mb * nq * d * 4);
-            let buf_batch_k_normed = alloc_buf(&device, mb * nkv * d * 4);
-            let buf_batch_q_roped = alloc_buf(&device, mb * nq * d * 4);
-            let buf_batch_k_roped = alloc_buf(&device, mb * nkv * d * 4);
-            let buf_batch_attn_out = alloc_buf(&device, mb * nq * d * 4);
-            let buf_batch_o_proj_out = alloc_buf(&device, mb * h * 4);
-            let buf_batch_gate = alloc_buf(&device, mb * inter * 4);
-            let buf_batch_up = alloc_buf(&device, mb * inter * 4);
-            let buf_batch_gate_act = alloc_buf(&device, mb * inter * 4);
-            let buf_batch_mlp_hidden = alloc_buf(&device, mb * inter * 4);
-            let buf_batch_down_out = alloc_buf(&device, mb * h * 4);
-            let buf_batch_logits = alloc_buf(&device, mb * lm_head_vocab * 4);
-            let buf_batch_token_ids = alloc_buf(&device, mb * 4);
-            let buf_batch_positions = alloc_buf(&device, mb * 4);
+            // Batch state (only when speculative decoding is enabled)
+            let batch = if draft_len > 0 {
+                let mb = 8usize;
+                Some(BatchState {
+                    pipe_embed_bf16_batch: pipeline_from_library(&device, &library, "embed_bf16_lookup_batch"),
+                    pipe_rms_norm_batch: pipeline_from_library(&device, &library, "rms_norm_gemma3_batch"),
+                    pipe_rms_norm_per_head_batch: pipeline_from_library(&device, &library, "rms_norm_per_head_batch"),
+                    pipe_rope_neox_batch: pipeline_from_library(&device, &library, "rope_neox_batch"),
+                    pipe_kv_append_batch: pipeline_from_library(&device, &library, "kv_cache_append_batch"),
+                    buf_hidden: alloc_buf(&device, mb * h * 4),
+                    buf_hidden2: alloc_buf(&device, mb * h * 4),
+                    buf_normed: alloc_buf(&device, mb * h * 4),
+                    buf_q: alloc_buf(&device, mb * nq * d * 4),
+                    buf_k: alloc_buf(&device, mb * nkv * d * 4),
+                    buf_v: alloc_buf(&device, mb * nkv * d * 4),
+                    buf_q_normed: alloc_buf(&device, mb * nq * d * 4),
+                    buf_k_normed: alloc_buf(&device, mb * nkv * d * 4),
+                    buf_q_roped: alloc_buf(&device, mb * nq * d * 4),
+                    buf_k_roped: alloc_buf(&device, mb * nkv * d * 4),
+                    buf_attn_out: alloc_buf(&device, mb * nq * d * 4),
+                    buf_o_proj_out: alloc_buf(&device, mb * h * 4),
+                    buf_gate: alloc_buf(&device, mb * inter * 4),
+                    buf_up: alloc_buf(&device, mb * inter * 4),
+                    buf_gate_act: alloc_buf(&device, mb * inter * 4),
+                    buf_mlp_hidden: alloc_buf(&device, mb * inter * 4),
+                    buf_down_out: alloc_buf(&device, mb * h * 4),
+                    buf_logits: alloc_buf(&device, mb * lm_head_vocab * 4),
+                    buf_token_ids: alloc_buf(&device, mb * 4),
+                    buf_positions: alloc_buf(&device, mb * 4),
+                })
+            } else {
+                None
+            };
 
             // KV cache buffers (half precision — 2 bytes per element)
             let max_seq_len = cfg.max_position_embeddings.min(2048);
@@ -1099,8 +1188,8 @@ kernel void kv_cache_append_batch(
                 kv_v_bufs.push(alloc_buf(&device, max_seq_len * kv_dim * 2));
             }
 
-            // Staging buffer for f32→f16 KV conversion (reused across layers during sync)
-            let buf_kv_staging = alloc_buf(&device, max_seq_len * kv_dim * 4);
+            // Staging buffer for f32→f16 KV conversion (reused across layers during sync, freed after)
+            let buf_kv_staging = Some(alloc_buf(&device, max_seq_len * kv_dim * 4));
 
             let elapsed = t_start.elapsed();
             eprintln!(
@@ -1124,12 +1213,10 @@ kernel void kv_cache_append_batch(
                 pipe_embed_bf16,
                 pipe_gemv_q4k,
                 pipe_gemv_bf16,
+                pipe_gemv_q4k_batch,
+                pipe_gemv_bf16_batch,
                 pipe_f32_to_f16,
-                pipe_embed_bf16_batch,
-                pipe_rms_norm_batch,
-                pipe_rms_norm_per_head_batch,
-                pipe_rope_neox_batch,
-                pipe_kv_append_batch,
+                batch,
                 layer_weights,
                 embed_buf,
                 lm_head_buf,
@@ -1155,26 +1242,6 @@ kernel void kv_cache_append_batch(
                 kv_k_bufs,
                 kv_v_bufs,
                 buf_kv_staging,
-                buf_batch_hidden,
-                buf_batch_hidden2,
-                buf_batch_normed,
-                buf_batch_q,
-                buf_batch_k,
-                buf_batch_v,
-                buf_batch_q_normed,
-                buf_batch_k_normed,
-                buf_batch_q_roped,
-                buf_batch_k_roped,
-                buf_batch_attn_out,
-                buf_batch_o_proj_out,
-                buf_batch_gate,
-                buf_batch_up,
-                buf_batch_gate_act,
-                buf_batch_mlp_hidden,
-                buf_batch_down_out,
-                buf_batch_logits,
-                buf_batch_token_ids,
-                buf_batch_positions,
                 config: cfg.clone(),
                 max_seq_len,
                 lm_head_vocab,
@@ -1206,6 +1273,84 @@ kernel void kv_cache_append_batch(
     }
 
     // =========================================================================
+    // Memory reporting
+    // =========================================================================
+
+    impl MetalDecodeContext {
+        /// Print a breakdown of Metal GPU buffer memory usage.
+        pub fn print_metal_memory(&self) {
+            let mut weight_bytes = 0usize;
+            for lw in &self.layer_weights {
+                weight_bytes += lw.q_proj.length();
+                weight_bytes += lw.k_proj.length();
+                weight_bytes += lw.v_proj.length();
+                weight_bytes += lw.o_proj.length();
+                weight_bytes += lw.gate_proj.length();
+                weight_bytes += lw.up_proj.length();
+                weight_bytes += lw.down_proj.length();
+                weight_bytes += lw.input_layernorm_gamma.length();
+                weight_bytes += lw.post_attn_layernorm_gamma.length();
+                weight_bytes += lw.pre_ffn_layernorm_gamma.length();
+                weight_bytes += lw.post_ffn_layernorm_gamma.length();
+                weight_bytes += lw.q_norm_gamma.length();
+                weight_bytes += lw.k_norm_gamma.length();
+            }
+            weight_bytes += self.embed_buf.length();
+            weight_bytes += self.lm_head_buf.length();
+            weight_bytes += self.final_norm_gamma.length();
+
+            let mut kv_bytes = 0usize;
+            for buf in &self.kv_k_bufs { kv_bytes += buf.length(); }
+            for buf in &self.kv_v_bufs { kv_bytes += buf.length(); }
+
+            let mut activation_bytes = 0usize;
+            activation_bytes += self.buf_hidden.length();
+            activation_bytes += self.buf_hidden2.length();
+            activation_bytes += self.buf_normed.length();
+            activation_bytes += self.buf_q.length();
+            activation_bytes += self.buf_k.length();
+            activation_bytes += self.buf_v.length();
+            activation_bytes += self.buf_q_normed.length();
+            activation_bytes += self.buf_k_normed.length();
+            activation_bytes += self.buf_q_roped.length();
+            activation_bytes += self.buf_k_roped.length();
+            activation_bytes += self.buf_attn_out.length();
+            activation_bytes += self.buf_o_proj_out.length();
+            activation_bytes += self.buf_gate.length();
+            activation_bytes += self.buf_up.length();
+            activation_bytes += self.buf_gate_act.length();
+            activation_bytes += self.buf_mlp_hidden.length();
+            activation_bytes += self.buf_down_out.length();
+            activation_bytes += self.buf_logits.length();
+
+            let staging_bytes = self.buf_kv_staging.as_ref()
+                .map(|b| b.length()).unwrap_or(0);
+
+            let batch_bytes = if let Some(ref b) = self.batch {
+                b.buf_hidden.length() + b.buf_hidden2.length() + b.buf_normed.length()
+                + b.buf_q.length() + b.buf_k.length() + b.buf_v.length()
+                + b.buf_q_normed.length() + b.buf_k_normed.length()
+                + b.buf_q_roped.length() + b.buf_k_roped.length()
+                + b.buf_attn_out.length() + b.buf_o_proj_out.length()
+                + b.buf_gate.length() + b.buf_up.length()
+                + b.buf_gate_act.length() + b.buf_mlp_hidden.length()
+                + b.buf_down_out.length() + b.buf_logits.length()
+                + b.buf_token_ids.length() + b.buf_positions.length()
+            } else { 0 };
+
+            let total = weight_bytes + kv_bytes + activation_bytes + staging_bytes + batch_bytes;
+            eprintln!("[ Metal ] GPU buffer memory: weights={:.1} MB  kv_cache={:.1} MB  activation={:.1} MB  staging={:.1} MB  batch={:.1} MB  total={:.1} MB",
+                weight_bytes as f64 / 1048576.0,
+                kv_bytes as f64 / 1048576.0,
+                activation_bytes as f64 / 1048576.0,
+                staging_bytes as f64 / 1048576.0,
+                batch_bytes as f64 / 1048576.0,
+                total as f64 / 1048576.0,
+            );
+        }
+    }
+
+    // =========================================================================
     // KV cache sync (from CPU prefill)
     // =========================================================================
 
@@ -1213,8 +1358,12 @@ kernel void kv_cache_append_batch(
         /// Copy KV cache contents from CPU `Gemma3KvCache` into GPU half buffers.
         /// Uses a GPU kernel to convert f32→f16 on-device.
         /// Call once after CPU prefill, before starting Metal decode loop.
+        /// Frees the staging buffer afterwards to save ~8 MB.
         pub fn sync_kv_from_cpu(&mut self, cache: &Gemma3KvCache) {
+            let staging = self.buf_kv_staging.as_ref()
+                .expect("sync_kv_from_cpu: staging buffer already freed");
             let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+
             for (i, layer_cache) in cache.layers.iter().enumerate() {
                 let lc = layer_cache.borrow();
                 let seq_len = lc.seq_len;
@@ -1223,20 +1372,23 @@ kernel void kv_cache_append_batch(
                 }
                 let n_floats = seq_len * kv_dim;
 
-                // Upload f32 K data to staging buffer, then convert to half on GPU
+                // K: copy to staging, dispatch f32→f16
                 unsafe {
-                    let staging = self.buf_kv_staging.contents().as_ptr() as *mut f32;
-                    std::ptr::copy_nonoverlapping(lc.k.data.as_ptr(), staging, n_floats);
+                    let dst = staging.contents().as_ptr() as *mut f32;
+                    std::ptr::copy_nonoverlapping(lc.k.data.as_ptr(), dst, n_floats);
                 }
-                self.dispatch_f32_to_f16(&self.buf_kv_staging, &self.kv_k_bufs[i], n_floats);
+                self.dispatch_f32_to_f16(staging, &self.kv_k_bufs[i], n_floats);
 
-                // Same for V
+                // V: copy to staging, dispatch f32→f16
                 unsafe {
-                    let staging = self.buf_kv_staging.contents().as_ptr() as *mut f32;
-                    std::ptr::copy_nonoverlapping(lc.v.data.as_ptr(), staging, n_floats);
+                    let dst = staging.contents().as_ptr() as *mut f32;
+                    std::ptr::copy_nonoverlapping(lc.v.data.as_ptr(), dst, n_floats);
                 }
-                self.dispatch_f32_to_f16(&self.buf_kv_staging, &self.kv_v_bufs[i], n_floats);
+                self.dispatch_f32_to_f16(staging, &self.kv_v_bufs[i], n_floats);
             }
+
+            // Free the staging buffer — no longer needed after sync.
+            self.buf_kv_staging = None;
         }
 
         /// Run the f32→f16 conversion kernel synchronously.
@@ -1546,8 +1698,72 @@ kernel void kv_cache_append_batch(
             );
         }
 
-        /// Encode Q4K GEMV dispatch: out[M,N] = act[M,K] @ Q4K[N,K]^T
+        /// Encode fast M=1 Q4K GEMV dispatch: out[N] = act[K] @ Q4K[N,K]^T
         fn dispatch_gemv_q4k(
+            &self,
+            encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+            act_buf: &ProtocolObject<dyn MTLBuffer>,
+            weight_buf: &ProtocolObject<dyn MTLBuffer>,
+            out_buf: &ProtocolObject<dyn MTLBuffer>,
+            k: usize,
+            n: usize,
+        ) {
+            encoder.setComputePipelineState(&self.pipe_gemv_q4k);
+            let k_u32 = k as u32;
+            let n_u32 = n as u32;
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&k_u32 as *const u32 as *mut c_void).unwrap(),
+                    4, 3,
+                );
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(),
+                    4, 4,
+                );
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: n, height: 1, depth: 1 },
+                MTLSize { width: 32, height: 1, depth: 1 },
+            );
+        }
+
+        /// Encode fast M=1 BF16 GEMV dispatch: out[N] = act[K] @ BF16[N,K]^T
+        fn dispatch_gemv_bf16(
+            &self,
+            encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+            act_buf: &ProtocolObject<dyn MTLBuffer>,
+            weight_buf: &ProtocolObject<dyn MTLBuffer>,
+            out_buf: &ProtocolObject<dyn MTLBuffer>,
+            k: usize,
+            n: usize,
+        ) {
+            encoder.setComputePipelineState(&self.pipe_gemv_bf16);
+            let k_u32 = k as u32;
+            let n_u32 = n as u32;
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&k_u32 as *const u32 as *mut c_void).unwrap(),
+                    4, 3,
+                );
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(),
+                    4, 4,
+                );
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: n, height: 1, depth: 1 },
+                MTLSize { width: 32, height: 1, depth: 1 },
+            );
+        }
+
+        /// Encode batch Q4K GEMV dispatch: out[M,N] = act[M,K] @ Q4K[N,K]^T
+        fn dispatch_gemv_q4k_batch(
             &self,
             encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
             act_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -1557,7 +1773,7 @@ kernel void kv_cache_append_batch(
             n: usize,
             m: usize,
         ) {
-            encoder.setComputePipelineState(&self.pipe_gemv_q4k);
+            encoder.setComputePipelineState(&self.pipe_gemv_q4k_batch);
             let k_u32 = k as u32;
             let n_u32 = n as u32;
             let m_u32 = m as u32;
@@ -1584,8 +1800,8 @@ kernel void kv_cache_append_batch(
             );
         }
 
-        /// Encode BF16 GEMV dispatch: out[M,N] = act[M,K] @ BF16[N,K]^T
-        fn dispatch_gemv_bf16(
+        /// Encode batch BF16 GEMV dispatch: out[M,N] = act[M,K] @ BF16[N,K]^T
+        fn dispatch_gemv_bf16_batch(
             &self,
             encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
             act_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -1595,7 +1811,7 @@ kernel void kv_cache_append_batch(
             n: usize,
             m: usize,
         ) {
-            encoder.setComputePipelineState(&self.pipe_gemv_bf16);
+            encoder.setComputePipelineState(&self.pipe_gemv_bf16_batch);
             let k_u32 = k as u32;
             let n_u32 = n as u32;
             let m_u32 = m as u32;
@@ -1700,9 +1916,9 @@ kernel void kv_cache_append_batch(
             is_bf16: bool,
         ) {
             if is_bf16 {
-                self.dispatch_gemv_bf16(encoder, act_buf, weight_buf, out_buf, k, n, 1);
+                self.dispatch_gemv_bf16(encoder, act_buf, weight_buf, out_buf, k, n);
             } else {
-                self.dispatch_gemv_q4k(encoder, act_buf, weight_buf, out_buf, k, n, 1);
+                self.dispatch_gemv_q4k(encoder, act_buf, weight_buf, out_buf, k, n);
             }
         }
 
@@ -1791,9 +2007,9 @@ kernel void kv_cache_append_batch(
 
             // 19. Down projection: mlp_hidden → down_out
             if lw.down_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_mlp_hidden, &lw.down_proj, &self.buf_down_out, inter, h, 1);
+                self.dispatch_gemv_bf16(encoder, &self.buf_mlp_hidden, &lw.down_proj, &self.buf_down_out, inter, h);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_mlp_hidden, &lw.down_proj, &self.buf_down_out, inter, h, 1);
+                self.dispatch_gemv_q4k(encoder, &self.buf_mlp_hidden, &lw.down_proj, &self.buf_down_out, inter, h);
             }
 
             // 20. Post-FFN norm: down_out → normed
@@ -1861,6 +2077,7 @@ kernel void kv_cache_append_batch(
             token_ids: &[usize],
             start_position: usize,
         ) -> Vec<f32> {
+            let b = self.batch.as_ref().expect("decode_step_batch requires draft_len > 0");
             let m = token_ids.len();
             assert!(m <= 8, "decode_step_batch: M must be <= 8");
 
@@ -1875,8 +2092,8 @@ kernel void kv_cache_append_batch(
 
             // Upload token IDs and positions
             unsafe {
-                let tid_ptr = self.buf_batch_token_ids.contents().as_ptr() as *mut u32;
-                let pos_ptr = self.buf_batch_positions.contents().as_ptr() as *mut u32;
+                let tid_ptr = b.buf_token_ids.contents().as_ptr() as *mut u32;
+                let pos_ptr = b.buf_positions.contents().as_ptr() as *mut u32;
                 for i in 0..m {
                     *tid_ptr.add(i) = token_ids[i] as u32;
                     *pos_ptr.add(i) = (start_position + i) as u32;
@@ -1888,13 +2105,13 @@ kernel void kv_cache_append_batch(
 
             // 1. Batch embedding lookup → buf_batch_hidden[M, H]
             {
-                encoder.setComputePipelineState(&self.pipe_embed_bf16_batch);
+                encoder.setComputePipelineState(&b.pipe_embed_bf16_batch);
                 let h_u32 = h as u32;
                 let m_u32 = m as u32;
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&self.embed_buf), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_token_ids), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_token_ids), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&h_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -1918,13 +2135,13 @@ kernel void kv_cache_append_batch(
 
             // 3. Final norm: batch_hidden[M,H] → batch_normed[M,H]
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_batch);
                 let d_u32 = h as u32;
                 let m_u32 = m as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&self.final_norm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&d_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -1941,12 +2158,12 @@ kernel void kv_cache_append_batch(
 
             // 4. lm_head: batch_normed[M,H] → batch_logits[M,vocab]
             if self.lm_head_is_bf16 {
-                self.dispatch_gemv_bf16(&encoder, &self.buf_batch_normed,
-                    &self.lm_head_buf, &self.buf_batch_logits,
+                self.dispatch_gemv_bf16_batch(&encoder, &b.buf_normed,
+                    &self.lm_head_buf, &b.buf_logits,
                     h, self.lm_head_vocab, m);
             } else {
-                self.dispatch_gemv_q4k(&encoder, &self.buf_batch_normed,
-                    &self.lm_head_buf, &self.buf_batch_logits,
+                self.dispatch_gemv_q4k_batch(&encoder, &b.buf_normed,
+                    &self.lm_head_buf, &b.buf_logits,
                     h, self.lm_head_vocab, m);
             }
 
@@ -1955,7 +2172,7 @@ kernel void kv_cache_append_batch(
             cmd_buf.waitUntilCompleted();
 
             let n_logits = m * self.lm_head_vocab;
-            let ptr = self.buf_batch_logits.contents().as_ptr() as *const f32;
+            let ptr = b.buf_logits.contents().as_ptr() as *const f32;
             unsafe { std::slice::from_raw_parts(ptr, n_logits).to_vec() }
         }
 
@@ -1967,6 +2184,7 @@ kernel void kv_cache_append_batch(
             start_position: usize,
             m: usize,
         ) {
+            let b = self.batch.as_ref().unwrap();
             let lw = &self.layer_weights[layer_idx];
             let h = self.config.hidden_size;
             let nq = self.config.num_attention_heads;
@@ -1979,12 +2197,12 @@ kernel void kv_cache_append_batch(
 
             // 1. Input layernorm: batch_hidden[M,H] → batch_normed[M,H]
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_batch);
                 let d_u32 = h as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.input_layernorm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&d_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2001,30 +2219,30 @@ kernel void kv_cache_append_batch(
 
             // 2-4. Q, K, V projections (batch GEMV with M rows)
             if lw.q_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_normed, &lw.q_proj, &self.buf_batch_q, h, nq * d, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_normed, &lw.q_proj, &b.buf_q, h, nq * d, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_normed, &lw.q_proj, &self.buf_batch_q, h, nq * d, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_normed, &lw.q_proj, &b.buf_q, h, nq * d, m);
             }
             if lw.k_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_normed, &lw.k_proj, &self.buf_batch_k, h, nkv * d, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_normed, &lw.k_proj, &b.buf_k, h, nkv * d, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_normed, &lw.k_proj, &self.buf_batch_k, h, nkv * d, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_normed, &lw.k_proj, &b.buf_k, h, nkv * d, m);
             }
             if lw.v_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_normed, &lw.v_proj, &self.buf_batch_v, h, nkv * d, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_normed, &lw.v_proj, &b.buf_v, h, nkv * d, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_normed, &lw.v_proj, &self.buf_batch_v, h, nkv * d, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_normed, &lw.v_proj, &b.buf_v, h, nkv * d, m);
             }
 
             // 5-6. Per-head RMSNorm on Q and K (batch)
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_per_head_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_per_head_batch);
                 let nh = nq as u32;
                 let hd = d as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_q), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_q), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.q_norm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_q_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_q_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&nh as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2040,13 +2258,13 @@ kernel void kv_cache_append_batch(
                 );
             }
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_per_head_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_per_head_batch);
                 let nh = nkv as u32;
                 let hd = d as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_k), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_k), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.k_norm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_k_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_k_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&nh as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2064,12 +2282,12 @@ kernel void kv_cache_append_batch(
 
             // 7-8. RoPE on Q and K (batch — reads positions from buffer)
             {
-                encoder.setComputePipelineState(&self.pipe_rope_neox_batch);
+                encoder.setComputePipelineState(&b.pipe_rope_neox_batch);
                 let nh = nq as u32;
                 let hd = d as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_q_normed), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_q_roped), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_q_normed), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_q_roped), 0, 1);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&nh as *const u32 as *mut c_void).unwrap(), 4, 2);
                     encoder.setBytes_length_atIndex(
@@ -2078,7 +2296,7 @@ kernel void kv_cache_append_batch(
                         NonNull::new(&lw.rope_theta as *const f32 as *mut c_void).unwrap(), 4, 4);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&lw.rope_freq_scale as *const f32 as *mut c_void).unwrap(), 4, 5);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_positions), 0, 6);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_positions), 0, 6);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&m_u32 as *const u32 as *mut c_void).unwrap(), 4, 7);
                 }
@@ -2088,12 +2306,12 @@ kernel void kv_cache_append_batch(
                 );
             }
             {
-                encoder.setComputePipelineState(&self.pipe_rope_neox_batch);
+                encoder.setComputePipelineState(&b.pipe_rope_neox_batch);
                 let nh = nkv as u32;
                 let hd = d as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_k_normed), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_k_roped), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_k_normed), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_k_roped), 0, 1);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&nh as *const u32 as *mut c_void).unwrap(), 4, 2);
                     encoder.setBytes_length_atIndex(
@@ -2102,7 +2320,7 @@ kernel void kv_cache_append_batch(
                         NonNull::new(&lw.rope_theta as *const f32 as *mut c_void).unwrap(), 4, 4);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&lw.rope_freq_scale as *const f32 as *mut c_void).unwrap(), 4, 5);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_positions), 0, 6);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_positions), 0, 6);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&m_u32 as *const u32 as *mut c_void).unwrap(), 4, 7);
                 }
@@ -2114,12 +2332,12 @@ kernel void kv_cache_append_batch(
 
             // 9. KV cache append: write M rows starting at start_position
             {
-                encoder.setComputePipelineState(&self.pipe_kv_append_batch);
+                encoder.setComputePipelineState(&b.pipe_kv_append_batch);
                 let sl = start_position as u32;
                 let kvd = kv_dim as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_k_roped), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_v), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_k_roped), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_v), 0, 1);
                     encoder.setBuffer_offset_atIndex(Some(&self.kv_k_bufs[layer_idx]), 0, 2);
                     encoder.setBuffer_offset_atIndex(Some(&self.kv_v_bufs[layer_idx]), 0, 3);
                     encoder.setBytes_length_atIndex(
@@ -2161,12 +2379,12 @@ kernel void kv_cache_append_batch(
                 unsafe {
                     // Point Q at offset mi * nq * d * 4 bytes
                     encoder.setBuffer_offset_atIndex(
-                        Some(&self.buf_batch_q_roped), mi * nq * d * 4, 0);
+                        Some(&b.buf_q_roped), mi * nq * d * 4, 0);
                     encoder.setBuffer_offset_atIndex(Some(&self.kv_k_bufs[layer_idx]), 0, 1);
                     encoder.setBuffer_offset_atIndex(Some(&self.kv_v_bufs[layer_idx]), 0, 2);
                     // Point attn_out at offset mi * nq * d * 4 bytes
                     encoder.setBuffer_offset_atIndex(
-                        Some(&self.buf_batch_attn_out), mi * nq * d * 4, 3);
+                        Some(&b.buf_attn_out), mi * nq * d * 4, 3);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&ks as *const u32 as *mut c_void).unwrap(), 4, 4);
                     encoder.setBytes_length_atIndex(
@@ -2190,19 +2408,19 @@ kernel void kv_cache_append_batch(
 
             // 11. O projection: batch_attn_out[M, nq*d] → batch_o_proj_out[M, H]
             if lw.o_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_attn_out, &lw.o_proj, &self.buf_batch_o_proj_out, nq * d, h, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_attn_out, &lw.o_proj, &b.buf_o_proj_out, nq * d, h, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_attn_out, &lw.o_proj, &self.buf_batch_o_proj_out, nq * d, h, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_attn_out, &lw.o_proj, &b.buf_o_proj_out, nq * d, h, m);
             }
 
             // 12. Post-attention norm: batch_o_proj_out → batch_normed
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_batch);
                 let d_u32 = h as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_o_proj_out), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_o_proj_out), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.post_attn_layernorm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&d_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2222,9 +2440,9 @@ kernel void kv_cache_append_batch(
                 encoder.setComputePipelineState(&self.pipe_vec_add);
                 let n_u32 = (m * h) as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden2), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden2), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                 }
@@ -2238,12 +2456,12 @@ kernel void kv_cache_append_batch(
 
             // 14. Pre-FFN norm: batch_hidden2 → batch_normed
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_batch);
                 let d_u32 = h as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden2), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden2), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.pre_ffn_layernorm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&d_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2260,14 +2478,14 @@ kernel void kv_cache_append_batch(
 
             // 15-16. Gate and Up projections
             if lw.gate_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_normed, &lw.gate_proj, &self.buf_batch_gate, h, inter, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_normed, &lw.gate_proj, &b.buf_gate, h, inter, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_normed, &lw.gate_proj, &self.buf_batch_gate, h, inter, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_normed, &lw.gate_proj, &b.buf_gate, h, inter, m);
             }
             if lw.up_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_normed, &lw.up_proj, &self.buf_batch_up, h, inter, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_normed, &lw.up_proj, &b.buf_up, h, inter, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_normed, &lw.up_proj, &self.buf_batch_up, h, inter, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_normed, &lw.up_proj, &b.buf_up, h, inter, m);
             }
 
             // 17. GELU_tanh on gate (M * inter elements)
@@ -2275,8 +2493,8 @@ kernel void kv_cache_append_batch(
                 encoder.setComputePipelineState(&self.pipe_gelu_tanh);
                 let n_u32 = (m * inter) as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_gate), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_gate_act), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_gate), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_gate_act), 0, 1);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(), 4, 2);
                 }
@@ -2293,9 +2511,9 @@ kernel void kv_cache_append_batch(
                 encoder.setComputePipelineState(&self.pipe_elem_mul);
                 let n_u32 = (m * inter) as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_gate_act), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_up), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_mlp_hidden), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_gate_act), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_up), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_mlp_hidden), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                 }
@@ -2309,19 +2527,19 @@ kernel void kv_cache_append_batch(
 
             // 19. Down projection
             if lw.down_proj_is_bf16 {
-                self.dispatch_gemv_bf16(encoder, &self.buf_batch_mlp_hidden, &lw.down_proj, &self.buf_batch_down_out, inter, h, m);
+                self.dispatch_gemv_bf16_batch(encoder, &b.buf_mlp_hidden, &lw.down_proj, &b.buf_down_out, inter, h, m);
             } else {
-                self.dispatch_gemv_q4k(encoder, &self.buf_batch_mlp_hidden, &lw.down_proj, &self.buf_batch_down_out, inter, h, m);
+                self.dispatch_gemv_q4k_batch(encoder, &b.buf_mlp_hidden, &lw.down_proj, &b.buf_down_out, inter, h, m);
             }
 
             // 20. Post-FFN norm: batch_down_out → batch_normed
             {
-                encoder.setComputePipelineState(&self.pipe_rms_norm_batch);
+                encoder.setComputePipelineState(&b.pipe_rms_norm_batch);
                 let d_u32 = h as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_down_out), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_down_out), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&lw.post_ffn_layernorm_gamma), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&d_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                     encoder.setBytes_length_atIndex(
@@ -2341,9 +2559,9 @@ kernel void kv_cache_append_batch(
                 encoder.setComputePipelineState(&self.pipe_vec_add);
                 let n_u32 = (m * h) as u32;
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden2), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_normed), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&self.buf_batch_hidden), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden2), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_normed), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&b.buf_hidden), 0, 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::new(&n_u32 as *const u32 as *mut c_void).unwrap(), 4, 3);
                 }
@@ -2386,6 +2604,8 @@ kernel void kv_cache_append_batch(
                 "attention_decode",
                 "gemv_q4k_t",
                 "gemv_bf16_t",
+                "gemv_q4k_t_batch",
+                "gemv_bf16_t_batch",
                 "f32_to_f16_convert",
             ];
 

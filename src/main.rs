@@ -151,7 +151,7 @@ impl CliArgs {
             benchmark: false,
             quantize: false,
             debug: false,
-            draft_len: 4,
+            draft_len: 0,
         };
         let mut i = 0;
         while i < args.len() {
@@ -489,6 +489,7 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
         }
         crate::transformer4::release_memory_to_os();
     }
+    crate::transformer4::print_rss("after weight load");
 
     if args.quantize {
         eprintln!("[ Gemma3 ] Quantizing weights to Q4...");
