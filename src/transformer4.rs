@@ -524,6 +524,9 @@ impl Gemma3Model {
             // Norm gamma vectors are tiny (2560 f32 = 10 KB each) — not worth clearing.
         }
         // Free embedding table (262144 × 2560 × 2 = ~1.3 GB BF16)
+        if let Some(ref bf16) = self.embed_bf16 {
+            crate::nn2::mark_embed_pages_reusable(&bf16.data);
+        }
         self.embed_bf16 = None;
         self.embed_tokens.set_data(Mat::zeros(0, 0));
         // Free lm_head (weight-tied, but clear its own references too)
@@ -2171,6 +2174,8 @@ impl Gemma3Model {
 
             ctx
         };
+
+        print_rss("decode loop start");
 
         // ----- Decode loop -----
         let decode_start = std::time::Instant::now();

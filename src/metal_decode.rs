@@ -1111,7 +1111,11 @@ kernel void kv_cache_append_batch(
                 (upload_f32(&device, &w.data), w.rows, true)
             };
 
-            // Free embed + lm_head CPU data now that Metal buffers hold copies
+            // Free embed + lm_head CPU data now that Metal buffers hold copies.
+            // Mark pages reusable BEFORE dropping so macOS reclaims physical memory.
+            if let Some(ref bf16) = model.embed_bf16 {
+                crate::nn2::mark_embed_pages_reusable(&bf16.data);
+            }
             model.embed_bf16 = None;
             model.lm_head.clear_weight_data();
             crate::transformer4::release_memory_to_os();

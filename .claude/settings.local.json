@@ -27,7 +27,8 @@
       "Bash(ollama run gemma3:4b \"What do you think about juventus footbal club?\")",
       "Bash(sort -k5 -rn)",
       "Bash(grep -n \"enum GgufType\\\\|pub enum GgufType\" /Users/francesco/workspace/hw/rich-triplet/src/*.rs)",
-      "Bash(git status -u)"
+      "Bash(git status -u)",
+      "Bash(diffstat)"
     ]
   }
 }

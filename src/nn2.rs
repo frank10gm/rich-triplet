@@ -26,6 +26,40 @@ use crate::autograd2::{Mat, MatBf16, Q4KMat, Q4Mat, TensorNode};
 use crate::nn::InitRng; // reuse the RNG from Phase 2
 
 // =============================================================================
+// Memory management helpers
+// =============================================================================
+
+/// Mark a slice's pages as reusable so macOS can reclaim the physical memory.
+/// Without this, freed MALLOC_LARGE regions stay physically resident.
+#[cfg(target_os = "macos")]
+pub fn mark_pages_reusable<T>(data: &[T]) {
+    const PAGE_SIZE: usize = 16384; // Apple Silicon
+    const MADV_FREE_REUSABLE: i32 = 7;
+    let ptr = data.as_ptr() as usize;
+    let len = data.len() * std::mem::size_of::<T>();
+    // Align to page boundaries (round start up, round end down)
+    let start = (ptr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = (ptr + len) & !(PAGE_SIZE - 1);
+    if end > start {
+        unsafe {
+            unsafe extern "C" {
+                fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            madvise(start as *mut std::ffi::c_void, end - start, MADV_FREE_REUSABLE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mark_pages_reusable<T>(_data: &[T]) {}
+
+/// Mark the embed BF16 table's pages as reusable.
+/// Called from metal_decode before dropping embed_bf16.
+pub fn mark_embed_pages_reusable(data: &[u16]) {
+    mark_pages_reusable(data);
+}
+
+// =============================================================================
 // Trait: Module2
 // =============================================================================
 
@@ -232,8 +266,21 @@ impl Linear2 {
     ///
     /// Call after weights have been uploaded to GPU Metal buffers.
     /// The GPU buffers hold their own copy, so the CPU data is redundant.
+    ///
+    /// On macOS, uses madvise(MADV_FREE_REUSABLE) to tell the kernel to
+    /// reclaim the physical pages immediately.  Without this, freed large
+    /// allocations stay physically resident as MALLOC_LARGE (empty) regions.
     pub fn clear_weight_data(&mut self) {
+        if let Some(ref q4k) = self.q4k_weight {
+            mark_pages_reusable(&q4k.blocks);
+        }
         self.q4k_weight = None;
+        if let Some(ref bf16) = self.bf16_weight {
+            // Only madvise if this is the last Arc reference
+            if std::sync::Arc::strong_count(&bf16.data) == 1 {
+                mark_pages_reusable(&bf16.data);
+            }
+        }
         self.bf16_weight = None;
         self.q4_weight = None;
         self.weight.set_data(Mat::zeros(0, 0));
