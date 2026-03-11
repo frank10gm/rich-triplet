@@ -1234,6 +1234,16 @@ pub fn load_linear_from_gguf(
             let bits = f32s_to_bf16_and_drop(f32s);
             linear.load_bf16(bits, rows, cols);
         }
+        GgufType::Q8_0 => {
+            let f32s = gguf.decode_q8_0_to_f32(idx)?;
+            let bits = f32s_to_bf16_and_drop(f32s);
+            linear.load_bf16(bits, rows, cols);
+        }
+        GgufType::Q5K => {
+            let f32s = gguf.decode_q5k_to_f32(idx)?;
+            let bits = f32s_to_bf16_and_drop(f32s);
+            linear.load_bf16(bits, rows, cols);
+        }
         _ => {
             eprintln!(
                 "[ GGUF ] Warning: unsupported type {:?} for tensor {}, skipping",

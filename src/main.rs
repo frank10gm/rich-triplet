@@ -6,6 +6,8 @@ mod gguf_loader;
 mod metal_ops;
 #[cfg(feature = "metal")]
 mod metal_decode;
+#[cfg(feature = "metal")]
+mod metal_decode_qwen35;
 mod ndarray;
 mod nn;
 mod nn2;

@@ -455,6 +455,136 @@ impl Qwen35DeltaNet {
         self.out_proj.forward(&TensorNode::leaf(out_mat))
     }
 
+    /// Batched prefill: process multiple tokens at once.
+    /// x: [T, hidden] → output: [T, hidden]
+    /// Batches projections as GEMM; loops for recurrent state update.
+    pub fn forward_prefill(&self, x: &TensorNode, state: &mut DeltaNetState) -> TensorNode {
+        let nk = self.num_k_heads;
+        let nv = self.num_v_heads;
+        let kd = self.key_head_dim;
+        let vd = self.value_head_dim;
+        let v_per_k = nv / nk;
+        let key_dim = nk * kd;
+        let value_dim = nv * vd;
+        let t = x.data().rows;
+
+        // 1. Batch projections (GEMM)
+        let qkv_all = self.in_proj_qkv.forward(x); // [T, qkv_dim]
+        let z_all = self.in_proj_z.forward(x);      // [T, value_dim]
+        let a_all = self.in_proj_a.forward(x);      // [T, nv]
+        let b_all = self.in_proj_b.forward(x);      // [T, nv]
+
+        let qkv_d = qkv_all.data();
+        let z_d = z_all.data();
+        let a_d = a_all.data();
+        let b_d = b_all.data();
+
+        // 2-8. Process each token sequentially (conv1d + recurrent)
+        let mut all_gated = vec![0.0f32; t * value_dim];
+
+        for tok in 0..t {
+            let qkv_row = &qkv_d.data[tok * self.qkv_dim..(tok + 1) * self.qkv_dim];
+            let z_row = &z_d.data[tok * value_dim..(tok + 1) * value_dim];
+            let a_row = &a_d.data[tok * nv..(tok + 1) * nv];
+            let b_row = &b_d.data[tok * nv..(tok + 1) * nv];
+
+            // Conv1d + SiLU
+            let qkv_conv = self.apply_conv1d(qkv_row, state);
+
+            // Split QKV
+            let mut q_flat = vec![0.0f32; key_dim];
+            let mut k_flat = vec![0.0f32; key_dim];
+            let mut v_flat = vec![0.0f32; value_dim];
+            q_flat.copy_from_slice(&qkv_conv[0..key_dim]);
+            k_flat.copy_from_slice(&qkv_conv[key_dim..key_dim * 2]);
+            v_flat.copy_from_slice(&qkv_conv[key_dim * 2..key_dim * 2 + value_dim]);
+
+            // Gates
+            let mut beta = vec![0.0f32; nv];
+            let mut g_decay = vec![0.0f32; nv];
+            for h in 0..nv {
+                beta[h] = sigmoid(b_row[h]);
+                g_decay[h] = -self.a_log[h].exp() * softplus(a_row[h] + self.dt_bias[h]);
+            }
+
+            // L2 normalize
+            l2_normalize_heads(&mut q_flat, nk, kd);
+            l2_normalize_heads(&mut k_flat, nk, kd);
+
+            // Repeat-interleave
+            let mut q_exp = vec![0.0f32; nv * kd];
+            let mut k_exp = vec![0.0f32; nv * kd];
+            for g in 0..nk {
+                for vi in 0..v_per_k {
+                    let dst = (g * v_per_k + vi) * kd;
+                    q_exp[dst..dst + kd].copy_from_slice(&q_flat[g * kd..(g + 1) * kd]);
+                    k_exp[dst..dst + kd].copy_from_slice(&k_flat[g * kd..(g + 1) * kd]);
+                }
+            }
+
+            // Scale Q
+            let q_scale = 1.0 / (kd as f32).sqrt();
+            for v in &mut q_exp { *v *= q_scale; }
+
+            // Recurrent state update
+            let mut output = vec![0.0f32; nv * vd];
+            for h in 0..nv {
+                let s = state.head_state_mut(h);
+                let k_h = &k_exp[h * kd..(h + 1) * kd];
+                let v_h = &v_flat[h * vd..(h + 1) * vd];
+                let q_h = &q_exp[h * kd..(h + 1) * kd];
+                let decay = g_decay[h].exp();
+                let beta_h = beta[h];
+
+                for val in s.iter_mut() { *val *= decay; }
+
+                let mut kv_mem = vec![0.0f32; vd];
+                for i in 0..kd {
+                    let k_i = k_h[i];
+                    if k_i != 0.0 {
+                        for j in 0..vd { kv_mem[j] += s[i * vd + j] * k_i; }
+                    }
+                }
+
+                for i in 0..kd {
+                    let k_i = k_h[i];
+                    if k_i != 0.0 {
+                        for j in 0..vd {
+                            s[i * vd + j] += k_i * (v_h[j] - kv_mem[j]) * beta_h;
+                        }
+                    }
+                }
+
+                let out_h = &mut output[h * vd..(h + 1) * vd];
+                for i in 0..kd {
+                    let q_i = q_h[i];
+                    if q_i != 0.0 {
+                        for j in 0..vd { out_h[j] += s[i * vd + j] * q_i; }
+                    }
+                }
+            }
+
+            // Gated RMSNorm per head
+            let eps = 1e-6f32;
+            let dst = &mut all_gated[tok * value_dim..(tok + 1) * value_dim];
+            for h in 0..nv {
+                let out_h = &output[h * vd..(h + 1) * vd];
+                let z_h = &z_row[h * vd..(h + 1) * vd];
+                let mut sum_sq = 0.0f32;
+                for j in 0..vd { sum_sq += out_h[j] * out_h[j]; }
+                let rms = (sum_sq / vd as f32 + eps).sqrt();
+                for j in 0..vd {
+                    let normed = out_h[j] / rms;
+                    dst[h * vd + j] = normed * self.norm_weight[j] * silu(z_h[j]);
+                }
+            }
+        }
+
+        // 9. Batch output projection (GEMM)
+        let gated_tn = TensorNode::leaf(Mat::new(all_gated, t, value_dim));
+        self.out_proj.forward(&gated_tn)
+    }
+
     /// Apply causal conv1d with state update. Returns conv_output after SiLU.
     fn apply_conv1d(&self, input: &[f32], state: &mut DeltaNetState) -> Vec<f32> {
         let dim = self.qkv_dim;
@@ -591,6 +721,125 @@ impl Qwen35FullAttention {
         let out_mat = Mat::new(gated, 1, nq * d);
         self.o_proj.forward(&TensorNode::leaf(out_mat))
     }
+
+    /// Batched prefill: process multiple tokens at once with causal attention.
+    /// x: [T, hidden] → output: [T, hidden]
+    pub fn forward_prefill(&self, x: &TensorNode, cache: &mut FullAttnKvCache) -> TensorNode {
+        let d = self.head_dim;
+        let nq = self.n_q_heads;
+        let nkv = self.n_kv_heads;
+        let groups = nq / nkv;
+        let t = x.data().rows;
+        let start_pos = cache.seq_len;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        // 1. Batch projections (GEMM)
+        let qg_tn = self.q_proj.forward(x);  // [T, nq*d*2]
+        let k_tn = self.k_proj.forward(x);   // [T, nkv*d]
+        let v_tn = self.v_proj.forward(x);   // [T, nkv*d]
+        let qg_d = qg_tn.data();
+        let k_d = k_tn.data();
+        let v_d = v_tn.data();
+
+        // 2. Split Q/gate, normalize, RoPE per token
+        let mut q_all = vec![0.0f32; t * nq * d];
+        let mut gate_all = vec![0.0f32; t * nq * d];
+        let mut k_all = vec![0.0f32; t * nkv * d];
+        let v_all = v_d.data.clone();
+
+        for tok in 0..t {
+            // Split Q and gate
+            let qg_off = tok * nq * d * 2;
+            let q_off = tok * nq * d;
+            for h in 0..nq {
+                for j in 0..d {
+                    q_all[q_off + h * d + j] = qg_d.data[qg_off + h * d * 2 + j];
+                    gate_all[q_off + h * d + j] = qg_d.data[qg_off + h * d * 2 + d + j];
+                }
+            }
+
+            // Per-head RMSNorm Q
+            let q_slice = &mut q_all[q_off..q_off + nq * d];
+            apply_per_head_norm_raw(q_slice, &self.q_norm, nq, d);
+
+            // Per-head RMSNorm K
+            let k_off = tok * nkv * d;
+            k_all[k_off..k_off + nkv * d].copy_from_slice(
+                &k_d.data[k_off..k_off + nkv * d],
+            );
+            let k_slice = &mut k_all[k_off..k_off + nkv * d];
+            apply_per_head_norm_raw(k_slice, &self.k_norm, nkv, d);
+
+            // Partial RoPE
+            let pos = start_pos + tok;
+            apply_partial_rope(
+                &mut q_all[q_off..q_off + nq * d],
+                nq, d, self.rope_dim, self.rope_theta, pos,
+            );
+            apply_partial_rope(
+                &mut k_all[k_off..k_off + nkv * d],
+                nkv, d, self.rope_dim, self.rope_theta, pos,
+            );
+        }
+
+        // 3. Store all K, V in cache
+        for tok in 0..t {
+            let k_off = tok * nkv * d;
+            let k_mat = Mat::new(k_all[k_off..k_off + nkv * d].to_vec(), 1, nkv * d);
+            let v_mat = Mat::new(v_all[tok * nkv * d..(tok + 1) * nkv * d].to_vec(), 1, nkv * d);
+            cache.append(&k_mat, &v_mat);
+        }
+
+        // 4. Causal attention: each query attends to all keys up to its position
+        let mut attn_out = vec![0.0f32; t * nq * d];
+        for h in 0..nq {
+            let kv_h = h / groups;
+            for qi in 0..t {
+                let cache_end = start_pos + qi + 1; // attend to positions 0..=qi+start_pos
+                let mut scores = vec![0.0f32; cache_end];
+
+                // Compute Q @ K^T for all cached keys
+                let q_off = qi * nq * d + h * d;
+                for ki in 0..cache_end {
+                    let k_row = &cache.k.data[ki * nkv * d + kv_h * d..];
+                    let mut dot = 0.0f32;
+                    for j in 0..d {
+                        dot += q_all[q_off + j] * k_row[j];
+                    }
+                    scores[ki] = dot * scale;
+                }
+
+                // Softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    sum_exp += *s;
+                }
+                for s in &mut scores { *s /= sum_exp; }
+
+                // Weighted sum of values
+                let out_off = qi * nq * d + h * d;
+                for ki in 0..cache_end {
+                    let v_row = &cache.v.data[ki * nkv * d + kv_h * d..];
+                    let w = scores[ki];
+                    for j in 0..d {
+                        attn_out[out_off + j] += w * v_row[j];
+                    }
+                }
+            }
+        }
+
+        // 5. Apply output gate: attn_out * sigmoid(gate)
+        let mut gated = vec![0.0f32; t * nq * d];
+        for i in 0..t * nq * d {
+            gated[i] = attn_out[i] * sigmoid(gate_all[i]);
+        }
+
+        // 6. Batch output projection (GEMM)
+        let out_mat = Mat::new(gated, t, nq * d);
+        self.o_proj.forward(&TensorNode::leaf(out_mat))
+    }
 }
 
 // ============================================================================
@@ -668,6 +917,25 @@ impl Qwen35Block {
         let x2 = x.add(&attn);
 
         // Pre-norm → MLP → residual
+        let normed2 = self.post_attention_layernorm.forward_gemma3(&x2);
+        let mlp_out = self.mlp.forward(&normed2);
+        x2.add(&mlp_out)
+    }
+
+    /// Batched prefill: x [T, hidden] → [T, hidden]
+    pub fn forward_prefill(&self, x: &TensorNode, cache: &mut LayerCache) -> TensorNode {
+        let normed = self.input_layernorm.forward_gemma3(x);
+        let attn = match (&self.token_mixer, cache) {
+            (TokenMixer::DeltaNet(dn), LayerCache::DeltaNet(state)) => {
+                dn.forward_prefill(&normed, state)
+            }
+            (TokenMixer::FullAttn(fa), LayerCache::FullAttn(kv)) => {
+                fa.forward_prefill(&normed, kv)
+            }
+            _ => panic!("Layer/cache type mismatch"),
+        };
+        let x2 = x.add(&attn);
+
         let normed2 = self.post_attention_layernorm.forward_gemma3(&x2);
         let mlp_out = self.mlp.forward(&normed2);
         x2.add(&mlp_out)
@@ -754,100 +1022,146 @@ impl Qwen35Model {
         // Track seq position for full attention layers
         let mut _seq_pos = 0usize;
 
-        // ----- Prefill: process prompt tokens one by one -----
+        // ----- Prefill: batched (all prompt tokens at once) -----
         let prefill_start = std::time::Instant::now();
 
-        for (t, &tok) in token_ids.iter().enumerate() {
-            let x_data = self.embed_token(tok);
-            let is_last = t == token_ids.len() - 1;
-            if is_last && debug {
-                let rms: f32 = (x_data.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
-                eprintln!("[ Qwen3.5-dbg ] embed rms={:.4} first5={:.4?}", rms, &x_data[..5]);
+        // Embed all tokens into [T, h] matrix
+        let t_len = token_ids.len();
+        let mut embed_data = Vec::with_capacity(t_len * h);
+        for &tok in token_ids {
+            embed_data.extend_from_slice(&self.embed_token(tok));
+        }
+        let mut x = TensorNode::leaf(Mat::new(embed_data, t_len, h));
+
+        if debug {
+            let xd = x.data();
+            let last_row: Vec<f32> = (0..h).map(|c| xd.at(t_len - 1, c)).collect();
+            let rms: f32 = (last_row.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+            eprintln!("[ Qwen3.5-dbg ] embed rms={:.4} first5={:.4?}", rms, &last_row[..5]);
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_prefill(&x, &mut cache.layers[i].borrow_mut());
+            if debug && (i < 3 || i == self.layers.len() - 1) {
+                let xd = x.data();
+                let last_row: Vec<f32> = (0..h).map(|c| xd.at(t_len - 1, c)).collect();
+                let rms: f32 = (last_row.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+                let kind = if self.config.is_full_attention_layer(i) { "full" } else { "delta" };
+                eprintln!("[ Qwen3.5-dbg ] layer {} ({}) h_rms={:.4}", i, kind, rms);
             }
-            let mut x = TensorNode::leaf(Mat::new(x_data, 1, h));
+        }
 
-            for (i, layer) in self.layers.iter().enumerate() {
-                x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
-                if is_last && debug && (i < 3 || i == self.layers.len() - 1) {
-                    let xd = x.data();
-                    let rms: f32 = (xd.data.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
-                    let kind = if self.config.is_full_attention_layer(i) { "full" } else { "delta" };
-                    eprintln!("[ Qwen3.5-dbg ] layer {} ({}) h_rms={:.4}", i, kind, rms);
-                }
+        // Extract last row [1, h] for logits
+        {
+            let xd = x.data();
+            let last_row: Vec<f32> = (0..h).map(|c| xd.at(t_len - 1, c)).collect();
+            let x_last = TensorNode::leaf(Mat::new(last_row, 1, h));
+            let normed = self.norm.forward_gemma3(&x_last);
+            let logits_node = self.lm_head.forward(&normed);
+            let logits = logits_node.data().clone();
+
+            let prefill_ms = prefill_start.elapsed().as_millis();
+            let prefill_tps = token_ids.len() as f64 / prefill_start.elapsed().as_secs_f64();
+            eprintln!(
+                "[ Qwen3.5 ] Prefill: {} tokens in {:.0} ms ({:.1} tok/s)",
+                token_ids.len(), prefill_ms, prefill_tps
+            );
+
+            if debug {
+                let lv = &logits.data;
+                let mut indexed: Vec<(usize, f32)> =
+                    lv.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
+                eprintln!("[ Qwen3.5-dbg ] prefill top-5: {:?}", top5);
             }
 
-            // Only compute logits for the last prompt token
-            if is_last {
-                let normed = self.norm.forward_gemma3(&x);
-                let logits_node = self.lm_head.forward(&normed);
-                let logits = logits_node.data().clone();
+            let first = crate::transformer4::sample_token(
+                &logits, 0, &params, &seen, &mut rng,
+            );
+            callback(first);
+            seen.push(first);
+            if first == self.config.eos_token_id || first == 248046 {
+                return;
+            }
 
-                let prefill_ms = prefill_start.elapsed().as_millis();
-                let prefill_tps = token_ids.len() as f64 / prefill_start.elapsed().as_secs_f64();
-                eprintln!(
-                    "[ Qwen3.5 ] Prefill: {} tokens in {:.0} ms ({:.1} tok/s)",
-                    token_ids.len(), prefill_ms, prefill_tps
-                );
+            // ── Metal GPU decode path ──
+            #[cfg(feature = "metal")]
+            let use_metal = true;
+            #[cfg(not(feature = "metal"))]
+            let use_metal = false;
 
-                if debug {
-                    let lv = &logits.data;
-                    let mut indexed: Vec<(usize, f32)> =
-                        lv.iter().cloned().enumerate().collect();
-                    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
-                    eprintln!("[ Qwen3.5-dbg ] prefill top-5: {:?}", top5);
-                }
+            #[cfg(feature = "metal")]
+            let metal_ctx = {
+                let ctx = crate::metal_decode_qwen35::inner::MetalDecodeContextQwen35::new(self);
+                ctx.print_memory_stats();
+                // Warmup to trigger shader JIT
+                let t_warmup = std::time::Instant::now();
+                let _ = ctx.decode_step(0, 0);
+                eprintln!("[ Qwen3.5-Metal ] GPU warmup in {:.0} ms", t_warmup.elapsed().as_millis());
+                // Sync state from CPU prefill
+                ctx.sync_state_from_cpu(&cache);
+                ctx
+            };
 
-                let first = crate::transformer4::sample_token(
-                    &logits, 0, &params, &seen, &mut rng,
-                );
-                callback(first);
-                seen.push(first);
-                if first == self.config.eos_token_id || first == 248046 {
-                    // Stop at <|endoftext|>, <|im_end|>, or </think>
-                    return;
-                }
+            let decode_start = std::time::Instant::now();
+            let mut prev = first;
+            let mut n_decoded = 1usize;
+            let mut metal_seq_len = token_ids.len();
 
-                // ----- Decode loop -----
-                let decode_start = std::time::Instant::now();
-                let mut prev = first;
-                let mut n_decoded = 1usize;
-
-                for _ in 1..max_new {
+            for _ in 1..max_new {
+                #[cfg(feature = "metal")]
+                let logits = if use_metal {
+                    let logits_vec = metal_ctx.decode_step(prev, metal_seq_len);
+                    metal_seq_len += 1;
+                    Mat::new(logits_vec.clone(), 1, logits_vec.len())
+                } else {
                     let x_data = self.embed_token(prev);
                     let mut x = TensorNode::leaf(Mat::new(x_data, 1, h));
-
                     for (i, layer) in self.layers.iter().enumerate() {
                         x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
                     }
-
                     let normed = self.norm.forward_gemma3(&x);
                     let logits_node = self.lm_head.forward(&normed);
-                    let logits = logits_node.data().clone();
+                    logits_node.data().clone()
+                };
 
-                    prev = crate::transformer4::sample_token(
-                        &logits, 0, &params, &seen, &mut rng,
-                    );
-                    callback(prev);
-                    seen.push(prev);
-                    n_decoded += 1;
-
-                    if prev == self.config.eos_token_id || prev == 248046 {
-                        break;
+                #[cfg(not(feature = "metal"))]
+                let logits = {
+                    let x_data = self.embed_token(prev);
+                    let mut x = TensorNode::leaf(Mat::new(x_data, 1, h));
+                    for (i, layer) in self.layers.iter().enumerate() {
+                        x = layer.forward_cached(&x, &mut cache.layers[i].borrow_mut());
                     }
-                }
+                    let normed = self.norm.forward_gemma3(&x);
+                    let logits_node = self.lm_head.forward(&normed);
+                    logits_node.data().clone()
+                };
 
-                let decode_elapsed = decode_start.elapsed();
-                let decode_tps = n_decoded as f64 / decode_elapsed.as_secs_f64();
-                let ms_per_tok = decode_elapsed.as_millis() as f64 / n_decoded as f64;
-                eprintln!(
-                    "[ Qwen3.5 ] Decode: {} tokens in {:.0} ms ({:.1} tok/s, {:.0} ms/tok)",
-                    n_decoded,
-                    decode_elapsed.as_millis(),
-                    decode_tps,
-                    ms_per_tok
+                prev = crate::transformer4::sample_token(
+                    &logits, 0, &params, &seen, &mut rng,
                 );
+                callback(prev);
+                seen.push(prev);
+                n_decoded += 1;
+
+                if prev == self.config.eos_token_id || prev == 248046 {
+                    break;
+                }
             }
+
+            let decode_elapsed = decode_start.elapsed();
+            let decode_tps = n_decoded as f64 / decode_elapsed.as_secs_f64();
+            let ms_per_tok = decode_elapsed.as_millis() as f64 / n_decoded as f64;
+            let backend = if use_metal { "Metal" } else { "CPU" };
+            eprintln!(
+                "[ Qwen3.5 ] Decode ({}): {} tokens in {:.0} ms ({:.1} tok/s, {:.0} ms/tok)",
+                backend,
+                n_decoded,
+                decode_elapsed.as_millis(),
+                decode_tps,
+                ms_per_tok
+            );
         }
     }
 
@@ -884,14 +1198,16 @@ impl Qwen35Model {
         let mut loaded = 0usize;
         let mut lm_head_explicitly_loaded = false;
 
-        // Helper: load tensor as f32 vec (handles F32/F16)
+        // Helper: load tensor as f32 vec (handles F32/F16/Q8_0)
         let load_f32 = |gguf: &GgufFile, idx: usize| -> std::io::Result<Vec<f32>> {
             match gguf.tensor_info[idx].gguf_type {
                 GgufType::F32 => gguf.decode_f32(idx),
                 GgufType::F16 => gguf.decode_f16_to_f32(idx),
+                GgufType::Q8_0 => gguf.decode_q8_0_to_f32(idx),
+                GgufType::Q6K => gguf.decode_q6k_to_f32(idx),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    format!("expected f32/f16 for {}", gguf.tensor_info[idx].name),
+                    format!("expected f32/f16/q8_0 for {}", gguf.tensor_info[idx].name),
                 )),
             }
         };
@@ -967,7 +1283,7 @@ impl Qwen35Model {
                             layer.input_layernorm.gamma.set_data(Mat::new(adj, 1, n));
                             loaded += 1;
                         }
-                        "ffn_norm.weight" => {
+                        "ffn_norm.weight" | "post_attention_norm.weight" => {
                             let f32s = load_f32(&gguf, idx)?;
                             let n = f32s.len();
                             let adj: Vec<f32> = f32s.iter().map(|&v| v - 1.0).collect();
@@ -1034,13 +1350,13 @@ impl Qwen35Model {
                         }
 
                         // ---- DeltaNet layer weights ----
-                        "ssm_in.weight" => {
+                        "ssm_in.weight" | "attn_qkv.weight" => {
                             if let TokenMixer::DeltaNet(ref mut dn) = layer.token_mixer {
                                 crate::transformer4::load_linear_from_gguf(&gguf, idx, &mut dn.in_proj_qkv)?;
                             }
                             loaded += 1;
                         }
-                        "ssm_gate.weight" => {
+                        "ssm_gate.weight" | "attn_gate.weight" => {
                             if let TokenMixer::DeltaNet(ref mut dn) = layer.token_mixer {
                                 crate::transformer4::load_linear_from_gguf(&gguf, idx, &mut dn.in_proj_z)?;
                             }
@@ -1064,7 +1380,7 @@ impl Qwen35Model {
                             }
                             loaded += 1;
                         }
-                        "ssm_a.weight" => {
+                        "ssm_a.weight" | "ssm_a" => {
                             if let TokenMixer::DeltaNet(ref mut dn) = layer.token_mixer {
                                 let f32s = load_f32(&gguf, idx)?;
                                 dn.a_log = f32s;
@@ -1081,8 +1397,9 @@ impl Qwen35Model {
                         "ssm_norm.weight" => {
                             if let TokenMixer::DeltaNet(ref mut dn) = layer.token_mixer {
                                 let f32s = load_f32(&gguf, idx)?;
-                                // Zero-centered: subtract 1 for (1+gamma) variant
-                                dn.norm_weight = f32s.iter().map(|&v| v - 1.0).collect();
+                                // Gated RMSNorm uses weight directly (init=1.0), NOT (1+gamma).
+                                // GGUF should store raw HF values (≈1.0). No adjustment.
+                                dn.norm_weight = f32s;
                             }
                             loaded += 1;
                         }

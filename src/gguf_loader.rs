@@ -117,6 +117,7 @@ impl GgufType {
             Self::Q4_0 => Some((18, 32)),  // 2 bytes f16 scale + 16 bytes nibbles
             Self::Q8_0 => Some((34, 32)),  // 4 bytes f32 scale + 32 bytes i8
             Self::Q4K  => Some((144, 256)), // Q4_K super-block
+            Self::Q5K  => Some((176, 256)), // Q5_K super-block
             Self::Q6K  => Some((210, 256)), // Q6_K super-block
             _          => None,
         }
@@ -607,6 +608,121 @@ impl GgufFile {
                 for l in 0..32usize {
                     if base + elem < end {
                         out[base + elem] = scale2 * (qs[q_off + l] >> 4) as f32 - min2;
+                    }
+                    elem += 1;
+                }
+
+                q_off += 32;
+                is    += 2;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Decode a Q8_0 tensor into a flat Vec<f32>.
+    ///
+    /// ## Q8_0 block layout (34 bytes per 32 elements):
+    ///   d      — fp16 scale (bytes 0–1)
+    ///   qs[32] — int8 quants (bytes 2–33)
+    pub fn decode_q8_0_to_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q8_0,
+            "decode_q8_0_to_f32 called on non-Q8_0 tensor");
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem = info.n_elements();
+        let n_blocks = (n_elem + 31) / 32;
+        let mut out = vec![0.0f32; n_elem];
+
+        for b in 0..n_blocks {
+            let block_off = b * 34;
+            let d_bits = u16::from_le_bytes([bytes[block_off], bytes[block_off + 1]]);
+            let d = f16_to_f32(d_bits);
+
+            let base = b * 32;
+            let end = (base + 32).min(n_elem);
+            for i in 0..32 {
+                if base + i < end {
+                    let q = bytes[block_off + 2 + i] as i8;
+                    out[base + i] = d * q as f32;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Decode a Q5_K tensor into a flat Vec<f32>.
+    ///
+    /// ## Q5_K block layout (176 bytes per 256 elements):
+    ///   d          — fp16 super-block scale (bytes 0–1)
+    ///   dmin       — fp16 super-block min scale (bytes 2–3)
+    ///   scales[12] — packed 6-bit scales/mins (bytes 4–15)
+    ///   qh[32]     — high bits of 5-bit quants (bytes 16–47)
+    ///   qs[128]    — low 4 bits of quants (bytes 48–175)
+    pub fn decode_q5k_to_f32(&self, idx: usize) -> io::Result<Vec<f32>> {
+        let info = &self.tensor_info[idx];
+        assert_eq!(info.gguf_type, GgufType::Q5K,
+            "decode_q5k_to_f32 called on non-Q5K tensor");
+
+        let bytes = self.read_tensor_bytes(idx)?;
+        let n_elem = info.n_elements();
+        let n_blocks = (n_elem + 255) / 256;
+        let mut out = vec![0.0f32; n_elem];
+
+        let get_scale_min = |sc: &[u8], j: usize| -> (f32, f32) {
+            let (sc_val, min_val) = if j < 4 {
+                (sc[j] & 0x3F, sc[j + 4] & 0x3F)
+            } else {
+                (
+                    (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4),
+                    (sc[j + 4] >> 4)   | ((sc[j + 0] >> 6) << 4),
+                )
+            };
+            (sc_val as f32, min_val as f32)
+        };
+
+        for b in 0..n_blocks {
+            let block_off = b * 176;
+            let d_bits    = u16::from_le_bytes([bytes[block_off],     bytes[block_off + 1]]);
+            let dmin_bits = u16::from_le_bytes([bytes[block_off + 2], bytes[block_off + 3]]);
+            let d    = f16_to_f32(d_bits);
+            let dmin = f16_to_f32(dmin_bits);
+            let sc   = &bytes[block_off + 4..block_off + 16];
+            let qh   = &bytes[block_off + 16..block_off + 48];
+            let qs   = &bytes[block_off + 48..block_off + 176];
+
+            let base = b * 256;
+            let end  = (base + 256).min(n_elem);
+
+            let mut q_off = 0usize;
+            let mut is    = 0usize;
+            let mut elem  = 0usize;
+
+            for _chunk in 0..4 {
+                let (d1, m1) = get_scale_min(sc, is);
+                let (d2, m2) = get_scale_min(sc, is + 1);
+                let scale1 = d * d1;
+                let min1   = dmin * m1;
+                let scale2 = d * d2;
+                let min2   = dmin * m2;
+
+                // First 32 elements: low nibbles + high bit
+                for l in 0..32usize {
+                    if base + elem < end {
+                        let lo = (qs[q_off + l] & 0x0F) as u32;
+                        let hi = ((qh[l] >> is) & 1) as u32;
+                        out[base + elem] = scale1 * (lo | (hi << 4)) as f32 - min1;
+                    }
+                    elem += 1;
+                }
+                // Next 32 elements: high nibbles + high bit
+                for l in 0..32usize {
+                    if base + elem < end {
+                        let lo = (qs[q_off + l] >> 4) as u32;
+                        let hi = ((qh[l] >> (is + 1)) & 1) as u32;
+                        out[base + elem] = scale2 * (lo | (hi << 4)) as f32 - min2;
                     }
                     elem += 1;
                 }
