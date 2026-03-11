@@ -28,7 +28,10 @@
       "Bash(sort -k5 -rn)",
       "Bash(grep -n \"enum GgufType\\\\|pub enum GgufType\" /Users/francesco/workspace/hw/rich-triplet/src/*.rs)",
       "Bash(git status -u)",
-      "Bash(diffstat)"
+      "Bash(diffstat)",
+      "WebSearch",
+      "Read(//private/tmp/**)",
+      "Bash(gh api repos/ggml-org/llama.cpp/contents/gguf-py/gguf/tensor_mapping.py --jq '.download_url')"
     ]
   }
 }

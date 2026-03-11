@@ -1080,7 +1080,7 @@ impl Gemma3Model {
 /// position floor(i/2), which was already read at step floor(i/2) < i.
 /// The resulting Vec<u16> reuses the original allocation (alignment 4 >= 2);
 /// macOS malloc/free does not require matching alignment on dealloc.
-fn f32s_to_bf16_and_drop(f32s: Vec<f32>) -> Vec<u16> {
+pub fn f32s_to_bf16_and_drop(f32s: Vec<f32>) -> Vec<u16> {
     use crate::autograd2::MatBf16;
     let n = f32s.len();
     let mut raw = std::mem::ManuallyDrop::new(f32s);
@@ -1148,8 +1148,32 @@ fn model_set_embed_bf16(model: &mut Gemma3Model, bits: Vec<u16>, vocab: usize, h
     model.lm_head.load_bf16_arc(arc, vocab, hidden);
 }
 
+/// Generic embed setup for non-Gemma models (used by Qwen3.5).
+/// Sets embed_bf16 and optionally ties lm_head to embed.
+pub fn model_set_embed_bf16_raw(
+    embed_tokens: &mut TensorNode,
+    embed_bf16: &mut Option<crate::autograd2::MatBf16>,
+    lm_head: &mut crate::nn2::Linear2,
+    bits: Vec<u16>,
+    vocab: usize,
+    hidden: usize,
+    tie_weights: bool,
+) {
+    use crate::autograd2::MatBf16;
+    let arc = std::sync::Arc::new(bits);
+    *embed_bf16 = Some(MatBf16 {
+        data: arc.clone(),
+        rows: vocab,
+        cols: hidden,
+    });
+    embed_tokens.set_data(crate::autograd2::Mat::zeros(0, 0));
+    if tie_weights {
+        lm_head.load_bf16_arc(arc, vocab, hidden);
+    }
+}
+
 /// Load a Linear2 weight from a GGUF tensor, supporting Q4_0, BF16, F16, F32.
-fn load_linear_from_gguf(
+pub fn load_linear_from_gguf(
     gguf: &crate::gguf_loader::GgufFile,
     idx: usize,
     linear: &mut crate::nn2::Linear2,
@@ -2937,16 +2961,16 @@ fn scale_tensor(x: &TensorNode, factor: f32) -> TensorNode {
 // Minimal LCG RNG (copied from transformer3 pattern)
 // ============================================================================
 
-struct LcgRng {
+pub struct LcgRng {
     state: u64,
 }
 impl LcgRng {
-    fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         LcgRng {
             state: seed.wrapping_add(1),
         }
     }
-    fn next_f32(&mut self) -> f32 {
+    pub fn next_f32(&mut self) -> f32 {
         self.state = self
             .state
             .wrapping_mul(6364136223846793005)
@@ -2955,7 +2979,7 @@ impl LcgRng {
     }
 }
 
-fn sample_token(
+pub fn sample_token(
     logits: &Mat,
     row: usize,
     params: &crate::transformer3::SamplingParams,

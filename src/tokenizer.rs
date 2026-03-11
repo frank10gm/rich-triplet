@@ -1759,6 +1759,9 @@ pub struct HfBpeTokenizer {
     /// merge_rank[pair] = priority (lower = applied first)
     merge_rank: HashMap<(String, String), usize>,
     unk_id: u32,
+    /// If true, use GPT-2 byte-level encoding (Qwen, GPT-2 style)
+    /// If false, use SentencePiece ▁ encoding (Gemma style)
+    byte_level: bool,
 }
 
 impl HfBpeTokenizer {
@@ -1798,7 +1801,10 @@ impl HfBpeTokenizer {
 
         let unk_id = vocab_map.get("<unk>").copied().unwrap_or(0);
 
-        Ok(HfBpeTokenizer { id_to_token, token_to_id: vocab_map, merge_rank, unk_id })
+        // Detect ByteLevel pre-tokenizer from the JSON
+        let byte_level = s.contains("\"ByteLevel\"");
+
+        Ok(HfBpeTokenizer { id_to_token, token_to_id: vocab_map, merge_rank, unk_id, byte_level })
     }
 
     /// Parse the "model"."vocab" object: returns token→id map.
@@ -1985,6 +1991,148 @@ impl HfBpeTokenizer {
         Ok((out, i))
     }
 
+    /// GPT-2 byte-level encode: pre-tokenize → byte-to-unicode → BPE per word
+    fn encode_byte_level(&self, text: &str) -> Vec<u32> {
+        let b2u = gpt2_bytes_to_unicode();
+        let words = Self::gpt2_pretokenize(text);
+        let mut ids = Vec::new();
+        for word in &words {
+            // Convert each byte to GPT-2 unicode char
+            let unicode_word: String = word.bytes().map(|b| b2u[b as usize]).collect();
+            ids.extend(self.bpe_encode_word(&unicode_word));
+        }
+        ids
+    }
+
+    /// GPT-2 byte-level decode: token strings → bytes → UTF-8
+    fn decode_byte_level(&self, ids: &[u32]) -> String {
+        let b2u = gpt2_bytes_to_unicode();
+        // Build inverse: char → byte
+        let mut u2b: HashMap<char, u8> = HashMap::new();
+        for (b, &c) in b2u.iter().enumerate() {
+            u2b.insert(c, b as u8);
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        for &id in ids {
+            if let Some(tok) = self.id_to_token.get(id as usize) {
+                for c in tok.chars() {
+                    if let Some(&b) = u2b.get(&c) {
+                        bytes.push(b);
+                    }
+                    // Special tokens (like <|im_start|>) have chars not in the map — skip
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Simple GPT-2-style pre-tokenizer (splits text into words for BPE).
+    /// Handles: letter sequences with optional leading space/punct, digits,
+    /// punctuation, whitespace. No regex crate needed.
+    fn gpt2_pretokenize(text: &str) -> Vec<&str> {
+        let mut words: Vec<&str> = Vec::new();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let (byte_start, ch) = chars[i];
+
+            // Case 1: Contractions ('s, 't, 're, 've, 'm, 'll, 'd)
+            if ch == '\'' && i + 1 < chars.len() {
+                let next_lower = chars[i + 1].1.to_ascii_lowercase();
+                // Single-char contractions
+                if matches!(next_lower, 's' | 't' | 'd' | 'm') {
+                    let byte_end = if i + 2 < chars.len() { chars[i + 2].0 } else { text.len() };
+                    words.push(&text[byte_start..byte_end]);
+                    i += 2;
+                    continue;
+                }
+                // Two-char contractions
+                if i + 2 < chars.len() {
+                    let c2 = chars[i + 2].1.to_ascii_lowercase();
+                    let pair = (next_lower, c2);
+                    if matches!(pair, ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+                        let byte_end = if i + 3 < chars.len() { chars[i + 3].0 } else { text.len() };
+                        words.push(&text[byte_start..byte_end]);
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+
+            // Case 2: Optional non-letter-digit char + letter sequence
+            if ch.is_alphabetic() || ch == '_' {
+                // Just letters
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].1.is_alphabetic() || chars[j].1 == '_') { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i = j;
+                continue;
+            }
+            // Non-letter-digit followed by letters: group them (e.g., " is" → one word)
+            if !ch.is_alphanumeric() && ch != '\r' && ch != '\n'
+                && i + 1 < chars.len() && chars[i + 1].1.is_alphabetic()
+            {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].1.is_alphabetic() || chars[j].1 == '_') { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i = j;
+                continue;
+            }
+
+            // Case 3: Single digit
+            if ch.is_ascii_digit() {
+                let byte_end = if i + 1 < chars.len() { chars[i + 1].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i += 1;
+                continue;
+            }
+
+            // Case 4: Newlines
+            if ch == '\r' || ch == '\n' {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].1 == '\r' || chars[j].1 == '\n') { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i = j;
+                continue;
+            }
+
+            // Case 5: Whitespace run (not newlines)
+            if ch.is_whitespace() {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].1.is_whitespace()
+                    && chars[j].1 != '\r' && chars[j].1 != '\n' { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i = j;
+                continue;
+            }
+
+            // Case 6: Optional leading space + punctuation/symbols
+            if ch == ' ' && i + 1 < chars.len() && !chars[i + 1].1.is_alphanumeric()
+                && !chars[i + 1].1.is_whitespace()
+            {
+                let mut j = i + 1;
+                while j < chars.len() && !chars[j].1.is_alphanumeric()
+                    && !chars[j].1.is_whitespace() { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
+                words.push(&text[byte_start..byte_end]);
+                i = j;
+                continue;
+            }
+
+            // Case 7: Single character (punctuation, symbol, etc.)
+            let byte_end = if i + 1 < chars.len() { chars[i + 1].0 } else { text.len() };
+            words.push(&text[byte_start..byte_end]);
+            i += 1;
+        }
+
+        words
+    }
+
     /// Encode a single pre-tokenized word (already has ▁ prefix) using BPE.
     fn bpe_encode_word(&self, word: &str) -> Vec<u32> {
         if word.is_empty() { return Vec::new(); }
@@ -2043,8 +2191,11 @@ impl Tokenizer for HfBpeTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() { return Vec::new(); }
 
-        // Normalize: replace spaces with ▁ (do NOT prepend ▁ to the start —
-        // the Gemma tokenizer only adds ▁ where spaces appear in the source).
+        if self.byte_level {
+            return self.encode_byte_level(text);
+        }
+
+        // SentencePiece style: replace spaces with ▁
         let normalized = text.replace(' ', "\u{2581}");
 
         // Split into words at ▁ boundaries (keep ▁ as prefix of each word)
@@ -2068,6 +2219,9 @@ impl Tokenizer for HfBpeTokenizer {
     }
 
     fn decode(&self, ids: &[u32]) -> String {
+        if self.byte_level {
+            return self.decode_byte_level(ids);
+        }
         let mut out = String::new();
         for &id in ids {
             let tok = if (id as usize) < self.id_to_token.len() {

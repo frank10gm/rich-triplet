@@ -17,6 +17,7 @@ mod transformer;
 mod transformer2;
 mod transformer3;
 mod transformer4;
+mod transformer_qwen35;
 
 use autograd2::restore_checkpoint;
 use dataset::TextDataset;
@@ -317,7 +318,7 @@ fn print_help() {
     println!(
         "  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is separate)"
     );
-    println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b");
+    println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-4b | qwen35-9b");
     println!("  --max-new N              Tokens to generate          [default: 200]");
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
     println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
@@ -545,6 +546,126 @@ fn run_gemma3(args: &CliArgs, prompt: &str) {
 }
 
 // =============================================================================
+// Generation mode — Qwen 3.5 with loaded weights
+// =============================================================================
+
+fn run_qwen35(args: &CliArgs, prompt: &str) {
+    use std::io::Write;
+    use tokenizer::HfBpeTokenizer;
+    use transformer_qwen35::{ConfigQwen35, Qwen35Model};
+
+    let weights_path = args.weights.as_deref().unwrap();
+    let model_name = args.model.as_deref().unwrap_or("qwen35-4b");
+
+    let is_gguf = weights_path.ends_with(".gguf")
+        || (std::fs::metadata(weights_path).map(|m| m.is_file()).unwrap_or(false)
+            && {
+                std::fs::File::open(weights_path).ok().and_then(|mut f| {
+                    use std::io::Read;
+                    let mut magic = [0u8; 4];
+                    f.read_exact(&mut magic).ok().map(|_| magic == *b"GGUF")
+                }).unwrap_or(false)
+            });
+
+    let weights_dir = if is_gguf {
+        std::path::Path::new(weights_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string())
+    } else {
+        weights_path.trim_end_matches('/').to_string()
+    };
+
+    let tok_dir = args
+        .tokenizer_dir
+        .as_deref()
+        .unwrap_or(&weights_dir)
+        .trim_end_matches('/');
+
+    let tok_json_path = format!("{}/tokenizer.json", tok_dir);
+    eprintln!("[ Qwen3.5 ] Loading tokenizer from {}...", tok_json_path);
+    let tok = HfBpeTokenizer::from_json_file(&tok_json_path).unwrap_or_else(|e| {
+        eprintln!("Error: failed to load tokenizer from {}: {}", tok_json_path, e);
+        if is_gguf && args.tokenizer_dir.is_none() {
+            eprintln!("Hint: GGUF files do not include a tokenizer.");
+            eprintln!("      Pass --tokenizer-dir pointing to your HF directory.");
+        }
+        std::process::exit(1);
+    });
+    eprintln!("[ Qwen3.5 ] Vocab size: {}", tok.vocab_size());
+
+    let config = match model_name {
+        "qwen35-9b" => ConfigQwen35::qwen35_9b(),
+        "qwen35-0.8b" | "qwen35-0_8b" => ConfigQwen35::qwen35_0_8b(),
+        _ => ConfigQwen35::qwen35_4b(),
+    };
+    eprintln!(
+        "[ Qwen3.5 ] Building {} model ({} layers, hidden={})...",
+        model_name, config.num_hidden_layers, config.hidden_size
+    );
+
+    let mut model = Qwen35Model::new_for_inference(config);
+
+    if is_gguf {
+        eprintln!("[ Qwen3.5 ] Loading weights from GGUF: {}...", weights_path);
+        model.load_weights_from_gguf(weights_path).expect("failed to load GGUF weights");
+        crate::transformer4::release_memory_to_os();
+    } else {
+        eprintln!("[ Qwen3.5 ] Loading weights from {}...", weights_path);
+        model.load_weights_from_dir(weights_path).expect("failed to load safetensors weights");
+        crate::transformer4::release_memory_to_os();
+    }
+    crate::transformer4::print_rss("after weight load");
+
+    // Qwen3.5 chat template (ChatML):
+    //   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    // Special token IDs:
+    //   <|im_start|> = 248045, <|im_end|> = 248046, <|endoftext|> = 248044
+    let im_start: usize = 248045;
+    let im_end: usize = 248046;
+    let newline: usize = 198; // \n
+    let mut token_ids: Vec<usize> = vec![im_start];
+    token_ids.extend(tok.encode("user").iter().map(|&id| id as usize));
+    token_ids.push(newline);
+    token_ids.extend(tok.encode(prompt).iter().map(|&id| id as usize));
+    token_ids.push(im_end);
+    token_ids.push(newline);
+    token_ids.push(im_start);
+    token_ids.extend(tok.encode("assistant").iter().map(|&id| id as usize));
+    token_ids.push(newline);
+
+    if token_ids.is_empty() {
+        eprintln!("Error: prompt encodes to zero tokens");
+        std::process::exit(1);
+    }
+
+    for (i, &tid) in token_ids.iter().enumerate() {
+        let text = tok.decode(&[tid as u32]);
+        eprintln!("  [{}] id={} text={:?}", i, tid, text);
+    }
+
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+
+    model.generate_cached_streaming(
+        &token_ids,
+        args.max_new,
+        args.temperature,
+        args.top_k,
+        args.top_p,
+        args.rep_penalty,
+        args.seed,
+        args.debug,
+        |tok_id| {
+            let text = tok.decode(&[tok_id as u32]);
+            print!("{}", text);
+            std::io::stdout().flush().ok();
+        },
+    );
+    println!();
+}
+
+// =============================================================================
 // Generation mode — trained Gpt2 on built-in corpus
 // =============================================================================
 
@@ -648,16 +769,22 @@ fn main() {
     // Generation mode
     // -------------------------------------------------------------------------
     if let Some(ref prompt) = args.prompt.clone() {
+        let is_qwen35 = args
+            .model
+            .as_deref()
+            .map_or(false, |m| m.starts_with("qwen35"));
         let is_gemma3 = args.tokenizer_model.is_some()
             || args
                 .model
                 .as_deref()
                 .map_or(false, |m| m.starts_with("gemma3"))
-            || args
+            || (!is_qwen35 && args
                 .weights
                 .as_deref()
-                .map_or(false, |w| w.ends_with(".gguf"));
-        if is_gemma3 {
+                .map_or(false, |w| w.ends_with(".gguf")));
+        if is_qwen35 {
+            run_qwen35(&args, prompt);
+        } else if is_gemma3 {
             run_gemma3(&args, prompt);
         } else if args.weights.is_some() {
             run_gpt_oss(&args, prompt);
