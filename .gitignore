@@ -6,3 +6,5 @@ thumbs.db
 
 /target
 /models
+
+*.wav
