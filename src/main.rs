@@ -1,25 +1,48 @@
 mod autograd;
 mod autograd2;
+mod clip_text;
+mod conv1d;
+mod conv2d;
 mod dataset;
+mod duration;
+mod flux;
 mod gguf_loader;
+mod hubert;
 #[cfg(feature = "metal")]
 mod metal_ops;
 #[cfg(feature = "metal")]
 mod metal_decode;
 #[cfg(feature = "metal")]
 mod metal_decode_qwen35;
+#[cfg(feature = "metal")]
+mod metal_flux;
+#[cfg(feature = "metal")]
+mod metal_omnivoice;
 mod ndarray;
 mod nn;
 mod nn2;
+mod omnivoice;
+mod omnivoice_codec;
+mod orpheus;
+mod png;
+mod qlinear;
+mod resample;
+mod snac;
+mod t5;
 mod tensor;
 mod tokenizer;
+mod torch_pickle;
 mod train;
 mod train2;
 mod transformer;
 mod transformer2;
 mod transformer3;
 mod transformer4;
+mod transformer5;
+mod transformer6;
 mod transformer_qwen35;
+mod vae;
+mod wav;
 
 use autograd2::restore_checkpoint;
 use dataset::TextDataset;
@@ -91,6 +114,8 @@ today yesterday tomorrow now always never often rarely
 struct CliArgs {
     /// --prompt TEXT     : text to complete (triggers generation mode)
     prompt: Option<String>,
+    /// --system TEXT     : ChatML system prompt (Qwen 3.5 chat models)
+    system: Option<String>,
     /// --weights DIR     : directory with .safetensors shards (GPT-OSS or Gemma 3)
     weights: Option<String>,
     /// --vocab PATH      : BPE vocab.json (required with --weights for GPT-OSS)
@@ -129,6 +154,59 @@ struct CliArgs {
     debug: bool,
     /// --draft-len N : max speculative draft tokens per step (default 4, 0 = disabled)
     draft_len: usize,
+    /// --voice NAME : Orpheus speaker
+    voice: Option<String>,
+    /// --snac PATH : SNAC codec checkpoint (pytorch_model.bin)
+    snac: Option<String>,
+    /// --out PATH : where to write the synthesised WAV
+    out: Option<String>,
+    /// --no-audio-mask : let Orpheus sample outside the audio token range
+    no_audio_mask: bool,
+    /// --no-leading-bos : drop the BOS that vLLM's re-tokenization prepends
+    no_leading_bos: bool,
+    /// --language NAME : OmniVoice language hint
+    language: Option<String>,
+    /// --instruct TEXT : OmniVoice free-text voice description
+    instruct: Option<String>,
+    /// --ref-audio PATH : WAV of the voice to clone
+    ref_audio: Option<String>,
+    /// --ref-text TEXT : what that WAV says
+    ref_text: Option<String>,
+    /// --duration S : audio seconds to generate; 0 uses the length heuristic
+    duration: f32,
+    /// --steps N : OmniVoice unmasking steps, or FLUX denoising steps
+    steps: usize,
+    /// Whether --steps was given, so each model can keep its own default.
+    steps_set: bool,
+    /// --guidance G : classifier-free guidance scale; 0 disables it
+    guidance: f32,
+    /// --chunk-seconds S : audio per chunk when splitting long text; 0 never splits
+    chunk_seconds: f32,
+    /// --chunk-threshold S : split only when the estimate exceeds this
+    chunk_threshold: f32,
+    /// --chunk-gap S : silence between chunks
+    chunk_gap: f32,
+    /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
+    rope_interleaved: bool,
+    /// --t5 PATH : T5-XXL encoder GGUF, for text-to-image
+    t5: Option<String>,
+    /// --t5-tokenizer PATH : the encoder's SentencePiece `spiece.model`
+    t5_tokenizer: Option<String>,
+    /// --clip PATH : CLIP-L text encoder safetensors
+    clip: Option<String>,
+    /// --clip-tokenizer PATH : CLIP's `tokenizer.json`
+    clip_tokenizer: Option<String>,
+    /// --vae PATH : image autoencoder safetensors
+    vae: Option<String>,
+    /// --width / --height : image size in pixels
+    width: usize,
+    height: usize,
+    /// --tile N : VAE tile size in latent pixels; 0 decodes the image whole
+    vae_tile: usize,
+    /// --cpu : run the diffusion transformer on the CPU even when Metal is on
+    force_cpu: bool,
+    /// --batch N : generate N images from consecutive seeds in one run
+    batch: usize,
 }
 
 impl CliArgs {
@@ -136,6 +214,7 @@ impl CliArgs {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut a = CliArgs {
             prompt: None,
+            system: None,
             weights: None,
             vocab: None,
             merges: None,
@@ -155,6 +234,33 @@ impl CliArgs {
             quantize: false,
             debug: false,
             draft_len: 0,
+            voice: None,
+            snac: None,
+            out: None,
+            no_audio_mask: false,
+            no_leading_bos: false,
+            language: None,
+            instruct: None,
+            ref_audio: None,
+            ref_text: None,
+            duration: 0.0,
+            steps: 12,
+            steps_set: false,
+            guidance: 2.0,
+            chunk_seconds: 15.0,
+            chunk_threshold: 30.0,
+            chunk_gap: 0.3,
+            rope_interleaved: false,
+            t5: None,
+            t5_tokenizer: None,
+            clip: None,
+            clip_tokenizer: None,
+            vae: None,
+            width: 1024,
+            height: 1024,
+            vae_tile: 0,
+            force_cpu: false,
+            batch: 1,
         };
         let mut i = 0;
         while i < args.len() {
@@ -163,6 +269,12 @@ impl CliArgs {
                     i += 1;
                     if i < args.len() {
                         a.prompt = Some(args[i].clone());
+                    }
+                }
+                "--system" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.system = Some(args[i].clone());
                     }
                 }
                 "--weights" => {
@@ -273,6 +385,152 @@ impl CliArgs {
                 "--debug" => {
                     a.debug = true;
                 }
+                "--voice" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.voice = Some(args[i].clone());
+                    }
+                }
+                "--snac" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.snac = Some(args[i].clone());
+                    }
+                }
+                "--out" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.out = Some(args[i].clone());
+                    }
+                }
+                "--no-audio-mask" => {
+                    a.no_audio_mask = true;
+                }
+                "--no-leading-bos" => {
+                    a.no_leading_bos = true;
+                }
+                "--language" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.language = Some(args[i].clone());
+                    }
+                }
+                "--instruct" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.instruct = Some(args[i].clone());
+                    }
+                }
+                "--chunk-seconds" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.chunk_seconds = args[i].parse().unwrap_or(15.0);
+                    }
+                }
+                "--chunk-threshold" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.chunk_threshold = args[i].parse().unwrap_or(30.0);
+                    }
+                }
+                "--chunk-gap" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.chunk_gap = args[i].parse().unwrap_or(0.3);
+                    }
+                }
+                "--ref-audio" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.ref_audio = Some(args[i].clone());
+                    }
+                }
+                "--ref-text" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.ref_text = Some(args[i].clone());
+                    }
+                }
+                "--duration" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.duration = args[i].parse().unwrap_or(0.0);
+                    }
+                }
+                "--steps" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.steps = args[i].parse().unwrap_or(12);
+                        a.steps_set = true;
+                    }
+                }
+                "--guidance" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.guidance = args[i].parse().unwrap_or(2.0);
+                    }
+                }
+                "--t5" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.t5 = Some(args[i].clone());
+                    }
+                }
+                "--t5-tokenizer" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.t5_tokenizer = Some(args[i].clone());
+                    }
+                }
+                "--clip" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.clip = Some(args[i].clone());
+                    }
+                }
+                "--clip-tokenizer" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.clip_tokenizer = Some(args[i].clone());
+                    }
+                }
+                "--vae" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.vae = Some(args[i].clone());
+                    }
+                }
+                "--width" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.width = args[i].parse().unwrap_or(a.width);
+                    }
+                }
+                "--height" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.height = args[i].parse().unwrap_or(a.height);
+                    }
+                }
+                "--tile" => {
+                    i += 1;
+                    if i < args.len() {
+                        a.vae_tile = args[i].parse().unwrap_or(a.vae_tile);
+                    }
+                }
+                "--batch" => {
+                    // A missing or unparseable count means one image, and so
+                    // does zero.
+                    i += 1;
+                    let n: usize = if i < args.len() { args[i].parse().unwrap_or(1) } else { 1 };
+                    a.batch = n.max(1);
+                }
+                "--cpu" => {
+                    a.force_cpu = true;
+                }
+                "--rope-interleaved" => {
+                    a.rope_interleaved = true;
+                }
                 "--draft-len" => {
                     i += 1;
                     if i < args.len() {
@@ -320,7 +578,8 @@ fn print_help() {
     println!(
         "  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is separate)"
     );
-    println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-4b | qwen35-9b");
+    println!("  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-0.8b |");
+    println!("                           qwen35-4b | qwen35-9b | orpheus-3b | omnivoice");
     println!("  --max-new N              Tokens to generate          [default: 200]");
     println!("  --temp T                 Sampling temperature        [default: 0.8]");
     println!("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]");
@@ -331,9 +590,53 @@ fn print_help() {
     println!("  --checkpoint PATH        Load saved .ckpt instead of training");
     println!("  --benchmark              Run scalar-vs-tensor autograd benchmark");
     println!("  --debug                  Enable per-step diagnostic logging");
+    println!("\nText to speech (--model orpheus-3b):");
+    println!("  --voice NAME             en: tara leah jess leo dan mia zac zoe [default: tara]");
+    println!("                           es: javi sergio maria   it: pietro giulia carlo");
+    println!("                           (which work depends on the checkpoint loaded)");
+    println!("  --snac PATH              SNAC 24 kHz checkpoint (pytorch_model.bin)");
+    println!("  --out PATH               Output WAV                  [default: out.wav]");
+    println!("  --no-audio-mask          Allow sampling outside the audio token range");
+    println!("  --no-leading-bos         Drop the leading BOS token from the prompt");
+    println!("\nFLUX text to image (--model flux-schnell, --model flux-dev):");
+    println!("  --weights PATH           Transformer GGUF (Q4_K_M recommended)");
+    println!("  --t5 PATH                T5-XXL encoder GGUF");
+    println!("  --t5-tokenizer PATH      spiece.model (optional; the GGUF carries one)");
+    println!("  --clip PATH              CLIP-L text encoder safetensors");
+    println!("  --clip-tokenizer PATH    CLIP's tokenizer.json");
+    println!("  --vae PATH               Autoencoder safetensors (ae.safetensors)");
+    println!("  --width N --height N     Image size; multiples of 16 (default 1024)");
+    println!("  --steps N                Denoising steps (schnell 4, dev 28)");
+    println!("  --seed N                 Noise seed");
+    println!("  --tile N                 VAE tile in latent pixels; 0 decodes whole");
+    println!("  --batch N                Generate N images from consecutive seeds");
+    println!("  --cpu                    Run the transformer on the CPU");
+    println!("  --out PATH               Where to write the PNG (default out.png)");
+    println!("\nOmniVoice (--model omnivoice):");
+    println!("  --language NAME          Language hint, e.g. Italian    [default: None]");
+    println!("  --instruct TEXT          Voice description              [default: None]");
+    println!("  --chunk-seconds S        Audio per chunk for long text  [default: 15]");
+    println!("  --chunk-threshold S      Split above this many seconds   [default: 30]");
+    println!("  --chunk-gap S            Pause between chunks           [default: 0.3]");
+    println!("  --ref-audio PATH         WAV of a voice to clone");
+    println!("  --ref-text TEXT          What that WAV says (required with it)");
+    println!("  --duration S             Audio seconds (0 = estimate)   [default: 0]");
+    println!("  --steps N                Unmasking steps                [default: 12]");
+    println!("  --guidance G             Guidance scale (0 = off)       [default: 2.0]");
+    println!("  --rope-interleaved       Use interleaved RoPE pairing (debugging; the");
+    println!("                           default half-split is the correct one)");
+    println!("  --weights PATH           omnivoice-base GGUF");
+    println!("  --snac PATH              omnivoice-tokenizer GGUF");
+    println!();
     println!("  --pretokenize S D        Tokenize text file S, write binary D.bin");
     println!("                           Uses char tokenizer built from S.");
     println!("                           For BPE: also pass --vocab and --merges.");
+}
+
+/// Print `message` to stderr and exit with status 1.
+fn die(message: &str) -> ! {
+    eprintln!("{}", message);
+    std::process::exit(1);
 }
 
 // =============================================================================
@@ -392,6 +695,621 @@ fn run_gpt_oss(args: &CliArgs, prompt: &str) {
         std::io::stdout().flush().ok();
     });
     println!();
+}
+
+// =============================================================================
+// Generation mode — OmniVoice masked-diffusion text to speech
+// =============================================================================
+
+fn run_omnivoice(args: &CliArgs, prompt: &str) {
+    use gguf_loader::GgufFile;
+    use omnivoice::{OmniRequest, omni_prepare_reference, omni_synthesize};
+    use omnivoice_codec::{OmniCodecConfig, OmniCodecDecoder, OmniCodecEncoder};
+    use transformer5::{RopePairing, load_gguf_tokenizer};
+    use transformer6::{Config6, OmniForward, OmniLm};
+    use wav::{read_wav, wave_stats, write_wav};
+
+    let lm_path = args.weights.as_deref().unwrap_or("models/omnivoice-base-Q8_0.gguf");
+    let codec_path = args.snac.as_deref().unwrap_or("models/omnivoice-tokenizer-Q8_0.gguf");
+    let out_path = args.out.as_deref().unwrap_or("out.wav");
+
+    for p in [lm_path, codec_path] {
+        if !std::path::Path::new(p).exists() {
+            die(&format!(
+                concat!(
+                    "OmniVoice weights not found at {}\n",
+                    "       Fetch both halves with:\n",
+                    "         curl -L -o models/omnivoice-base-Q8_0.gguf \\\n",
+                    "           https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/",
+                    "omnivoice-base-Q8_0.gguf\n",
+                    "         curl -L -o models/omnivoice-tokenizer-Q8_0.gguf \\\n",
+                    "           https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/",
+                    "omnivoice-tokenizer-Q8_0.gguf"
+                ),
+                p
+            ));
+        }
+    }
+
+    // The LM's GGUF carries its own byte-level vocabulary, so no separate
+    // tokenizer file is needed.
+    let gguf = GgufFile::open(lm_path)
+        .unwrap_or_else(|e| die(&format!("failed to open GGUF: {}", e)));
+    let tok = load_gguf_tokenizer(&gguf)
+        .unwrap_or_else(|e| die(&format!("failed to build the tokenizer from GGUF: {}", e)));
+
+    let mut cfg = Config6::omnivoice();
+    cfg.rope_pairing = if args.rope_interleaved {
+        RopePairing::Interleaved
+    } else {
+        RopePairing::HalfSplit
+    };
+
+    eprintln!("[ OmniVoice ] Loading the language model from {}...", lm_path);
+    let mut lm = OmniLm::load(lm_path, cfg)
+        .unwrap_or_else(|e| die(&format!("failed to load the language model: {}", e)));
+    if args.quantize {
+        let n = lm.quantize_projections_to_q4k();
+        eprintln!(
+            "[ OmniVoice ] Requantized {} projections -> {:.2} GB",
+            n,
+            lm.weight_bytes() as f64 / 1e9
+        );
+    }
+    crate::transformer4::release_memory_to_os();
+    crate::transformer4::print_rss("after weight load");
+
+    eprintln!("[ OmniVoice ] Loading the codec from {}...", codec_path);
+    let codec = OmniCodecDecoder::load(codec_path, OmniCodecConfig::defaults())
+        .unwrap_or_else(|e| die(&format!("failed to load the codec: {}", e)));
+    eprintln!("[ OmniVoice ] Codec decoder: {} parameters", codec.parameter_count());
+
+    let mut request = OmniRequest {
+        text: prompt.to_string(),
+        language: args.language.clone().unwrap_or_default(),
+        instruct: args.instruct.clone().unwrap_or_default(),
+        duration_seconds: args.duration,
+        ..OmniRequest::default()
+    };
+
+    // Voice cloning: read the reference, encode it, and hand the codes over as
+    // decided positions. The analysis half of the codec is only loaded when
+    // there is something to analyse -- it is bigger than the synthesis half.
+    if let Some(ref ref_audio) = args.ref_audio {
+        let ref_text = match args.ref_text.as_deref() {
+            Some(text) if !text.is_empty() => text,
+            _ => die(
+                "--ref-audio needs --ref-text: the model has to know which part of the \
+                 prompt it has already heard",
+            ),
+        };
+        let wav = read_wav(ref_audio)
+            .unwrap_or_else(|e| die(&format!("failed to read the reference audio: {}", e)));
+        let reference = omni_prepare_reference(&wav.mono(), wav.sample_rate, &codec.config)
+            .unwrap_or_else(|e| die(&format!("failed to prepare the reference audio: {}", e)));
+        eprintln!(
+            "[ OmniVoice ] Reference: {:.2} s, {} Hz, {} ch, rms {:.4}",
+            reference.seconds(&codec.config),
+            wav.sample_rate,
+            wav.channels,
+            reference.rms
+        );
+        if reference.seconds(&codec.config) > 20.0 {
+            eprintln!(
+                "[ OmniVoice ] Warning: reference clips over 20 s slow generation down and \
+                 clone no better; 3-10 s is the useful range"
+            );
+        }
+
+        eprintln!("[ OmniVoice ] Loading the codec encoder from {}...", codec_path);
+        let encoder = OmniCodecEncoder::load(codec_path, OmniCodecConfig::defaults())
+            .unwrap_or_else(|e| die(&format!("failed to load the codec encoder: {}", e)));
+        let codes = encoder
+            .encode(&reference.samples)
+            .unwrap_or_else(|e| die(&format!("failed to encode the reference audio: {}", e)));
+        eprintln!("[ OmniVoice ] Encoded the reference to {} frames", codes[0].len());
+        request.ref_codes = codes;
+        request.ref_text = ref_text.to_string();
+        request.ref_rms = reference.rms;
+    }
+    request.debug = args.debug;
+    request.generation.num_step = args.steps;
+    request.generation.guidance_scale = args.guidance;
+    request.generation.seed = args.seed;
+    request.generation.chunk_seconds = args.chunk_seconds;
+    request.generation.chunk_threshold_seconds = args.chunk_threshold;
+    request.generation.chunk_gap_seconds = args.chunk_gap;
+
+    let duration_field = if request.duration_seconds > 0.0 {
+        format!("{:.1}s", request.duration_seconds)
+    } else {
+        "estimated".to_string()
+    };
+    eprintln!(
+        "[ OmniVoice ] lang={} steps={} guidance={:.2} duration={} rope={} clone={}",
+        if request.language.is_empty() { "None" } else { &request.language },
+        request.generation.num_step,
+        request.generation.guidance_scale,
+        duration_field,
+        if args.rope_interleaved { "interleaved" } else { "half-split" },
+        if request.ref_codes.is_empty() { "off" } else { "on" }
+    );
+    eprintln!("[ OmniVoice ] Synthesising: \"{}\"", prompt);
+
+    #[cfg(not(feature = "metal"))]
+    let accel: Option<&dyn OmniForward> = None;
+    // The whole forward pass in one command buffer. Unlike the decode engines,
+    // this exists for the GEMMs rather than despite them: a diffusion step is a
+    // full-sequence pass over a few hundred positions, which is the shape the
+    // matrix units are for.
+    #[cfg(feature = "metal")]
+    let metal_ctx = {
+        use metal_omnivoice::MetalOmniContext;
+        eprintln!("[ Metal ] Uploading weights...");
+        let t_upload = std::time::Instant::now();
+        match MetalOmniContext::create(&mut lm, MetalOmniContext::MAX_TOKENS) {
+            Some(ctx) => {
+                eprintln!(
+                    "[ Metal ] {:.2} GB in GPU buffers, uploaded in {:.1} s",
+                    ctx.buffer_bytes() as f64 / 1e9,
+                    t_upload.elapsed().as_secs_f64()
+                );
+                crate::transformer4::release_memory_to_os();
+                crate::transformer4::print_rss("after the GPU upload");
+                ctx
+            }
+            // create() frees the CPU weights as it goes, so a partial failure
+            // leaves nothing to fall back to.
+            None => die("the Metal engine failed to initialise"),
+        }
+    };
+    #[cfg(feature = "metal")]
+    let accel: Option<&dyn OmniForward> = Some(&metal_ctx);
+
+    let result = omni_synthesize(&lm, &codec, &tok, &request, accel)
+        .unwrap_or_else(|e| die(&format!("synthesis failed: {}", e)));
+
+    let stats = wave_stats(&result.samples);
+    if result.chunks > 1 {
+        eprintln!(
+            "[ OmniVoice ] Split into {} chunks; each after the first takes the first as \
+             its reference",
+            result.chunks
+        );
+    }
+    eprintln!(
+        "[ OmniVoice ] {} frames, {} prompt tokens, {} forward passes -> {} samples",
+        result.frames,
+        result.prompt_tokens,
+        result.forward_passes,
+        result.samples.len()
+    );
+    eprintln!(
+        "[ OmniVoice ] {:.2} s audio in {:.2} s generate + {:.2} s decode (RTF {:.2})",
+        result.audio_seconds(),
+        result.generate_seconds,
+        result.decode_seconds,
+        result.realtime_factor()
+    );
+    eprintln!("[ OmniVoice ] waveform: {}", stats.describe());
+    if !stats.looks_like_speech() {
+        eprintln!("[ OmniVoice ] Warning: the waveform statistics do not look like speech");
+    }
+
+    if let Err(e) = write_wav(out_path, &result.samples, result.sample_rate, 1) {
+        die(&format!("failed to write the WAV: {}", e));
+    }
+    eprintln!("[ OmniVoice ] Wrote {}", out_path);
+}
+
+// =============================================================================
+// FLUX — text to image
+// =============================================================================
+
+/// Encode a prompt with CLIP-L, returning the pooled vector FLUX conditions on.
+///
+/// CLIP wants the sequence bracketed by BOS and EOT and padded to 77 with more
+/// EOT. The padding matters: the pooled vector is read at the *first* EOT, so
+/// padding with anything else would work equally well here -- but the model was
+/// trained with EOT padding, and the per-token states the pooling reads through
+/// depend on it.
+fn encode_clip(weights: &str, tokenizer_path: &str, prompt: &str) -> Result<Vec<f32>, String> {
+    use clip_text::{ClipTextConfig, ClipTextEncoder};
+    use tokenizer::HfBpeTokenizer;
+
+    let tok = HfBpeTokenizer::from_json_file(tokenizer_path)?;
+    let cfg = ClipTextConfig::large();
+
+    const BOS: u32 = 49406;
+    let eot = cfg.eot_token_id;
+    let max_positions = cfg.max_position_embeddings;
+    let mut ids: Vec<u32> = vec![BOS];
+    for id in tok.encode(prompt) {
+        if ids.len() + 1 >= max_positions {
+            break; // leave room for the EOT
+        }
+        ids.push(id);
+    }
+    ids.push(eot);
+    ids.resize(max_positions, eot);
+
+    let model = ClipTextEncoder::load(weights, cfg)?;
+    let out = model.forward(&ids)?;
+    Ok(out.pooled)
+}
+
+/// Encode a prompt with T5-XXL, returning the `[seq_len, 4096]` sequence.
+///
+/// schnell truncates or pads to 256. T5 appends `</s>` and has no BOS, and the
+/// padding is id 0 -- the model was trained with an attention mask that hides
+/// it, which this implementation does not have, so the padded positions do
+/// contribute. They contribute what the reference implementation's unmasked
+/// path would contribute, which is what matters for matching it.
+///
+/// `tokenizer_path` is optional: the distributed encoder GGUFs carry their own
+/// unigram vocabulary, which is both one fewer download and one fewer way to
+/// pair a checkpoint with the wrong tokenizer.
+fn encode_t5(
+    weights: &str,
+    tokenizer_path: Option<&str>,
+    prompt: &str,
+    seq_len: usize,
+) -> Result<autograd2::Mat, String> {
+    use gguf_loader::GgufFile;
+    use t5::{T5Config, T5Encoder, load_t5_gguf_tokenizer};
+    use tokenizer::SentencePieceTokenizer;
+
+    let gguf = GgufFile::open(weights).map_err(|e| e.to_string())?;
+    let tok = match tokenizer_path {
+        Some(path) => SentencePieceTokenizer::from_model_file(path),
+        None => load_t5_gguf_tokenizer(&gguf),
+    }
+    .map_err(|e| format!("t5 tokenizer: {}", e))?;
+
+    const EOS: u32 = 1;
+    const PAD: u32 = 0;
+    let mut ids = tok.encode(prompt);
+    if ids.len() + 1 > seq_len {
+        ids.truncate(seq_len - 1);
+    }
+    ids.push(EOS);
+    ids.resize(seq_len, PAD);
+
+    let mut model = T5Encoder::load_gguf(weights, T5Config::xxl())?;
+    eprintln!(
+        "[ FLUX ] T5-XXL: {:.2} B parameters",
+        model.parameter_count() as f64 / 1e9
+    );
+    let seq = model.forward(&ids)?;
+    model.free_weights();
+    Ok(seq)
+}
+
+fn run_flux(args: &CliArgs, prompt: &str) {
+    use flux::{FluxConfig, FluxModel, FluxSampleParams, flux_sample};
+    use png::{image_stats, write_png};
+    use vae::{VaeConfig, VaeDecoder};
+
+    let Some(weights_path) = args.weights.as_deref() else {
+        die("--model flux-schnell needs --weights pointing at the transformer GGUF");
+    };
+    let require = |v: &Option<String>, flag: &str| -> String {
+        match v {
+            Some(s) => s.clone(),
+            None => die(&format!("--model flux-schnell needs {}", flag)),
+        }
+    };
+    let t5_path = require(&args.t5, "--t5");
+    let clip_path = require(&args.clip, "--clip");
+    let clip_tok = require(&args.clip_tokenizer, "--clip-tokenizer");
+    let vae_path = require(&args.vae, "--vae");
+    let out_path = args.out.as_deref().unwrap_or("out.png");
+
+    let is_dev = args.model.as_deref().is_some_and(|m| m.contains("dev"));
+    let cfg = if is_dev { FluxConfig::dev() } else { FluxConfig::schnell() };
+    // schnell is distilled to four steps; dev wants nearer thirty.
+    let steps = if args.steps_set {
+        args.steps
+    } else if is_dev {
+        28
+    } else {
+        4
+    };
+
+    const VAE_FACTOR: usize = 8;
+    let align = VAE_FACTOR * cfg.patch_size;
+    if args.width % align != 0 || args.height % align != 0 {
+        die(&format!("--width and --height must be multiples of {}", align));
+    }
+
+    // Text first, and both encoders are released before the transformer is
+    // loaded. T5-XXL is 2.8 GB at Q4_K and the transformer is 6.7 GB; holding
+    // both at once is the difference between fitting in 18 GB and not.
+    eprintln!("[ FLUX ] Encoding the prompt with CLIP-L...");
+    let pooled = encode_clip(&clip_path, &clip_tok, prompt)
+        .unwrap_or_else(|e| die(&format!("CLIP encoding failed: {}", e)));
+
+    eprintln!("[ FLUX ] Encoding the prompt with T5-XXL...");
+    let context = encode_t5(&t5_path, args.t5_tokenizer.as_deref(), prompt, 256)
+        .unwrap_or_else(|e| die(&format!("T5 encoding failed: {}", e)));
+
+    eprintln!("[ FLUX ] Loading the transformer from {}...", weights_path);
+    let mut model = FluxModel::load_gguf(weights_path, cfg.clone())
+        .unwrap_or_else(|e| die(&format!("failed to load the transformer: {}", e)));
+    eprintln!(
+        "[ FLUX ] {:.2} B parameters, {:.2} GB of weights",
+        model.parameter_count() as f64 / 1e9,
+        model.weight_bytes() as f64 / 1e9
+    );
+
+    let mut params = FluxSampleParams {
+        width: args.width,
+        height: args.height,
+        steps,
+        guidance: args.guidance,
+        // schnell's scheduler does not shift; dev's does, as a function of the
+        // sequence length. 1.0 is the identity either way for the four-step path.
+        shift: if is_dev { 1.15 } else { 1.0 },
+        ..FluxSampleParams::default()
+    };
+
+    let started = std::time::Instant::now();
+
+    // Sample every seed before decoding any of them. The transformer is 7 GB
+    // and the autoencoder wants the memory, so the two cannot be interleaved
+    // without reloading one of them per image -- and a latent is 1 MB, so
+    // holding the whole batch costs nothing.
+    let mut latents: Vec<autograd2::Mat> = Vec::with_capacity(args.batch);
+    {
+        // The GPU engine takes the transformer's weights over as it uploads
+        // them, and lives until the batch is sampled.
+        #[cfg(feature = "metal")]
+        let engine = if !args.force_cpu {
+            let built = metal_flux::MetalFluxContext::create(
+                &mut model,
+                args.height / VAE_FACTOR,
+                args.width / VAE_FACTOR,
+                context.rows,
+            )
+            .unwrap_or_else(|e| die(&format!("failed to build the Metal engine: {}", e)));
+            eprintln!(
+                "[ FLUX ] Metal: {:.2} GB on the GPU",
+                built.device_bytes() as f64 / 1e9
+            );
+            Some(built)
+        } else {
+            None
+        };
+        for i in 0..args.batch {
+            params.seed = args.seed.wrapping_add(i as u64);
+            let progress = if args.batch > 1 {
+                format!(" [{}/{}]", i + 1, args.batch)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[ FLUX ] Sampling {}x{} in {} steps (seed {}){}...",
+                args.width, args.height, steps, params.seed, progress
+            );
+            let one = std::time::Instant::now();
+            #[cfg(feature = "metal")]
+            let latent = match &engine {
+                Some(engine) => {
+                    metal_flux::flux_sample_metal(engine, &cfg, &context, &pooled, &params)
+                }
+                None => flux_sample(&model, &context, &pooled, &params),
+            };
+            #[cfg(not(feature = "metal"))]
+            let latent = flux_sample(&model, &context, &pooled, &params);
+            let latent = latent.unwrap_or_else(|e| die(&format!("sampling failed: {}", e)));
+            eprintln!("[ FLUX ] Sampled in {:.1} s", one.elapsed().as_secs_f64());
+            latents.push(latent);
+        }
+    }
+
+    // The transformer is finished, and it is holding 7 GB the autoencoder would
+    // rather have. Releasing it here is what lets the decode run whole-image.
+    model.free_weights();
+
+    eprintln!(
+        "[ FLUX ] Decoding {} latent{}...",
+        latents.len(),
+        if latents.len() == 1 { "" } else { "s" }
+    );
+    let vae = VaeDecoder::load(&vae_path, VaeConfig::flux())
+        .unwrap_or_else(|e| die(&format!("failed to load the autoencoder: {}", e)));
+
+    let lat_h = args.height / VAE_FACTOR;
+    let lat_w = args.width / VAE_FACTOR;
+    // The last decoder level runs 128 channels at full resolution, which is
+    // half a gigabyte per activation at 1024x1024, and a residual unit holds
+    // three. Tiling caps that -- but it also decodes the overlaps twice, and
+    // now that the mid-block attention is a pair of gemms rather than a triple
+    // loop the whole-image path is the faster of the two at 1024x1024 (27 s
+    // against 33 s). So the threshold sits above it: tile only when the latent
+    // is larger than 128x128, where whole-image would want ~10 GB.
+    let tile = if args.vae_tile != 0 {
+        args.vae_tile
+    } else if lat_h * lat_w > 128 * 128 {
+        64
+    } else {
+        0
+    };
+    for (i, latent) in latents.iter().enumerate() {
+        let pixels = if tile != 0 {
+            vae.decode_tiled(latent, lat_h, lat_w, tile, tile / 4)
+        } else {
+            vae.decode(latent, lat_h, lat_w)
+        }
+        .unwrap_or_else(|e| die(&format!("decoding failed: {}", e)));
+
+        let stats = image_stats(&pixels, args.width, args.height);
+        eprintln!("[ FLUX ] {}", stats.describe());
+
+        // A single image keeps the name it was given; a batch gets the seed
+        // spliced in before the extension, so the files stay distinguishable
+        // and say which seed produced them.
+        let path = if latents.len() > 1 {
+            let seed = format!("_s{}", args.seed.wrapping_add(i as u64));
+            match out_path.rfind('.') {
+                None => format!("{}{}", out_path, seed),
+                Some(dot) => format!("{}{}{}", &out_path[..dot], seed, &out_path[dot..]),
+            }
+        } else {
+            out_path.to_string()
+        };
+        if let Err(e) = write_png(&path, &pixels, args.width, args.height) {
+            die(&format!("failed to write the image: {}", e));
+        }
+        eprintln!("[ FLUX ] Wrote {}", path);
+    }
+    eprintln!(
+        "[ FLUX ] {} image{} in {:.1} s total",
+        latents.len(),
+        if latents.len() == 1 { "" } else { "s" },
+        started.elapsed().as_secs_f64()
+    );
+}
+
+// =============================================================================
+// Generation mode — Orpheus text to speech
+// =============================================================================
+
+fn run_orpheus(args: &CliArgs, prompt: &str) {
+    use gguf_loader::GgufFile;
+    use orpheus::{OrpheusConfig, OrpheusRequest, orpheus_default_sampling, orpheus_synthesize};
+    use snac::{SnacConfig, SnacDecoder};
+    use transformer5::{Config5, LlamaModel, load_gguf_tokenizer};
+    use wav::{wave_stats, write_wav};
+
+    let weights_path = args.weights.as_deref().unwrap();
+    let snac_path = args.snac.as_deref().unwrap_or("models/snac_24khz.bin");
+    let out_path = args.out.as_deref().unwrap_or("out.wav");
+    let voice = args.voice.as_deref().unwrap_or("tara");
+
+    if !std::path::Path::new(snac_path).exists() {
+        die(&format!(
+            "SNAC codec weights not found at {}\n       Fetch them with:\n         curl -L -o {} \
+             https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/main/pytorch_model.bin\n       \
+             or point --snac at an existing copy.",
+            snac_path, snac_path
+        ));
+    }
+
+    // The GGUF carries its own vocabulary and merges, so no --tokenizer-dir is
+    // needed -- which matters here, because the Orpheus repository is gated.
+    eprintln!("[ Orpheus ] Reading {}...", weights_path);
+    let gguf = GgufFile::open(weights_path)
+        .unwrap_or_else(|e| die(&format!("failed to open GGUF: {}", e)));
+    let tok = load_gguf_tokenizer(&gguf)
+        .unwrap_or_else(|e| die(&format!("failed to build the tokenizer from GGUF: {}", e)));
+
+    let mut model = LlamaModel::new_for_inference(Config5::orpheus_3b());
+    if let Err(e) = model.load_weights_from_gguf(weights_path) {
+        die(&format!("failed to load weights: {}", e));
+    }
+
+    // How the file was quantized decides what to do next.
+    //
+    // A Q4_K_M checkpoint keeps most projections native and lifts only
+    // attn_v, ffn_down and output to Q6_K -- those are the quality-sensitive
+    // ones, chosen deliberately. Flattening them would throw that away, so
+    // only the lm_head is requantized: it is the largest single read per
+    // token, and at 156 940 entries it costs 964 MB as BF16 against 271 MB as
+    // Q4_K.
+    //
+    // A uniformly higher-precision file -- Q8_0, F16 -- has no Q4_K tensors at
+    // all, so every projection widens to BF16 and the model lands near 6.6 GB
+    // with roughly 3.5x the per-token memory traffic. There is no deliberate
+    // choice to preserve there, so requantizing all of them is the right call.
+    let projections = model.projection_count();
+    let widened = model.bf16_projection_count();
+    if widened * 2 > projections {
+        eprintln!(
+            "[ Orpheus ] {} of {} projections were widened to BF16 ({:.2} GB); \
+             requantizing to Q4_K...",
+            widened,
+            projections,
+            model.weight_bytes() as f64 / 1e9
+        );
+        let converted = model.quantize_projections_to_q4k();
+        eprintln!(
+            "[ Orpheus ] Requantized {} projections, now {:.2} GB",
+            converted,
+            model.weight_bytes() as f64 / 1e9
+        );
+    } else {
+        eprintln!("[ Orpheus ] Quantizing lm_head to Q4_K...");
+        model.quantize_lm_head();
+    }
+    crate::transformer4::release_memory_to_os();
+    crate::transformer4::print_rss("after weight load");
+
+    eprintln!("[ Orpheus ] Loading SNAC codec from {}...", snac_path);
+    let snac = SnacDecoder::load(snac_path, SnacConfig::snac_24khz())
+        .unwrap_or_else(|e| die(&format!("failed to load the SNAC codec: {}", e)));
+    eprintln!("[ Orpheus ] SNAC decoder: {} parameters", snac.parameter_count());
+
+    let mut request = OrpheusRequest {
+        text: prompt.to_string(),
+        voice: voice.to_string(),
+        max_new: args.max_new,
+        debug: args.debug,
+        mask_to_audio: !args.no_audio_mask,
+        sampling: orpheus_default_sampling(args.seed),
+        ..OrpheusRequest::default()
+    };
+    // Explicit flags win over the reference defaults.
+    request.sampling.temperature = args.temperature;
+    request.sampling.top_p = args.top_p;
+    request.sampling.top_k = args.top_k;
+    request.sampling.repetition_penalty = args.rep_penalty;
+
+    eprintln!(
+        "[ Orpheus ] voice={} max_new={} temp={:.2} top_p={:.2} rep={:.2}",
+        voice,
+        request.max_new,
+        request.sampling.temperature,
+        request.sampling.top_p,
+        request.sampling.repetition_penalty
+    );
+    eprintln!("[ Orpheus ] Synthesising: \"{}\"", prompt);
+
+    let cfg = OrpheusConfig {
+        leading_bos: !args.no_leading_bos,
+        ..OrpheusConfig::defaults()
+    };
+    let result = orpheus_synthesize(&model, &snac, &tok, &request, &cfg)
+        .unwrap_or_else(|e| die(&format!("synthesis failed: {}", e)));
+
+    let stats = wave_stats(&result.samples);
+    eprintln!(
+        "[ Orpheus ] {} tokens -> {} codes ({} rejected) -> {} groups -> {} samples",
+        result.tokens_generated,
+        result.codes_accepted,
+        result.codes_rejected,
+        result.groups,
+        result.samples.len()
+    );
+    eprintln!(
+        "[ Orpheus ] {:.2} s audio in {:.2} s generate + {:.2} s decode (RTF {:.2})",
+        result.audio_seconds(),
+        result.generate_seconds,
+        result.decode_seconds,
+        result.realtime_factor()
+    );
+    eprintln!("[ Orpheus ] waveform: {}", stats.describe());
+    if !stats.looks_like_speech() {
+        // Not fatal -- a short or quiet clip fails this legitimately -- but a
+        // pipeline fault shows up here first, and every fault in this pipeline
+        // sounds the same.
+        eprintln!("[ Orpheus ] Warning: the waveform statistics do not look like speech");
+    }
+
+    if let Err(e) = write_wav(out_path, &result.samples, result.sample_rate, 1) {
+        die(&format!("failed to write the WAV: {}", e));
+    }
+    eprintln!("[ Orpheus ] Wrote {}", out_path);
 }
 
 // =============================================================================
@@ -626,7 +1544,19 @@ fn run_qwen35(args: &CliArgs, prompt: &str) {
     let im_start: usize = 248045;
     let im_end: usize = 248046;
     let newline: usize = 198; // \n
-    let mut token_ids: Vec<usize> = vec![im_start];
+    let mut token_ids: Vec<usize> = Vec::new();
+    // An optional system turn precedes the user turn. Fine-tuned chat models
+    // often bind their behaviour to the exact system prompt seen in training,
+    // so leaving it out can change what the model does.
+    if let Some(ref system) = args.system {
+        token_ids.push(im_start);
+        token_ids.extend(tok.encode("system").iter().map(|&id| id as usize));
+        token_ids.push(newline);
+        token_ids.extend(tok.encode(system).iter().map(|&id| id as usize));
+        token_ids.push(im_end);
+        token_ids.push(newline);
+    }
+    token_ids.push(im_start);
     token_ids.extend(tok.encode("user").iter().map(|&id| id as usize));
     token_ids.push(newline);
     token_ids.extend(tok.encode(prompt).iter().map(|&id| id as usize));
@@ -771,20 +1701,34 @@ fn main() {
     // Generation mode
     // -------------------------------------------------------------------------
     if let Some(ref prompt) = args.prompt.clone() {
-        let is_qwen35 = args
-            .model
-            .as_deref()
-            .map_or(false, |m| m.starts_with("qwen35"));
+        let model_starts_with =
+            |prefix: &str| args.model.as_deref().map_or(false, |m| m.starts_with(prefix));
+        let is_flux = model_starts_with("flux");
+        let is_omnivoice = model_starts_with("omnivoice");
+        let is_orpheus = model_starts_with("orpheus");
+        let is_qwen35 = model_starts_with("qwen35");
+        // A .gguf file with no --model is assumed to be Gemma 3, which is the
+        // only architecture this CLI ever loaded from GGUF first.
         let is_gemma3 = args.tokenizer_model.is_some()
-            || args
-                .model
-                .as_deref()
-                .map_or(false, |m| m.starts_with("gemma3"))
-            || (!is_qwen35 && args
-                .weights
-                .as_deref()
-                .map_or(false, |w| w.ends_with(".gguf")));
-        if is_qwen35 {
+            || model_starts_with("gemma3")
+            || (!is_qwen35
+                && !is_orpheus
+                && !is_omnivoice
+                && !is_flux
+                && args
+                    .weights
+                    .as_deref()
+                    .map_or(false, |w| w.ends_with(".gguf")));
+        if is_flux {
+            run_flux(&args, prompt);
+        } else if is_omnivoice {
+            run_omnivoice(&args, prompt);
+        } else if is_orpheus {
+            if args.weights.is_none() {
+                die("--model orpheus-3b needs --weights pointing at the GGUF file");
+            }
+            run_orpheus(&args, prompt);
+        } else if is_qwen35 {
             run_qwen35(&args, prompt);
         } else if is_gemma3 {
             run_gemma3(&args, prompt);

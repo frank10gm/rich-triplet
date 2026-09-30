@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
-use crate::autograd2::{Q4KMat, Q4Mat};
+use crate::autograd2::{Mat, Q4KMat, Q4Mat};
 
 // ---------------------------------------------------------------------------
 // Tensor type enum
@@ -734,6 +734,90 @@ impl GgufFile {
 
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Weight loading helpers
+// ---------------------------------------------------------------------------
+
+/// Decode any supported tensor to flat f32, in GGUF memory order.
+#[allow(dead_code)]
+fn tensor_to_f32(gguf: &GgufFile, idx: usize) -> io::Result<Vec<f32>> {
+    match gguf.tensor_info[idx].gguf_type {
+        GgufType::F32  => gguf.decode_f32(idx),
+        GgufType::F16  => gguf.decode_f16_to_f32(idx),
+        GgufType::Q8_0 => gguf.decode_q8_0_to_f32(idx),
+        GgufType::Q4K  => gguf.decode_q4k_to_f32(idx),
+        GgufType::Q6K  => gguf.decode_q6k_to_f32(idx),
+        GgufType::Q5K  => gguf.decode_q5k_to_f32(idx),
+        GgufType::Q4_0 => gguf.decode_q4_0_to_f32(idx),
+        other => Err(io::Error::new(io::ErrorKind::Unsupported,
+            format!("gguf: tensor '{}' has unsupported type {:?}",
+                gguf.tensor_info[idx].name, other))),
+    }
+}
+
+#[allow(dead_code)]
+fn find_tensor_or_err(gguf: &GgufFile, name: &str) -> io::Result<usize> {
+    gguf.find_tensor(name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+        format!("gguf: checkpoint has no tensor '{name}'")))
+}
+
+/// Decode any supported tensor to f32 by header index.
+///
+/// The by-name helpers below all route through this. Callers that have already
+/// looked up the index -- because they need the tensor's type to decide whether
+/// to keep it packed -- want it directly.
+#[allow(dead_code)]
+pub fn gguf_tensor_to_f32(gguf: &GgufFile, idx: usize) -> io::Result<Vec<f32>> {
+    if idx >= gguf.tensor_info.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "gguf: tensor index out of range"));
+    }
+    tensor_to_f32(gguf, idx)
+}
+
+/// Read an f32/f16 tensor as a flat vector, for biases.
+#[allow(dead_code)]
+pub fn load_gguf_vector(gguf: &GgufFile, name: &str) -> io::Result<Vec<f32>> {
+    let idx = find_tensor_or_err(gguf, name)?;
+    tensor_to_f32(gguf, idx)
+}
+
+/// Read a `[1, C]` Snake alpha as a flat vector.
+#[allow(dead_code)]
+pub fn load_gguf_alpha(gguf: &GgufFile, name: &str) -> io::Result<Vec<f32>> {
+    // Stored as [1, C]; only the channel count matters here.
+    load_gguf_vector(gguf, name)
+}
+
+/// Read a convolution weight out of GGUF into `conv1d.rs`'s layout.
+///
+/// GGUF *lists* dimensions in reverse of PyTorch but stores the same flat
+/// buffer, so no transpose is needed -- a `Conv1d` weight listed as
+/// `[K, Cin, Cout]` is still `[Cout][Cin][K]` row-major in memory, which is
+/// exactly the `[Cout, Cin * K]` matrix the convolution routines want. Only
+/// the row and column counts have to be worked out.
+///
+/// Those are derived from `out_channels` rather than from the shape, because
+/// GGUF elides trailing dimensions of length 1: the decoder's final
+/// `[1, 32, 7]` projection is listed as a two-dimensional `[7, 32]`, and there
+/// is no way to tell that from a genuinely two-dimensional weight. Passing the
+/// expected output width sidesteps the ambiguity and validates the tensor at
+/// the same time.
+#[allow(dead_code)]
+pub fn load_gguf_conv_weight(gguf: &GgufFile, name: &str, out_channels: usize) -> io::Result<Mat> {
+    let idx = find_tensor_or_err(gguf, name)?;
+    let values = tensor_to_f32(gguf, idx)?;
+
+    if out_channels == 0 || values.len() % out_channels != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "gguf: tensor '{}' holds {} values, which does not divide into {} output channels",
+            name, values.len(), out_channels)));
+    }
+    let cols = values.len() / out_channels;
+    // No transpose: GGUF reverses the dimension *listing*, not the buffer.
+    Ok(Mat::new(values, out_channels, cols))
 }
 
 // ---------------------------------------------------------------------------

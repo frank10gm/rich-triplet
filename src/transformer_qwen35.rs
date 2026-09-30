@@ -1009,6 +1009,7 @@ impl Qwen35Model {
             eos_token_id: Some(self.config.eos_token_id),
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
 
         let h = self.config.hidden_size;

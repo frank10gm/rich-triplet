@@ -135,6 +135,23 @@ pub struct SamplingParams {
     /// 0.0 = disabled.  Typical values: 0.2 – 1.0.
     /// Encourages the model to use new vocabulary.
     pub presence_penalty: f32,
+
+    /// Restrict sampling to ids in `[allowed_min, allowed_max)`, plus any
+    /// listed in `allowed_extra`. Both unset means no restriction.
+    ///
+    /// Useful when a model's vocabulary is partitioned by purpose -- Orpheus
+    /// puts 28 672 audio codes alongside 128 256 text tokens and should only
+    /// emit the former once its prompt is consumed. Masking is not a
+    /// correctness requirement for a well-behaved model; it stops a drifting
+    /// one from wandering out of the range the caller can use.
+    #[allow(dead_code)]
+    pub allowed_min: Option<usize>,
+    #[allow(dead_code)]
+    pub allowed_max: Option<usize>,
+    /// Ids permitted regardless of the range -- stop markers, typically,
+    /// which must stay reachable or generation runs to `max_new`.
+    #[allow(dead_code)]
+    pub allowed_extra: Vec<usize>,
 }
 
 impl SamplingParams {
@@ -145,6 +162,7 @@ impl SamplingParams {
             repetition_penalty: 1.0, seed: 0,
             eos_token_id: None,
             frequency_penalty: 0.0, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         }
     }
 
@@ -155,6 +173,7 @@ impl SamplingParams {
             repetition_penalty: 1.1, seed,
             eos_token_id: None,
             frequency_penalty: 0.0, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         }
     }
 }
@@ -1144,7 +1163,7 @@ impl GptOssModel {
             SamplingParams::greedy()
         } else {
             SamplingParams { temperature, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0,
-                             eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 }
+                             eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() }
         };
         // No previously-seen tokens (repetition_penalty disabled)
         self.sample_token_full(logits, pos, &params, &[], &mut LcgRng::new(params.seed))
@@ -2589,8 +2608,8 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p_nok = SamplingParams { temperature: 0.8, top_k: 0,              top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
-        let p_all = SamplingParams { temperature: 0.8, top_k: cfg.vocab_size, top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
+        let p_nok = SamplingParams { temperature: 0.8, top_k: 0,              top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() };
+        let p_all = SamplingParams { temperature: 0.8, top_k: cfg.vocab_size, top_p: 1.0, repetition_penalty: 1.0, seed: 42, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() };
         let r_nok = model.generate_with_params(&[1, 2], 5, &p_nok);
         let r_all = model.generate_with_params(&[1, 2], 5, &p_all);
         assert_eq!(r_nok, r_all, "top_k=0 should behave like top_k=vocab_size");
@@ -2602,8 +2621,8 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p1 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
-        let p2 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 0.9999, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
+        let p1 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() };
+        let p2 = SamplingParams { temperature: 0.9, top_k: 0, top_p: 0.9999, repetition_penalty: 1.0, seed: 7, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() };
         let r1 = model.generate_with_params(&[0, 3], 4, &p1);
         // With top_p ≈ 1 the result may or may not equal r1 depending on dist.
         // We just verify it runs without panic and produces correct length.
@@ -2617,7 +2636,7 @@ mod tests {
         let cfg = tiny_config();
         let mut rng = make_rng();
         let model = GptOssModel::new(cfg.clone(), &mut rng);
-        let p = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.5, seed: 3, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0 };
+        let p = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.5, seed: 3, eos_token_id: None, frequency_penalty: 0.0, presence_penalty: 0.0, allowed_min: None, allowed_max: None, allowed_extra: Vec::new() };
         let tokens = model.generate_with_params(&[0, 1, 2], 8, &p);
         for &tok in &tokens {
             assert!(tok < cfg.vocab_size, "token {} out of vocab", tok);
@@ -2986,6 +3005,7 @@ mod tests {
             repetition_penalty: 1.0, seed: 1,
             eos_token_id: Some(0),
             frequency_penalty: 0.0, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
         let tokens = model.generate_with_params(&[1, 2], 20, &p);
         // Either EOS was never produced (all 20 tokens) or it stopped early.
@@ -3020,6 +3040,7 @@ mod tests {
             repetition_penalty: 1.0, seed: 1,
             eos_token_id: Some(0),
             frequency_penalty: 0.0, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
         let mut streamed = Vec::new();
         model.generate_with_params_streaming(&[1, 2], 20, &p, |t| streamed.push(t));
@@ -3043,6 +3064,7 @@ mod tests {
             repetition_penalty: 1.0, seed: 5,
             eos_token_id: None,
             frequency_penalty: 0.5, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
         let tokens = model.generate_with_params(&[0, 1, 2], 10, &p);
         for &tok in &tokens {
@@ -3060,6 +3082,7 @@ mod tests {
             repetition_penalty: 1.0, seed: 6,
             eos_token_id: None,
             frequency_penalty: 0.0, presence_penalty: 0.3,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
         let tokens = model.generate_with_params(&[0, 1, 2], 10, &p);
         for &tok in &tokens {
@@ -3080,6 +3103,7 @@ mod tests {
             repetition_penalty: 1.0, seed: 99,
             eos_token_id: None,
             frequency_penalty: 0.0, presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
         let with_freq = SamplingParams {
             frequency_penalty: 2.0,

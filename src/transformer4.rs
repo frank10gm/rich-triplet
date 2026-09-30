@@ -602,6 +602,7 @@ impl Gemma3Model {
             eos_token_id: Some(self.config.eos_token_id),
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
 
         let mut rng = LcgRng::new(seed);
@@ -2065,6 +2066,7 @@ impl Gemma3Model {
             eos_token_id: Some(self.config.eos_token_id),
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            allowed_min: None, allowed_max: None, allowed_extra: Vec::new(),
         };
 
         print_rss("before KV cache alloc");
@@ -2782,7 +2784,7 @@ fn apply_rope_at_offset(
 /// **Prefill path (t_q > 1)** — per-head Mat copies are still made (same as
 /// before) because sgemm needs contiguous data; this path only runs once per
 /// generation (during prompt processing), so the cost is acceptable.
-fn gqa_attention_cached(
+pub fn gqa_attention_cached(
     q_data: &Mat,
     k_cache: &Mat,
     v_cache: &Mat,
@@ -2817,7 +2819,7 @@ fn gqa_attention_cached(
                 #[cfg(feature = "blas")]
                 {
                     scores[ci] = unsafe {
-                        cblas::sdot(
+                        crate::autograd2::sdot(
                             d_head as i32,
                             &q_data.data[q_off..],
                             1,
@@ -2859,7 +2861,7 @@ fn gqa_attention_cached(
 
                 #[cfg(feature = "blas")]
                 unsafe {
-                    cblas::saxpy(
+                    crate::autograd2::saxpy(
                         d_head as i32,
                         w,
                         &v_cache.data[v_base..],

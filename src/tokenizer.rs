@@ -1261,6 +1261,27 @@ impl SentencePieceTokenizer {
         Self::from_model_bytes(&bytes)
     }
 
+    /// Build directly from a vocabulary and its log-probabilities, as GGUF
+    /// stores them in `tokenizer.ggml.tokens` and `tokenizer.ggml.scores`.
+    ///
+    /// The counterpart of `HfBpeTokenizer::from_vocab_and_merges`, and it
+    /// exists for the same reason: a GGUF file already carries a complete
+    /// tokenizer, so requiring a separate `spiece.model` alongside it is asking
+    /// for a second download of something already on disk.
+    pub fn from_tokens_and_scores(tokens: Vec<String>, scores: &[f32]) -> Result<Self, String> {
+        if tokens.is_empty() {
+            return Err("sentencepiece: empty vocabulary".into());
+        }
+        if tokens.len() != scores.len() {
+            return Err(format!("sentencepiece: {} tokens but {} scores",
+                tokens.len(), scores.len()));
+        }
+        let pieces: Vec<SentencePiece> = tokens.into_iter().zip(scores.iter())
+            .map(|(text, &log_prob)| SentencePiece { text, log_prob })
+            .collect();
+        Ok(Self::from_pieces(pieces))
+    }
+
     fn from_pieces(pieces: Vec<SentencePiece>) -> Self {
         let mut piece_to_id = HashMap::new();
         for (i, p) in pieces.iter().enumerate() {
@@ -1750,6 +1771,28 @@ fn base64_encode(data: &[u8]) -> String {
 //
 // The tokenizer.json file is the canonical source; tokenizer.model is legacy.
 
+/// Which pre-tokenizer regex `HfBpeTokenizer` splits with before merging.
+///
+/// GPT-2 and Llama 3 differ in one clause that matters: GPT-2 splits every
+/// digit into its own token (`[0-9]`), while Llama 3 takes runs of up to
+/// three (`\p{N}{1,3}`). So "2024" is `2|0|2|4` under one and `202|4`
+/// under the other -- different ids, and a mispronounced number in a
+/// text-to-speech model. GGUF records which to use in `tokenizer.ggml.pre`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreTokenizer {
+    Gpt2,
+    Llama3,
+    /// CLIP. A different family: the text is lowercased and its whitespace
+    /// collapsed first, the split keeps only the matches (whitespace is
+    /// dropped rather than attached to the following word), and each word
+    /// carries an explicit `</w>` end-of-word marker instead of a leading
+    /// space. Feeding CLIP text through the GPT-2 splitter produces ids
+    /// that are individually valid and collectively meaningless -- every
+    /// space becomes its own token and no word ever matches its `</w>`
+    /// vocabulary entry.
+    Clip,
+}
+
 /// A BPE tokenizer loaded from a HuggingFace `tokenizer.json` file.
 pub struct HfBpeTokenizer {
     /// vocab[id] = token string
@@ -1762,6 +1805,8 @@ pub struct HfBpeTokenizer {
     /// If true, use GPT-2 byte-level encoding (Qwen, GPT-2 style)
     /// If false, use SentencePiece ▁ encoding (Gemma style)
     byte_level: bool,
+    pre: PreTokenizer,
+    end_of_word_suffix: String,
 }
 
 impl HfBpeTokenizer {
@@ -1804,7 +1849,99 @@ impl HfBpeTokenizer {
         // Detect ByteLevel pre-tokenizer from the JSON
         let byte_level = s.contains("\"ByteLevel\"");
 
-        Ok(HfBpeTokenizer { id_to_token, token_to_id: vocab_map, merge_rank, unk_id, byte_level })
+        // `end_of_word_suffix` is the discriminator that matters: it is what makes
+        // the merge sequence a different algorithm rather than a different regex,
+        // and CLIP is the model in this family that declares one.
+        let mut end_of_word_suffix = String::new();
+        if let Some(at) = s.find("\"end_of_word_suffix\"") {
+            // Only a string value counts: `"end_of_word_suffix": null` (Gemma's
+            // tokenizer.json) must leave the suffix empty rather than pick up
+            // the next key's quotes.
+            let after_colon = s[at..].find(':').map(|c| at + c + 1).unwrap_or(s.len());
+            let value = s[after_colon..].trim_start();
+            if value.starts_with('"') {
+                let open = s.len() - value.len();
+                if let Some(close) = s[open + 1..].find('"').map(|c| open + 1 + c) {
+                    end_of_word_suffix = s[open + 1..close].to_string();
+                }
+            }
+        }
+        let pre = if end_of_word_suffix.is_empty() { PreTokenizer::Gpt2 } else { PreTokenizer::Clip };
+
+        Ok(HfBpeTokenizer {
+            id_to_token, token_to_id: vocab_map, merge_rank, unk_id, byte_level,
+            pre, end_of_word_suffix,
+        })
+    }
+
+    /// Build directly from a vocabulary and merge list, as GGUF stores them in
+    /// `tokenizer.ggml.tokens` and `tokenizer.ggml.merges`.
+    ///
+    /// Merge entries are `"<left> <right>"`, split at the first space. Their
+    /// order is their priority, lowest first.
+    ///
+    /// This exists because a GGUF file already carries a complete tokenizer,
+    /// and some models -- Orpheus among them -- are gated on HuggingFace, so
+    /// requiring a separate `tokenizer.json` means requiring an account.
+    #[allow(dead_code)]
+    pub fn from_vocab_and_merges(tokens: Vec<String>, merges: &[String], byte_level: bool,
+                                 pre: PreTokenizer) -> Result<Self, String> {
+        if tokens.is_empty() {
+            return Err("hf tokenizer: vocabulary is empty".into());
+        }
+
+        let id_to_token = tokens;
+        let mut token_to_id: HashMap<String, u32> = HashMap::with_capacity(id_to_token.len());
+        for (id, tok) in id_to_token.iter().enumerate() {
+            // First id wins, matching how a JSON vocabulary object would load.
+            token_to_id.entry(tok.clone()).or_insert(id as u32);
+        }
+
+        let mut merge_rank: HashMap<(String, String), usize> = HashMap::with_capacity(merges.len());
+        for (rank, entry) in merges.iter().enumerate() {
+            let space = entry.find(' ');
+            match space {
+                Some(sp) if sp != 0 && sp + 1 < entry.len() => {
+                    // First rank wins, like `unordered_map::emplace`.
+                    merge_rank.entry((entry[..sp].to_string(), entry[sp + 1..].to_string()))
+                        .or_insert(rank);
+                }
+                _ => {
+                    return Err(format!(
+                        "hf tokenizer: merge {} ('{}') is not two space-separated pieces",
+                        rank, entry));
+                }
+            }
+        }
+
+        // GGUF vocabularies carry no explicit unknown token. Llama 3 never needs
+        // one -- byte-level encoding can spell any input -- so point it at id 0 and
+        // let a genuinely missing symbol be visible rather than silently dropped.
+        let unk_id = token_to_id.get("<unk>").copied().unwrap_or(0);
+
+        Ok(HfBpeTokenizer {
+            id_to_token, token_to_id, merge_rank, unk_id, byte_level,
+            pre, end_of_word_suffix: String::new(),
+        })
+    }
+
+    /// Which pre-tokenizer this instance splits with.
+    #[allow(dead_code)]
+    pub fn pre_tokenizer(&self) -> PreTokenizer { self.pre }
+
+    /// The end-of-word marker merged onto the last symbol of every word, empty
+    /// unless the file declared one.
+    #[allow(dead_code)]
+    pub fn end_of_word_suffix(&self) -> &str { &self.end_of_word_suffix }
+
+    /// True when the file declared a ByteLevel pre-tokenizer.
+    #[allow(dead_code)]
+    pub fn byte_level(&self) -> bool { self.byte_level }
+
+    /// Look up a token string by id; empty when out of range.
+    #[allow(dead_code)]
+    pub fn token_text(&self, id: u32) -> &str {
+        self.id_to_token.get(id as usize).map(String::as_str).unwrap_or("")
     }
 
     /// Parse the "model"."vocab" object: returns token→id map.
@@ -1994,12 +2131,13 @@ impl HfBpeTokenizer {
     /// GPT-2 byte-level encode: pre-tokenize → byte-to-unicode → BPE per word
     fn encode_byte_level(&self, text: &str) -> Vec<u32> {
         let b2u = gpt2_bytes_to_unicode();
-        let words = Self::gpt2_pretokenize(text);
+        let normalized = Self::normalize(text, self.pre);
+        let words = Self::pretokenize(&normalized, self.pre);
         let mut ids = Vec::new();
         for word in &words {
             // Convert each byte to GPT-2 unicode char
             let unicode_word: String = word.bytes().map(|b| b2u[b as usize]).collect();
-            ids.extend(self.bpe_encode_word(&unicode_word));
+            ids.extend(self.bpe_encode_word(&unicode_word, &self.end_of_word_suffix));
         }
         ids
     }
@@ -2029,7 +2167,109 @@ impl HfBpeTokenizer {
     /// Simple GPT-2-style pre-tokenizer (splits text into words for BPE).
     /// Handles: letter sequences with optional leading space/punct, digits,
     /// punctuation, whitespace. No regex crate needed.
-    fn gpt2_pretokenize(text: &str) -> Vec<&str> {
+    #[allow(dead_code)]
+    pub fn gpt2_pretokenize(text: &str) -> Vec<&str> {
+        Self::pretokenize(text, PreTokenizer::Gpt2)
+    }
+
+    /// Collapse whitespace runs to a single space and lowercase, which is
+    /// CLIP's normalizer. A no-op for the other pre-tokenizers.
+    pub fn normalize(text: &str, kind: PreTokenizer) -> String {
+        if kind != PreTokenizer::Clip {
+            return text.to_string();
+        }
+        // Collapse every whitespace run to one space, then lowercase. NFC
+        // composition is part of CLIP's normalizer too and is not done here: it
+        // matters only for text that carries combining marks, and getting it wrong
+        // costs a token boundary rather than a wrong word.
+        let mut out = String::with_capacity(text.len());
+        let mut in_space = false;
+        for cp in text.chars() {
+            if cp.is_whitespace() {
+                in_space = true;
+                continue;
+            }
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(cp.to_ascii_lowercase());
+        }
+        out
+    }
+
+    /// Split text the way CLIP does: contraction suffixes, letter runs, single
+    /// digits, and runs of everything that is neither whitespace nor
+    /// alphanumeric. Whitespace is dropped.
+    ///
+    /// The caller is expected to have normalized already -- see `normalize`.
+    pub fn clip_pretokenize(text: &str) -> Vec<&str> {
+        // CLIP's regex, directly:
+        //   's|'t|'re|'ve|'m|'ll|'d | [\p{L}]+ | [\p{N}] | [^\s\p{L}\p{N}]+
+        // with whitespace matching nothing and therefore dropped.
+        let mut words: Vec<&str> = Vec::new();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut i = 0;
+        let byte_end_at = |idx: usize| if idx < chars.len() { chars[idx].0 } else { text.len() };
+
+        while i < chars.len() {
+            let (byte_start, ch) = chars[i];
+
+            if ch.is_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            if ch == '\'' && i + 1 < chars.len() {
+                let n1 = chars[i + 1].1.to_ascii_lowercase();
+                if matches!(n1, 's' | 't' | 'm' | 'd') {
+                    words.push(&text[byte_start..byte_end_at(i + 2)]);
+                    i += 2;
+                    continue;
+                }
+                if i + 2 < chars.len() {
+                    let n2 = chars[i + 2].1.to_ascii_lowercase();
+                    if matches!((n1, n2), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+                        words.push(&text[byte_start..byte_end_at(i + 3)]);
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+
+            if ch.is_alphabetic() {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].1.is_alphabetic() { j += 1; }
+                words.push(&text[byte_start..byte_end_at(j)]);
+                i = j;
+                continue;
+            }
+
+            // `[\p{N}]` with no repetition: one digit per token, always.
+            if ch.is_ascii_digit() {
+                words.push(&text[byte_start..byte_end_at(i + 1)]);
+                i += 1;
+                continue;
+            }
+
+            let mut j = i + 1;
+            while j < chars.len() && !chars[j].1.is_whitespace()
+                && !chars[j].1.is_alphabetic() && !chars[j].1.is_ascii_digit() { j += 1; }
+            words.push(&text[byte_start..byte_end_at(j)]);
+            i = j;
+        }
+
+        words
+    }
+
+    /// Split text the way the GPT-2 pre-tokenizer does (see `gpt2_pretokenize`),
+    /// with Llama 3's digit clause under `PreTokenizer::Llama3`: runs of up to
+    /// three digits rather than one at a time. `PreTokenizer::Clip` routes to
+    /// `clip_pretokenize`.
+    pub fn pretokenize(text: &str, kind: PreTokenizer) -> Vec<&str> {
+        if kind == PreTokenizer::Clip {
+            return Self::clip_pretokenize(text);
+        }
         let mut words: Vec<&str> = Vec::new();
         let chars: Vec<(usize, char)> = text.char_indices().collect();
         let mut i = 0;
@@ -2082,11 +2322,16 @@ impl HfBpeTokenizer {
                 continue;
             }
 
-            // Case 3: Single digit
+            // Case 3: digits. GPT-2 emits one at a time; Llama 3's regex is
+            // `\p{N}{1,3}`, so it takes runs of up to three and "2024" becomes
+            // "202" + "4" rather than four separate digits.
             if ch.is_ascii_digit() {
-                let byte_end = if i + 1 < chars.len() { chars[i + 1].0 } else { text.len() };
+                let max_run = if kind == PreTokenizer::Llama3 { 3 } else { 1 };
+                let mut j = i + 1;
+                while j < chars.len() && j - i < max_run && chars[j].1.is_ascii_digit() { j += 1; }
+                let byte_end = if j < chars.len() { chars[j].0 } else { text.len() };
                 words.push(&text[byte_start..byte_end]);
-                i += 1;
+                i = j;
                 continue;
             }
 
@@ -2134,12 +2379,20 @@ impl HfBpeTokenizer {
     }
 
     /// Encode a single pre-tokenized word (already has ▁ prefix) using BPE.
-    fn bpe_encode_word(&self, word: &str) -> Vec<u32> {
+    fn bpe_encode_word(&self, word: &str, end_suffix: &str) -> Vec<u32> {
         if word.is_empty() { return Vec::new(); }
 
         // Initialize: each Unicode char is a symbol
-        let chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+        let mut chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
         if chars.is_empty() { return Vec::new(); }
+        // The end-of-word marker rides on the *last* symbol rather than becoming a
+        // symbol of its own. That is what makes `a</w>` reachable as a single
+        // vocabulary entry while `a` stays available mid-word.
+        if !end_suffix.is_empty() {
+            if let Some(last) = chars.last_mut() {
+                last.push_str(end_suffix);
+            }
+        }
 
         // Use index-based representation for fast merging
         // symbols[i] = Some(token_str), None means merged away
@@ -2213,7 +2466,7 @@ impl Tokenizer for HfBpeTokenizer {
 
         let mut ids = Vec::new();
         for word in &words {
-            ids.extend(self.bpe_encode_word(word));
+            ids.extend(self.bpe_encode_word(word, &self.end_of_word_suffix));
         }
         ids
     }
@@ -2235,4 +2488,66 @@ impl Tokenizer for HfBpeTokenizer {
     }
 
     fn vocab_size(&self) -> usize { self.id_to_token.len() }
+}
+
+// =============================================================================
+// CLIP pre-tokenization tests
+// =============================================================================
+//
+// CLIP is a different family from GPT-2 and Llama 3: the text is lowercased and
+// its whitespace collapsed before splitting, the split drops whitespace rather
+// than attaching it to the following word, and each word carries an explicit
+// `</w>` marker instead of a leading space.
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn test_clip_normalize_lowercases_and_collapses_whitespace() {
+        type PT = PreTokenizer;
+        assert_eq!(HfBpeTokenizer::normalize("A  Photo\tOf\nThings", PT::Clip), "a photo of things");
+        assert_eq!(HfBpeTokenizer::normalize("   leading and trailing   ", PT::Clip),
+            "leading and trailing");
+        // The other pre-tokenizers must be left exactly as they were: GPT-2 carries
+        // the space into the next token and depends on it surviving.
+        assert_eq!(HfBpeTokenizer::normalize("A  Photo", PT::Gpt2), "A  Photo");
+        assert_eq!(HfBpeTokenizer::normalize("A  Photo", PT::Llama3), "A  Photo");
+    }
+
+    #[test]
+    fn test_clip_pretokenize_drops_whitespace() {
+        let words = HfBpeTokenizer::clip_pretokenize("a photograph of a harbour at dawn");
+        assert_eq!(words, vec!["a", "photograph", "of", "a", "harbour", "at", "dawn"]);
+        // GPT-2 keeps the space, which is exactly the difference.
+        let gpt2 = HfBpeTokenizer::gpt2_pretokenize("a photograph");
+        assert_eq!(gpt2.len(), 2);
+        assert_eq!(gpt2[1], " photograph");
+    }
+
+    #[test]
+    fn test_clip_pretokenize_splits_digits_one_at_a_time() {
+        // `[\p{N}]` with no repetition, unlike Llama 3's runs of up to three.
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("2024"), vec!["2", "0", "2", "4"]);
+    }
+
+    #[test]
+    fn test_clip_pretokenize_keeps_contractions_together() {
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("it's"), vec!["it", "'s"]);
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("they're"), vec!["they", "'re"]);
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("we'll"), vec!["we", "'ll"]);
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("i've"), vec!["i", "'ve"]);
+    }
+
+    #[test]
+    fn test_clip_pretokenize_runs_punctuation_together() {
+        assert_eq!(HfBpeTokenizer::clip_pretokenize("wow!!! really?"),
+            vec!["wow", "!!!", "really", "?"]);
+    }
+
+    #[test]
+    fn test_clip_pretokenize_empty_and_whitespace_only() {
+        assert!(HfBpeTokenizer::clip_pretokenize("").is_empty());
+        assert!(HfBpeTokenizer::clip_pretokenize("   \t\n ").is_empty());
+    }
 }

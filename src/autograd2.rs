@@ -71,6 +71,129 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 // =============================================================================
+// sgemm entry point
+// =============================================================================
+//
+// Accelerate exports two CBLAS interfaces. The `cblas` crate binds the legacy
+// `cblas_sgemm`, deprecated since macOS 13.3; the C++ port compiles with
+// `ACCELERATE_NEW_LAPACK`, which routes the same call to `cblas_sgemm$NEWLAPACK`.
+// Both keep the 32-bit `int` interface, but they are different kernels: for
+// some small shapes (M <= 12 with N in {3, 16, 32}) they round differently in
+// the last ulp. Calling the new symbol keeps the two implementations
+// bit-identical and off the deprecated path.
+
+#[cfg(all(feature = "blas", target_os = "macos"))]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm$NEWLAPACK"]
+    fn cblas_sgemm_newlapack(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+    #[link_name = "cblas_sdot$NEWLAPACK"]
+    fn cblas_sdot_newlapack(n: i32, x: *const f32, incx: i32, y: *const f32, incy: i32) -> f32;
+    #[link_name = "cblas_saxpy$NEWLAPACK"]
+    fn cblas_saxpy_newlapack(n: i32, alpha: f32, x: *const f32, incx: i32, y: *mut f32, incy: i32);
+}
+
+/// Drop-in for `cblas::sdot`; see `sgemm` for why the symbol matters.
+#[cfg(feature = "blas")]
+pub(crate) unsafe fn sdot(n: i32, x: &[f32], incx: i32, y: &[f32], incy: i32) -> f32 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        cblas_sdot_newlapack(n, x.as_ptr(), incx, y.as_ptr(), incy)
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        cblas::sdot(n, x, incx, y, incy)
+    }
+}
+
+/// Drop-in for `cblas::saxpy`; see `sgemm` for why the symbol matters.
+#[cfg(feature = "blas")]
+pub(crate) unsafe fn saxpy(n: i32, alpha: f32, x: &[f32], incx: i32, y: &mut [f32], incy: i32) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        cblas_saxpy_newlapack(n, alpha, x.as_ptr(), incx, y.as_mut_ptr(), incy)
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        cblas::saxpy(n, alpha, x, incx, y, incy)
+    }
+}
+
+/// Drop-in for `cblas::sgemm` that calls Accelerate's new-LAPACK symbol on
+/// macOS and the `cblas` crate everywhere else.
+#[cfg(feature = "blas")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgemm(
+    layout: cblas::Layout,
+    trans_a: cblas::Transpose,
+    trans_b: cblas::Transpose,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    a: &[f32],
+    lda: i32,
+    b: &[f32],
+    ldb: i32,
+    beta: f32,
+    c: &mut [f32],
+    ldc: i32,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        // CBLAS enum values: CblasRowMajor = 101, CblasColMajor = 102,
+        // CblasNoTrans = 111, CblasTrans = 112, CblasConjTrans = 113.
+        let order = match layout {
+            cblas::Layout::RowMajor => 101,
+            cblas::Layout::ColumnMajor => 102,
+        };
+        let trans = |t: cblas::Transpose| match t {
+            cblas::Transpose::None => 111,
+            cblas::Transpose::Ordinary => 112,
+            cblas::Transpose::Conjugate => 113,
+        };
+        unsafe {
+            cblas_sgemm_newlapack(
+                order,
+                trans(trans_a),
+                trans(trans_b),
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr(),
+                lda,
+                b.as_ptr(),
+                ldb,
+                beta,
+                c.as_mut_ptr(),
+                ldc,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        cblas::sgemm(
+            layout, trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+}
+
+// =============================================================================
 // The Tensor type — re-exported from tensor.rs but with grad operations added
 // =============================================================================
 //
@@ -226,7 +349,7 @@ impl Mat {
         let (m, k, n) = (self.rows, self.cols, b.cols);
         let mut out = Mat::zeros(m, n);
         unsafe {
-            cblas::sgemm(
+            sgemm(
                 cblas::Layout::RowMajor,
                 cblas::Transpose::None,
                 cblas::Transpose::None,
@@ -262,7 +385,7 @@ impl Mat {
         );
         let mut out = Mat::zeros(m, n);
         unsafe {
-            cblas::sgemm(
+            sgemm(
                 cblas::Layout::RowMajor,
                 cblas::Transpose::None,
                 cblas::Transpose::Ordinary,
@@ -278,6 +401,29 @@ impl Mat {
                 &mut out.data,
                 n as i32,
             );
+        }
+        out
+    }
+
+    /// Scalar `self @ b^T` for builds without BLAS.
+    #[cfg(not(feature = "blas"))]
+    pub fn matmul_bt(&self, b: &Mat) -> Mat {
+        // self: [M, K],  b: [N, K]  →  out: [M, N]
+        let (m, k, n) = (self.rows, self.cols, b.rows);
+        assert_eq!(
+            k, b.cols,
+            "matmul_bt: [{},{}] × [{},{}]^T shape mismatch",
+            self.rows, self.cols, b.rows, b.cols
+        );
+        let mut out = Mat::zeros(m, n);
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for p in 0..k {
+                    acc += self.data[i * k + p] * b.data[j * k + p];
+                }
+                out.data[i * n + j] = acc;
+            }
         }
         out
     }
@@ -647,17 +793,17 @@ impl MatBf16 {
                 let actual = j1 - j0;
 
                 // Dequantise BF16 rows j0..j1 into chunk_buf[0..actual*k].
-                for ji in 0..actual {
-                    let src = (j0 + ji) * k;
-                    let dst = ji * k;
-                    for c in 0..k {
-                        chunk_buf[dst + c] = Self::bf16_to_f32(self.data[src + c]);
-                    }
+                // Slice iteration rather than indexing: the bounds checks on
+                // `self.data[src + c]` kept this loop scalar, and it dominated
+                // BF16 prefill (2x slower than the vectorised C++ loop).
+                let src = &self.data[j0 * k..j1 * k];
+                for (d, &s) in chunk_buf[..actual * k].iter_mut().zip(src) {
+                    *d = Self::bf16_to_f32(s);
                 }
 
                 // SGEMM: out[m, actual] = a[m, k] × chunk_buf[actual, k]^T
                 unsafe {
-                    cblas::sgemm(
+                    sgemm(
                         cblas::Layout::RowMajor,
                         cblas::Transpose::None,
                         cblas::Transpose::Ordinary,
@@ -1315,13 +1461,52 @@ impl Q4KMat {
     /// Chunked SGEMM with ~8 MB scratch (prefill and decode).
     #[cfg(feature = "blas")]
     pub fn matmul_q4k_t_blas(&self, a: &Mat) -> Mat {
-        let (m, k, n) = (a.rows, a.cols, self.rows);
-        assert_eq!(k, self.cols, "matmul_q4k_t_blas: a.cols {} != q4k.cols {}", k, self.cols);
+        assert_eq!(a.cols, self.cols, "matmul_q4k_t_blas: a.cols {} != q4k.cols {}", a.cols, self.cols);
 
-        // GEMV fast path for decode (M=1): fused NEON dot + multi-threading.
-        if m == 1 {
+        // GEMV fast path for decode (M=1): fused NEON dot + multi-threading. It
+        // quantizes the activation to int8; see `matmul_q4k_t_exact` for when that
+        // is not acceptable.
+        if a.rows == 1 {
             return self.gemv_mt(a);
         }
+        self.matmul_q4k_t_exact(a)
+    }
+
+    /// Same as `matmul_q4k_t_blas`, but never takes the single-row GEMV shortcut.
+    ///
+    /// That shortcut quantizes the *activation* to int8 before the dot
+    /// product, which is a large NEON win and costs about 0.4% -- the right
+    /// trade for a language model, where every decode step is a batch of one
+    /// and the error lands on one token's logits.
+    ///
+    /// It is the wrong trade for a diffusion transformer. There the only
+    /// batch-of-one matmuls are the modulation projections, whose output is a
+    /// shift, a scale and a gate applied to *every* token and *every* channel
+    /// of the block. They are a negligible share of the arithmetic and they
+    /// set the magnitude of everything downstream, so they get the exact path.
+    ///
+    /// Without the `blas` feature this falls back to `matmul_q4k_t`.
+    #[cfg(not(feature = "blas"))]
+    pub fn matmul_q4k_t_exact(&self, a: &Mat) -> Mat {
+        self.matmul_q4k_t(a)
+    }
+
+    /// Same as `matmul_q4k_t_blas`, but never takes the single-row GEMV shortcut.
+    ///
+    /// That shortcut quantizes the *activation* to int8 before the dot
+    /// product, which is a large NEON win and costs about 0.4% -- the right
+    /// trade for a language model, where every decode step is a batch of one
+    /// and the error lands on one token's logits.
+    ///
+    /// It is the wrong trade for a diffusion transformer. There the only
+    /// batch-of-one matmuls are the modulation projections, whose output is a
+    /// shift, a scale and a gate applied to *every* token and *every* channel
+    /// of the block. They are a negligible share of the arithmetic and they
+    /// set the magnitude of everything downstream, so they get the exact path.
+    #[cfg(feature = "blas")]
+    pub fn matmul_q4k_t_exact(&self, a: &Mat) -> Mat {
+        let (m, k, n) = (a.rows, a.cols, self.rows);
+        assert_eq!(k, self.cols, "matmul_q4k_t_exact: a.cols {} != q4k.cols {}", k, self.cols);
 
         // Chunked SGEMM for both prefill and decode.
         //
@@ -1383,7 +1568,7 @@ impl Q4KMat {
                             }
 
                             unsafe {
-                                cblas::sgemm(
+                                sgemm(
                                     cblas::Layout::RowMajor,
                                     cblas::Transpose::None,
                                     cblas::Transpose::Ordinary,
@@ -1416,7 +1601,7 @@ impl Q4KMat {
                     self.dequantize_row_into(j0 + ji, &mut chunk_buf[ji * k..(ji + 1) * k]);
                 }
                 unsafe {
-                    cblas::sgemm(
+                    sgemm(
                         cblas::Layout::RowMajor,
                         cblas::Transpose::None,
                         cblas::Transpose::Ordinary,
@@ -2283,7 +2468,7 @@ impl Q4Mat {
 
             // SGEMM: out[m, actual] = a[m, k] × chunk_buf[actual, k]^T
             unsafe {
-                cblas::sgemm(
+                sgemm(
                     cblas::Layout::RowMajor,
                     cblas::Transpose::None,
                     cblas::Transpose::Ordinary,
